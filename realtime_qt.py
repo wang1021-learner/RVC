@@ -1399,6 +1399,8 @@ class MainWindow(QMainWindow):
         self._device_guard = False
         self._dev_fp = ()
         self._load_gen = 0
+        self._load_started = None       # 需在 _rl() 之前初始化（_rl 会触发加载）
+        self._load_log_offset = 0
         url = self._settings.get("server_url") or DEFAULT_SERVER_URL
         mode = self._settings.get("infer_mode") or "local"
         self.engine = VCEngine(mode=mode, server_url=url)
@@ -1426,6 +1428,11 @@ class MainWindow(QMainWindow):
         self._install_timer.setInterval(5000)
         self._install_timer.timeout.connect(self._refresh_local_install)
         self._install_timer.start()
+        # 加载进度：每秒刷新「阶段 + 已等待秒数」，避免首次加载看起来像卡死
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(1000)
+        self._progress_timer.timeout.connect(self._update_load_progress)
+        self._progress_timer.start()
 
     def _on_rms_levels(self, in_db, out_db):
         self.in_meter.set_level(in_db)
@@ -2003,14 +2010,59 @@ class MainWindow(QMainWindow):
             if len(self._loaders) > 3:
                 self._loaders.pop(0)
         self._load_gen += 1
+        self._load_started = time.time()
+        self._load_log_offset = self._server_log_size()
         self._loader = ModelLoader(self.engine, speaker, self._load_gen, parent=self)
         self._loader.finished_ok.connect(self._on_loaded)
         self._loader.failed.connect(self._on_load_failed)
         self._loader.start()
 
+    def _server_log_size(self):
+        try:
+            p = package_root() / "logs" / "local_server.log"
+            return p.stat().st_size if p.is_file() else 0
+        except Exception:
+            return 0
+
+    def _loading_stage(self):
+        """从本地服务日志的「本次加载增量」推断当前阶段（避免读到历史记录）。"""
+        try:
+            log_path = package_root() / "logs" / "local_server.log"
+            if not log_path.is_file():
+                return None
+            offset = getattr(self, "_load_log_offset", 0) or 0
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(offset)
+                lines = f.readlines()
+            for line in reversed(lines):
+                low = line.lower()
+                if "graph ready" in low:
+                    return "预热完成，即将就绪"
+                if "warmup" in low:
+                    return "正在预热 CUDA Graph"
+                if "rmvpe" in low or "fcpe" in low or "音高" in line:
+                    return "正在加载音高模型"
+                if "加载模型" in line or "loading" in low:
+                    return "正在加载角色模型"
+                if "客户端连接" in line or "server 启动" in low:
+                    return "推理服务已启动"
+            return None
+        except Exception:
+            return None
+
+    def _update_load_progress(self):
+        if not hasattr(self, "_loader") or self._loader is None or not self._loader.isRunning():
+            return
+        elapsed = time.time() - (self._load_started or time.time())
+        stage = self._loading_stage() or "正在加载"
+        self.state_label.setText(f"加载中… {stage}（{elapsed:.0f} 秒）")
+        self.state_label.setStyleSheet(
+            "font-size:12px;font-weight:700;color:#b45309;")
+
     def _on_loaded(self, speaker, gen=0):
         if gen != self._load_gen:
             return
+        self._load_started = None
         self.engine.current_speaker = speaker
         self._sync_live_sliders(speaker)
         self.engine.change_pitch(speaker.pitch)
@@ -2023,6 +2075,7 @@ class MainWindow(QMainWindow):
     def _on_load_failed(self, err, gen=0):
         if gen != self._load_gen:
             return
+        self._load_started = None
         self._set_light(LIGHT_RED, "加载失败")
         self.sb.setEnabled(True)
         text = (err or "未知错误").strip()

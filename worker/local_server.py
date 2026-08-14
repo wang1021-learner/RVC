@@ -75,8 +75,12 @@ class LocalServerPipeline(RVCClient):
         self._log_fh = None
 
     # ── 服务进程管理 ──
-    def ensure_server(self, timeout=40.0):
-        """确保本机推理服务在运行；必要时拉起子进程并等它监听端口。"""
+    def ensure_server(self, timeout=60.0):
+        """确保本机推理服务在运行；必要时拉起子进程并等它监听端口。
+
+        首次启动服务端需导入 torch 并做 CUDA 探测（实测约 15 秒），
+        慢机器上可达 30 秒以上，因此默认等待 60 秒。
+        """
         if self._connected or port_in_use(DEFAULT_LOCAL_PORT):
             return True
         if not runtime_installed():
@@ -98,7 +102,7 @@ class LocalServerPipeline(RVCClient):
             self._log_fh = None
         try:
             self._proc = subprocess.Popen(
-                [str(py), str(script), "--host", "127.0.0.1",
+                [str(py), "-u", str(script), "--host", "127.0.0.1",
                  "--port", str(DEFAULT_LOCAL_PORT)],
                 cwd=str(src),
                 stdout=self._log_fh or subprocess.DEVNULL,
