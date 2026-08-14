@@ -348,15 +348,37 @@ BUILTIN_PRESETS = [
 def _wasapi_fail_reason(exc):
     s = str(exc or "").lower()
     if "illegal combination" in s:
-        return "输入输出不是同一组 API"
+        return "输入输出不是同一组 API（请选择同组设备，或点「刷新设备」重试）"
     if "sample" in s or "rate" in s:
-        return "采样率需为 48k"
+        return "采样率需为 48k（设备不支持当前采样率）"
     if "channel" in s:
-        return "通道数不匹配"
+        return "通道数不匹配（请更换设备或声道设置）"
+    if "unsupported" in s or "format" in s:
+        return "设备不支持当前音频格式（尝试切换共享模式）"
+    if "full duplex" in s or "duplex" in s:
+        return "设备不支持同时输入输出（全双工）"
     if any(k in s for k in ("unavail", "invalid device", "exclusive", "busy", "in use")):
-        return "设备被占用或不支持独占"
+        return "设备被占用或不支持独占（关闭占用程序，或改用共享模式）"
+    if "not found" in s or "doesn't exist" in s or "no such device" in s:
+        return "设备不存在，请点「刷新设备」后重选"
     text = str(exc).strip()
     return text[:80] if text else "未知原因"
+
+
+def _friendly_net_error(e):
+    """把底层网络异常翻译成用户可行动的提示。"""
+    s = str(e or "").lower()
+    if "refused" in s or "10061" in s:
+        return "服务器拒绝连接（未启动或端口不对）"
+    if "timed out" in s or "timeout" in s or "10060" in s:
+        return "连接超时（检查 IP 地址与防火墙）"
+    if "getaddrinfo" in s or "nodename" in s or "name or service" in s:
+        return "地址无法解析（请检查服务器地址写法）"
+    if "unreachable" in s or "10065" in s:
+        return "网络不可达（请检查网络连接）"
+    if "handshake" in s or "10054" in s or "reset" in s:
+        return "连接被重置（服务器可能异常退出）"
+    return (str(e) or "未知错误")[:120]
 
 
 def _device_fingerprint():
@@ -1079,8 +1101,10 @@ class VCEngine(QObject):
 
     def _open_monitor(self):
         self._close_monitor()
-        if not self.monitor_enabled or self.monitor_device is None:
+        if not self.monitor_enabled:
             return True, ""
+        if self.monitor_device is None:
+            return False, "未选择监听输出设备（请在右侧「音质与监听」中选择耳机）"
         block = getattr(self.pipeline, "_block_frame", None)
         if not block:
             return False, "推理块大小未知"
@@ -1325,6 +1349,7 @@ class MainWindow(QMainWindow):
         self.engine.infer_time.connect(self._on_infer_time)
         self.engine.started_ok.connect(self._on_started)
         self.engine.stopped_ok.connect(self._on_stopped)
+        self.engine.load_failed.connect(self._on_start_failed)
         self.engine.rms_levels.connect(self._on_rms_levels)
         self.engine.xrun_signal.connect(self._on_xrun)
         self.engine.loop_latency.connect(self._on_loop_latency)
@@ -1377,8 +1402,8 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_ui(self):
-        self.resize(1180, 700)
-        self.setMinimumSize(1080, 640)
+        self.resize(1240, 760)
+        self.setMinimumSize(1120, 680)
         central = QWidget(); self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 8)
@@ -1422,7 +1447,7 @@ class MainWindow(QMainWindow):
         sp.setStretchFactor(0, 0)
         sp.setStretchFactor(1, 1)
         sp.setStretchFactor(2, 0)
-        sp.setSizes([280, 560, 300])
+        sp.setSizes([300, 580, 330])
         root.addWidget(sp, 1)
 
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
@@ -1525,10 +1550,12 @@ class MainWindow(QMainWindow):
         dl = QGridLayout(); dl.setHorizontalSpacing(8); dl.setVerticalSpacing(8)
         dl.addWidget(self._lbl("输入"), 0, 0)
         self.ic = DeviceCombo(direction="input")
+        self.ic.setToolTip("WASAPI 独占要求输入输出同一组 API；选择后会自动对齐另一侧")
         self.ic.currentIndexChanged.connect(lambda: self._on_device_changed("input"))
         dl.addWidget(self.ic, 0, 1)
         dl.addWidget(self._lbl("输出"), 1, 0)
         self.oc = DeviceCombo(direction="output")
+        self.oc.setToolTip("WASAPI 独占要求输入输出同一组 API；选择后会自动对齐另一侧")
         self.oc.currentIndexChanged.connect(lambda: self._on_device_changed("output"))
         dl.addWidget(self.oc, 1, 1)
         rb = QPushButton("刷新设备")
@@ -1537,6 +1564,12 @@ class MainWindow(QMainWindow):
         dl.addWidget(rb, 2, 1, Qt.AlignRight)
         dl.setColumnStretch(1, 1)
         l.addLayout(dl)
+
+        # 设备错位/异常提示（常驻显示，比状态栏更醒目）
+        self.dev_hint = QLabel("")
+        self.dev_hint.setWordWrap(True)
+        self.dev_hint.setVisible(False)
+        l.addWidget(self.dev_hint)
         l.addStretch(1)
 
         self.sb = QPushButton("启动变声")
@@ -1552,10 +1585,16 @@ class MainWindow(QMainWindow):
         return g
 
     def _build_right(self):
-        g = QGroupBox("高级")
-        l = QGridLayout(g)
+        box = QWidget()
+        root = QVBoxLayout(box)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(10)
+
+        # ── 高级参数 ──
+        g1 = QGroupBox("高级参数")
+        l = QGridLayout(g1)
         l.setContentsMargins(10, 16, 10, 10)
-        l.setHorizontalSpacing(8); l.setVerticalSpacing(8)
+        l.setHorizontalSpacing(8); l.setVerticalSpacing(6)
 
         self.fc = create_styled_combo(max_visible=10); self.fc.addItems(["rmvpe", "fcpe", "pm"])
         self.fc.currentTextChanged.connect(lambda v: setattr(self.engine, "f0method", v))
@@ -1577,6 +1616,7 @@ class MainWindow(QMainWindow):
         self.ts.valueChanged.connect(lambda v: setattr(self.engine, "threhold", v))
         self.rs = QDoubleSpinBox(); self.rs.setRange(0.0, 1.0); self.rs.setSingleStep(0.1)
         self.rs.setValue(0.3)
+        self.rs.setToolTip("0=完全跟随输入音量，1=只保留变声自身音量")
         self.rs.valueChanged.connect(lambda v: setattr(self.engine, "rms_mix_rate", v))
         rows = [
             ("F0", self.fc),
@@ -1599,7 +1639,6 @@ class MainWindow(QMainWindow):
         nr.addWidget(self.inc); nr.addWidget(self.onc); nr.addStretch()
         l.addLayout(nr, len(rows), 0, 1, 2)
 
-        row = len(rows) + 1
         # 输出保护（直流高通 + 软限幅）
         pr = QHBoxLayout(); pr.setSpacing(8)
         self.limiter_cb = QCheckBox("输出保护")
@@ -1613,16 +1652,27 @@ class MainWindow(QMainWindow):
         self.limiter_th.setToolTip("起限阈值，-1 dB 为推荐值")
         self.limiter_th.valueChanged.connect(lambda v: setattr(self.engine, "limiter_threshold_db", v))
         pr.addWidget(self.limiter_th); pr.addStretch()
-        l.addLayout(pr, row, 0, 1, 2); row += 1
+        l.addLayout(pr, len(rows) + 1, 0, 1, 2)
 
-        # 输入 AGC
+        # 分阶段耗时（本地模式）
+        self.st_lbl = QLabel("阶段耗时: --")
+        self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
+        l.addWidget(self.st_lbl, len(rows) + 2, 0, 1, 2)
+        l.setColumnStretch(1, 1)
+        root.addWidget(g1)
+
+        # ── 音质与监听 ──
+        g2 = QGroupBox("音质与监听")
+        m = QGridLayout(g2)
+        m.setContentsMargins(10, 16, 10, 10)
+        m.setHorizontalSpacing(8); m.setVerticalSpacing(6)
+
         self.agc_cb = QCheckBox("输入自动增益 (AGC)")
         self.agc_cb.setToolTip("输入电平归一化，说话人远近变化时音色更稳定（实时生效）")
         self.agc_cb.toggled.connect(self._on_agc)
-        l.addWidget(self.agc_cb, row, 0, 1, 2); row += 1
+        m.addWidget(self.agc_cb, 0, 0, 1, 2)
 
-        # 场景预设
-        l.addWidget(self._lbl("预设"), row, 0)
+        m.addWidget(self._lbl("预设"), 1, 0)
         pbtn_row = QHBoxLayout(); pbtn_row.setSpacing(6)
         self._preset_map = load_presets()
         self.preset_cb = create_styled_combo()
@@ -1637,9 +1687,8 @@ class MainWindow(QMainWindow):
         pb_save.setToolTip("把当前参数保存为用户预设")
         pb_save.clicked.connect(self._save_preset)
         pbtn_row.addWidget(pb_save)
-        l.addLayout(pbtn_row, row, 1); row += 1
+        m.addLayout(pbtn_row, 1, 1)
 
-        # 监听混音
         mr = QHBoxLayout(); mr.setSpacing(8)
         self.monitor_cb = QCheckBox("监听")
         self.monitor_cb.setToolTip("把变声结果同时播放到第二输出设备（如耳机）")
@@ -1647,25 +1696,34 @@ class MainWindow(QMainWindow):
         mr.addWidget(self.monitor_cb)
         self.monitor_vol = QSlider(Qt.Horizontal)
         self.monitor_vol.setRange(0, 100); self.monitor_vol.setValue(80)
+        self.monitor_vol.setToolTip("监听音量")
         self.monitor_vol.valueChanged.connect(self._on_monitor_vol)
         mr.addWidget(self.monitor_vol, 1)
-        l.addLayout(mr, row, 0, 1, 2); row += 1
+        m.addLayout(mr, 2, 0, 1, 2)
 
         self.mc = DeviceCombo(direction="output")
         self.mc.setToolTip("监听输出设备（可不同于主输出）")
         self.mc.currentIndexChanged.connect(lambda: self._on_monitor_changed())
-        l.addWidget(self.mc, row, 0, 1, 2); row += 1
-
-        # 分阶段耗时（本地模式）
-        self.st_lbl = QLabel("阶段耗时: --")
-        self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
-        l.addWidget(self.st_lbl, row, 0, 1, 2); row += 1
-
-        l.setColumnStretch(1, 1)
-        l.setRowStretch(row, 1)
-        return g
+        m.addWidget(self.mc, 3, 0, 1, 2)
+        m.setColumnStretch(1, 1)
+        root.addWidget(g2)
+        root.addStretch(1)
+        return box
 
     # ── 事件处理 ──
+    def _show_dev_hint(self, text, warn=True):
+        icon = "⚠ " if warn else "ℹ "
+        color = "#b45309" if warn else "#1d4ed8"
+        bg = "#fef3c7" if warn else "#dbeafe"
+        self.dev_hint.setText(icon + text)
+        self.dev_hint.setStyleSheet(
+            f"font-size:12px;color:{color};background:{bg};"
+            "border:1px solid #e5e7eb;border-radius:6px;padding:6px 8px;")
+        self.dev_hint.setVisible(True)
+
+    def _clear_dev_hint(self):
+        self.dev_hint.setVisible(False)
+
     def _on_device_changed(self, which="input"):
         if self._device_guard:
             return
@@ -1675,12 +1733,20 @@ class MainWindow(QMainWindow):
             return
         in_id, out_id, err = self._resolve_selected(reinit=False)
         if err:
-            self.status_bar.showMessage(err, 6000)
+            self._show_dev_hint(err)
+            self.status_bar.showMessage(err, 8000)
             return
-        self.engine.reopen_stream(in_id, out_id)
+        ok, msg = self.engine.reopen_stream(in_id, out_id)
+        if not ok:
+            self._show_dev_hint(msg)
+            self.status_bar.showMessage("切换设备失败: " + msg, 8000)
+        else:
+            self._clear_dev_hint()
+            self.status_bar.showMessage("已切换设备 · " + msg, 5000)
         self._persist_settings()
 
     def _align_device_apis(self, changed):
+        """输入/输出 API 不同时自动对齐另一侧；无法对齐时给出明确提示。"""
         in_api = self.ic.currentDeviceApi()
         out_api = self.oc.currentDeviceApi()
         if in_api is None or out_api is None or in_api == out_api:
@@ -1689,18 +1755,28 @@ class MainWindow(QMainWindow):
         try:
             if changed == "input":
                 name = self.oc.currentDeviceName()
-                if not self.oc.selectByNameApi(name, in_api):
-                    if not self.oc.selectFirstWithApi(in_api):
-                        return
+                ok = self.oc.selectByNameApi(name, in_api) or self.oc.selectFirstWithApi(in_api)
                 shown = self.oc.currentDeviceName() or "默认设备"
-                self.status_bar.showMessage("输出已自动改为同组设备: " + shown, 5000)
+                if ok:
+                    self._show_dev_hint(f"输入与输出不在同一驱动组，输出已自动对齐为「{shown}」", warn=False)
+                    self.status_bar.showMessage("输出已自动改为同组设备: " + shown, 5000)
+                else:
+                    self._show_dev_hint(
+                        "输入/输出不在同一驱动组，且找不到可对齐的输出设备。"
+                        "请手动把输入输出选为同组设备（WASAPI 独占要求同组 API）。")
+                    self.status_bar.showMessage("输入输出 API 不一致且无法自动对齐", 8000)
             else:
                 name = self.ic.currentDeviceName()
-                if not self.ic.selectByNameApi(name, out_api):
-                    if not self.ic.selectFirstWithApi(out_api):
-                        return
+                ok = self.ic.selectByNameApi(name, out_api) or self.ic.selectFirstWithApi(out_api)
                 shown = self.ic.currentDeviceName() or "默认设备"
-                self.status_bar.showMessage("输入已自动改为同组设备: " + shown, 5000)
+                if ok:
+                    self._show_dev_hint(f"输入与输出不在同一驱动组，输入已自动对齐为「{shown}」", warn=False)
+                    self.status_bar.showMessage("输入已自动改为同组设备: " + shown, 5000)
+                else:
+                    self._show_dev_hint(
+                        "输入/输出不在同一驱动组，且找不到可对齐的输入设备。"
+                        "请手动把输入输出选为同组设备（WASAPI 独占要求同组 API）。")
+                    self.status_bar.showMessage("输入输出 API 不一致且无法自动对齐", 8000)
         finally:
             self._device_guard = False
 
@@ -1731,14 +1807,16 @@ class MainWindow(QMainWindow):
         in_id = find(self.ic.currentDeviceName(), self.ic.currentDeviceApi(), "max_input_channels")
         out_id = find(self.oc.currentDeviceName(), self.oc.currentDeviceApi(), "max_output_channels")
         if in_id == "missing":
-            return None, None, "输入设备已不存在，请刷新后重选"
+            return None, None, f"输入设备「{self.ic.currentDeviceName()}」已不存在，请点「刷新设备」后重选"
         if out_id == "missing":
-            return None, None, "输出设备已不存在，请刷新后重选"
+            return None, None, f"输出设备「{self.oc.currentDeviceName()}」已不存在，请点「刷新设备」后重选"
         if in_id is not None and out_id is not None:
             if devs[in_id]["hostapi"] != devs[out_id]["hostapi"]:
                 ain = apis[devs[in_id]["hostapi"]]["name"]
                 aout = apis[devs[out_id]["hostapi"]]["name"]
-                return None, None, "输入输出必须同一组 API（当前 %s / %s）" % (ain, aout)
+                return None, None, (
+                    f"输入（{ain}）与输出（{aout}）不是同一组 API，"
+                    "WASAPI 独占要求同组；请手动选择同组设备")
         return in_id, out_id, None
 
     def _rd(self, restore=True, reinit=True):
@@ -1782,6 +1860,7 @@ class MainWindow(QMainWindow):
         _in, _out, err = self._resolve_selected(reinit=False)
         if err:
             self.engine._hard_stop()
+            self._show_dev_hint("音频设备已断开: " + err)
             self.status_bar.showMessage("音频设备已断开: " + err, 8000)
 
     def _preferred_speaker_index(self):
@@ -1867,7 +1946,20 @@ class MainWindow(QMainWindow):
             return
         self._set_light(LIGHT_RED, "加载失败")
         self.sb.setEnabled(True)
-        self.status_bar.showMessage("加载失败: " + str(err), 8000)
+        text = (err or "未知错误").strip()
+        if len(text) > 300:
+            text = text[:300] + "…"
+        self.status_bar.showMessage("加载失败: " + text, 8000)
+        QMessageBox.warning(
+            self, "模型加载失败", text + NL + NL +
+            "请确认：模型文件完整且路径正确；服务器模式下请确认服务器已启动。")
+
+    def _on_start_failed(self, msg):
+        """启动变声失败：常驻提示 + 弹窗。"""
+        text = (msg or "未知错误").strip()
+        self._show_dev_hint("启动失败: " + text[:200])
+        self.status_bar.showMessage("启动失败: " + text, 8000)
+        QMessageBox.warning(self, "启动失败", text[:300])
 
     def _set_light(self, color, text):
         self.light.setStyleSheet(f"background:{color};border-radius:5px;")
@@ -1877,6 +1969,7 @@ class MainWindow(QMainWindow):
 
     def _on_started(self):
         self._set_light(LIGHT_GREEN, "运行中")
+        self._clear_dev_hint()
         self.sb.setText("停止变声")
         self.sb.setProperty("state", "on")
         self.sb.style().unpolish(self.sb); self.sb.style().polish(self.sb)
@@ -1945,6 +2038,7 @@ class MainWindow(QMainWindow):
             return
         in_id, out_id, err = self._resolve_selected(reinit=True)
         if err:
+            self._show_dev_hint(err)
             QMessageBox.warning(self, "设备", err)
             return
         self.engine.input_device = in_id
@@ -2080,6 +2174,9 @@ class MainWindow(QMainWindow):
         self.engine.set_monitor(
             self.monitor_cb.isChecked(), dev_id, self.monitor_vol.value() / 100.0)
         self._persist_settings()
+        if self.monitor_cb.isChecked() and dev_id is None:
+            self.status_bar.showMessage(
+                "请先在「监听」下方选择监听输出设备（如耳机）", 8000)
 
     def _monitor_device_id(self):
         name = self.mc.currentDeviceName()
@@ -2205,6 +2302,23 @@ class MainWindow(QMainWindow):
         url = self.server_edit.text().strip() or DEFAULT_SERVER_URL
         self.engine.set_server_url(url)
         self._persist_settings()
+        ok = False
+        try:
+            ok = bool(self.engine.pipeline.connect(timeout=5))
+        except Exception as e:
+            ok = False
+            self.status_bar.showMessage("连接失败: " + _friendly_net_error(e), 8000)
+            QMessageBox.warning(
+                self, "连接服务器",
+                "无法连接 " + url + NL + NL + _friendly_net_error(e))
+            return
+        if ok:
+            self.status_bar.showMessage("已连接服务器: " + url, 5000)
+        else:
+            QMessageBox.warning(
+                self, "连接服务器",
+                "无法连接 " + url + NL + NL +
+                "请确认：服务器已启动、地址与端口正确（默认 8765）、防火墙已放行。")
 
     def _apply_saved_params(self):
         s = self._settings
