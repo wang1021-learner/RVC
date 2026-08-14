@@ -31,11 +31,6 @@ matplotlib>=3.8.2,<4
 networkx>=3.2.0,<4
 numpy>=1.26.4,<2
 
-# Five-model MSST inference backend. Install both packages from the index;
-# local wheel paths are intentionally not used by this requirements file.
-pymss==2.0.14
-pymss-core==0.1.4
-
 # ONNX Runtime 1.19.x uses the CUDA 12 / cuDNN 9 provider ABI. Later current
 # releases have moved to CUDA 13, so this compatibility window is intentional.
 onnxruntime-gpu>=1.19.2,<1.20

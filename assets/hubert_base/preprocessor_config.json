@@ -1,0 +1,10 @@
+{
+  "do_normalize": true,
+  "feature_extractor_type": "Wav2Vec2FeatureExtractor",
+  "hop_length": 160,
+  "max_length": 2000000000,
+  "model_input_name": "input_values",
+  "padding_side": "right",
+  "return_attention_mask": true,
+  "sampling_rate": 16000
+}
