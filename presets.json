@@ -1,0 +1,19 @@
+{
+  "presets": [
+    {
+      "name": "示例-我的自定义",
+      "params": {
+        "block_time": 0.08,
+        "crossfade_time": 0.02,
+        "extra_time": 1.5,
+        "f0method": "rmvpe",
+        "I_noise_reduce": false,
+        "O_noise_reduce": false,
+        "rms_mix_rate": 0.3,
+        "threhold": -50,
+        "formant": 0.0,
+        "dry_mix": 0.0
+      }
+    }
+  ]
+}
