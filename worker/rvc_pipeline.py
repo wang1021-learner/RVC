@@ -3,6 +3,7 @@ import os, time, traceback
 import numpy as np, torch, torch.nn.functional as F, torchaudio.transforms as tat
 from configs.config import Config
 from infer import rtrvc as rvc_for_realtime
+from tools.dsp import DeEsser, OnePoleLP
 from tools.output_protector import OutputProtector
 from tools.torchgate import TorchGate
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
@@ -26,6 +27,10 @@ class RVCPipeline:
         # 输出保护：直流高通 + 软限幅（默认开启，-1 dBFS 起限）
         self.limiter_enable = True
         self.limiter_threshold_db = -1.0
+        # 音质增强：高频齿音直通 / 临场感 / 去齿音（实时生效）
+        self.hf_mix_rate = 0.3
+        self.presence = 0.15
+        self.deesser_enable = True
         self._active = False
         self.last_stage_ms = {}
 
@@ -171,6 +176,11 @@ class RVCPipeline:
             self._input_wav[-indata.shape[0]:] = torch.from_numpy(indata).to(self.config.device)
             if self.threhold > -80:
                 self._gate_last_block(indata.shape[0])
+            # 高频齿音直通：从 48k 原声提取 >6kHz 气音，与输入同延迟线滚动
+            if self.hf_mix_rate > 0:
+                hf_new = self._hp_hf.highpass(self._input_wav[-indata.shape[0]:])
+                self._hf_wav = torch.roll(self._hf_wav, -self._block_frame, dims=0)
+                self._hf_wav[-indata.shape[0]:] = hf_new
             self._input_wav_res = torch.roll(self._input_wav_res, -self._block_frame_16k, dims=0)
             if self.I_noise_reduce:
                 self._input_wav_denoise = torch.roll(self._input_wav_denoise, -self._block_frame, dims=0)
@@ -246,6 +256,11 @@ class RVCPipeline:
             threshold_db=self.limiter_threshold_db,
             device=dev,
         )
+        # 音质增强：齿音提取高通 + 同构延迟线 + 临场感 + 去齿音
+        self._hp_hf = OnePoleLP(6000.0, self.samplerate, dev)
+        self._hf_wav = torch.zeros(total, device=dev, dtype=dt)
+        self._hp_pres = OnePoleLP(3000.0, self.samplerate, dev)
+        self._deesser = DeEsser(sample_rate=self.samplerate, device=dev)
 
     def _prewarm(self):
         if not cuda_graph_enabled(self.config.device):
@@ -276,7 +291,7 @@ class RVCPipeline:
 
     def _zero_buffers(self):
         """清空全部环形缓冲和 f0 缓存（start 跳过重建时也要清，防止旧数据残留）"""
-        for a in ["_input_wav", "_input_wav_denoise", "_input_wav_res", "_output_buffer", "_sola_buffer", "_nr_buffer", "_gate_hist"]:
+        for a in ["_input_wav", "_input_wav_denoise", "_input_wav_res", "_output_buffer", "_sola_buffer", "_nr_buffer", "_gate_hist", "_hf_wav"]:
             obj = getattr(self, a, None)
             if obj is not None:
                 obj.zero_()
@@ -285,6 +300,10 @@ class RVCPipeline:
             self.rvc.cache_pitchf.zero_()
         if hasattr(self, "_protector"):
             self._protector.reset()
+        for a in ("_hp_hf", "_hp_pres", "_deesser"):
+            obj = getattr(self, a, None)
+            if obj is not None:
+                obj.reset()
 
     def _gate_last_block(self, n):
         """在 GPU 上按 10ms 帧做静音门，避免 librosa 每块回 CPU。"""
@@ -342,6 +361,31 @@ class RVCPipeline:
         infer_wav[:self._sola_buffer_frame] *= self._fade_in_window
         infer_wav[:self._sola_buffer_frame] += self._sola_buffer * self._fade_out_window
         self._sola_buffer[:] = infer_wav[self._block_frame:self._block_frame + self._sola_buffer_frame]
+        # ── 高频齿音直通补偿：48k 原声提取的气音按能量门限混回输出 ──
+        if self.hf_mix_rate > 0 and hasattr(self, "_hf_wav"):
+            end = -self._extra_frame if self._extra_frame > 0 else None
+            hf_block = self._hf_wav[-(self._extra_frame + self._block_frame): end]
+            in_tail = self._input_wav[-(self._extra_frame + self._block_frame): end]
+            hf_energy = hf_block.square().mean()
+            full_energy = in_tail.square().mean().clamp(min=1e-8)
+            ratio = hf_energy / full_energy
+            # 齿音占比门限：气音显著时混回，元音频段不动作
+            gate = ((ratio - 0.005) / 0.03).clamp(0.0, 1.0)
+            mix = self.hf_mix_rate * gate * 0.5
+            infer_wav[:self._block_frame] = (
+                infer_wav[:self._block_frame] * (1.0 - mix) + hf_block * mix
+            )
+        # ── 内置 DSP：自适应去齿音 + 临场感提升（状态跨块连续）──
+        if self.deesser_enable and hasattr(self, "_deesser"):
+            infer_wav[:self._block_frame] = self._deesser.process(
+                infer_wav[:self._block_frame]
+            )
+        if self.presence > 0 and hasattr(self, "_hp_pres"):
+            k = float(self.presence) * 0.3
+            infer_wav[:self._block_frame] = (
+                infer_wav[:self._block_frame]
+                + k * self._hp_pres.highpass(infer_wav[:self._block_frame])
+            )
         # 输出保护：对最终输出块做直流高通 + 软限幅（状态跨块连续，
         # 每个输出样本在其输出块上恰好经过一次保护）
         if self.limiter_enable and hasattr(self, "_protector"):

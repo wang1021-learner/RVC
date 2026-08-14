@@ -20,5 +20,8 @@
   "monitor_enabled": false,
   "monitor_volume": 0.8,
   "limiter_enable": true,
-  "limiter_threshold_db": -1.0
+  "limiter_threshold_db": -1.0,
+  "hf_mix_rate": 0.3,
+  "presence": 0.15,
+  "deesser_enable": true
 }

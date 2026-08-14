@@ -351,6 +351,9 @@ DEFAULT_PARAMS = {
     "threhold": -50,
     "limiter_enable": True,
     "limiter_threshold_db": -1.0,
+    "hf_mix_rate": 0.3,
+    "presence": 0.15,
+    "deesser_enable": True,
 }
 
 # 场景预设：低延迟 / 高音质 / 游戏语音 / 唱歌
@@ -901,6 +904,9 @@ class VCEngine(QObject):
     rms_mix_rate = _prop("rms_mix_rate"); threhold = _prop("threhold")
     limiter_enable = _prop("limiter_enable")
     limiter_threshold_db = _prop("limiter_threshold_db")
+    hf_mix_rate = _prop("hf_mix_rate")
+    presence = _prop("presence")
+    deesser_enable = _prop("deesser_enable")
 
     def change_pitch(self, val):
         if self.pipeline is not None:
@@ -1740,10 +1746,33 @@ class MainWindow(QMainWindow):
         pr.addWidget(self.limiter_th); pr.addStretch()
         l.addLayout(pr, len(rows) + 1, 0, 1, 2)
 
+        # 高频齿音直通（找回 s/sh/f 等清辅音细节）
+        self.hf_spin = QDoubleSpinBox(); self.hf_spin.setRange(0.0, 1.0)
+        self.hf_spin.setSingleStep(0.05); self.hf_spin.setValue(0.3)
+        self.hf_spin.setToolTip("把原声 6kHz 以上的气音/齿音按比例混回输出，改善咬字清晰度；0=关闭")
+        self.hf_spin.valueChanged.connect(lambda v: setattr(self.engine, "hf_mix_rate", v))
+        l.addWidget(self._lbl("齿音保留"), len(rows) + 2, 0)
+        l.addWidget(self.hf_spin, len(rows) + 2, 1)
+
+        # 临场感提升（3kHz 以上轻微增亮）
+        self.pres_spin = QDoubleSpinBox(); self.pres_spin.setRange(0.0, 1.0)
+        self.pres_spin.setSingleStep(0.05); self.pres_spin.setValue(0.15)
+        self.pres_spin.setToolTip("轻微提升人声穿透力，0=关闭，1=最大（约+2.5dB 高频搁架）")
+        self.pres_spin.valueChanged.connect(lambda v: setattr(self.engine, "presence", v))
+        l.addWidget(self._lbl("临场感"), len(rows) + 3, 0)
+        l.addWidget(self.pres_spin, len(rows) + 3, 1)
+
+        # 自适应去齿音
+        self.deess_cb = QCheckBox("去齿音")
+        self.deess_cb.setToolTip("监测 6kHz 以上能量，尖刺超标时自动软衰减（实时生效）")
+        self.deess_cb.setChecked(True)
+        self.deess_cb.toggled.connect(lambda v: setattr(self.engine, "deesser_enable", v))
+        l.addWidget(self.deess_cb, len(rows) + 4, 0, 1, 2)
+
         # 分阶段耗时（本地模式）
         self.st_lbl = QLabel("阶段耗时: --")
         self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
-        l.addWidget(self.st_lbl, len(rows) + 2, 0, 1, 2)
+        l.addWidget(self.st_lbl, len(rows) + 5, 0, 1, 2)
         l.setColumnStretch(1, 1)
         root.addWidget(g1)
 
@@ -2530,6 +2559,19 @@ class MainWindow(QMainWindow):
                 self.monitor_vol.setValue(int(float(s["monitor_volume"]) * 100))
             except Exception:
                 pass
+        # 音质增强（齿音保留/临场感/去齿音）
+        if "hf_mix_rate" in s:
+            try:
+                self.hf_spin.setValue(float(s["hf_mix_rate"]))
+            except Exception:
+                pass
+        if "presence" in s:
+            try:
+                self.pres_spin.setValue(float(s["presence"]))
+            except Exception:
+                pass
+        if "deesser_enable" in s:
+            self.deess_cb.setChecked(bool(s["deesser_enable"]))
 
     def _restore_devices(self):
         self.ic.blockSignals(True)
@@ -2580,6 +2622,9 @@ class MainWindow(QMainWindow):
             "monitor_volume": self.monitor_vol.value() / 100.0,
             "limiter_enable": bool(self.limiter_cb.isChecked()),
             "limiter_threshold_db": float(self.limiter_th.value()),
+            "hf_mix_rate": float(self.hf_spin.value()),
+            "presence": float(self.pres_spin.value()),
+            "deesser_enable": bool(self.deess_cb.isChecked()),
         })
         try:
             save_user_settings(data)

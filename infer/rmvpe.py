@@ -583,29 +583,24 @@ class RMVPE:
         # f0 = np.array([10 * (2 ** (cent_pred / 1200)) if cent_pred else 0 for cent_pred in cents_pred])
         return f0
 
-    def infer_from_audio(self, audio, thred=0.03):
-        # torch.cuda.synchronize()
-        # t0 = ttime()
+    def infer_hidden(self, audio):
+        """GPU 部分：mel -> 网络 hidden，保持为设备上的 Tensor（不落 CPU）。"""
         mel = self.extract_mel(audio, center=True)
-        # print(123123123,mel.device.type)
-        # torch.cuda.synchronize()
-        # t1 = ttime()
-        hidden = self.mel2hidden(mel)
-        # torch.cuda.synchronize()
-        # t2 = ttime()
-        # print(234234,hidden.device.type)
+        return self.mel2hidden(mel)
+
+    def decode_hidden(self, hidden, thred=0.03):
+        """CPU 部分：hidden -> f0 numpy（含取回同步）。"""
         if "privateuseone" not in str(self.device):
             hidden = hidden.squeeze(0).cpu().numpy()
         else:
             hidden = hidden[0]
         if self.is_half == True:
             hidden = hidden.astype("float32")
+        return self.decode(hidden, thred=thred)
 
-        f0 = self.decode(hidden, thred=thred)
-        # torch.cuda.synchronize()
-        # t3 = ttime()
-        # print("hmvpe:%s\t%s\t%s\t%s"%(t1-t0,t2-t1,t3-t2,t3-t0))
-        return f0
+    def infer_from_audio(self, audio, thred=0.03):
+        hidden = self.infer_hidden(audio)
+        return self.decode_hidden(hidden, thred=thred)
 
     def to_local_average_cents(self, salience, thred=0.05):
         # t0 = ttime()

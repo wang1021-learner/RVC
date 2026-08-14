@@ -127,6 +127,20 @@ class RVC:
             )
             self.infer_count = 0
             self.last_stage_ms = {}
+            # 优化4：F0 提取专用 CUDA 流（与 HuBERT 并行）
+            if (
+                str(self.device).startswith("cuda")
+                and os.environ.get("RVC_NO_F0_STREAM") != "1"
+            ):
+                self._f0_stream = torch.cuda.Stream(device=self.device)
+            else:
+                self._f0_stream = None
+            self._f0_pending = None
+            # 优化3：GPU 索引检索（低显存/异常自动回退 CPU 路径）
+            self.index_gpu = None
+            self._index_norm = None
+            self._gpu_index_checked = False
+            self.index_temp = 0.05  # Softmax 温度：越小越接近硬选择（余弦相似度分布较窄）
 
             self.resample_kernel = {}
 
@@ -209,6 +223,54 @@ class RVC:
                 got = np.stack([self.index.reconstruct(int(i)) for i in ids], axis=0)
             vecs[mask] = got
         return vecs.reshape(ix_safe.shape + (self.index.d,))
+
+    def _ensure_gpu_index(self):
+        """把预载的索引向量搬进显存做余弦 Top-K（一次），低显存/异常回退 CPU。"""
+        if getattr(self, "_gpu_index_checked", False):
+            return
+        self._gpu_index_checked = True
+        try:
+            if os.environ.get("RVC_CPU_INDEX") == "1":
+                return
+            dev = torch.device(self.device)
+            if dev.type != "cuda" or self.big_npy is None:
+                return
+            mem_gb = torch.cuda.get_device_properties(dev).total_memory / (1024**3)
+            if mem_gb < 3.5:
+                return  # 显存紧张，保持 CPU 检索
+            dtype = torch.float32 if mem_gb >= 6 else torch.float16
+            idx_t = torch.from_numpy(self.big_npy).to(dev, dtype=dtype)
+            norm = torch.nn.functional.normalize(idx_t.float(), dim=-1).t().contiguous()
+            self._index_norm = norm.to(dtype=dtype)
+            self.index_gpu = idx_t
+        except Exception:
+            self.index_gpu = None
+            self._index_norm = None
+
+    def _get_f0_gpu(self, x, f0_up_key, method):
+        """F0 提取的 GPU 部分（不落 CPU），返回 (hidden, method) 供后续解码。"""
+        if method == "rmvpe":
+            if not hasattr(self, "model_rmvpe"):
+                from infer.rmvpe import RMVPE
+
+                printt(i18n("正在加载RMVPE模型"))
+                self.model_rmvpe = RMVPE(
+                    _RMVPE_PATH,
+                    is_half=self.is_half,
+                    device=self.device,
+                )
+            return self.model_rmvpe.infer_hidden(x), method
+        raise ValueError(f"F0 method does not support GPU split: {method}")
+
+    def _finish_f0(self, pending, f0_up_key):
+        """F0 提取的 CPU 部分：同步取回并解码（在主流等待事件后调用）。"""
+        hidden, method = pending
+        if method == "rmvpe":
+            f0 = self.model_rmvpe.decode_hidden(hidden, thred=0.03)
+            f0 = _fill_short_uv(f0)
+            f0 *= pow(2, f0_up_key / 12)
+            return self.get_f0_post(f0)
+        raise ValueError(f"F0 method does not support GPU split: {method}")
 
     def change_index_rate(self, new_index_rate):
         if new_index_rate != 0 and not hasattr(self, "index"):
@@ -311,6 +373,26 @@ class RVC:
             else:
                 feats = input_wav.float().view(1, -1)
             padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
+            # ── 优化4：F0 提取（GPU 部分）先在辅助流发射，与 HuBERT 并行 ──
+            self._f0_pending = None
+            self._f0_event = None
+            if self.if_f0 == 1:
+                f0_extractor_frame = block_frame_16k + 800
+                if f0method == "rmvpe":
+                    f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
+                f0_tail = input_wav[-min(f0_extractor_frame, input_wav.shape[0]):]
+                f0_key = self.f0_up_key - self.formant_shift
+                if self._f0_stream is not None and f0method in ("rmvpe",):
+                    try:
+                        with torch.cuda.stream(self._f0_stream):
+                            self._f0_stream.wait_stream(torch.cuda.current_stream())
+                            self._f0_pending = self._get_f0_gpu(f0_tail, f0_key, f0method)
+                            self._f0_event = torch.cuda.Event()
+                            self._f0_event.record(self._f0_stream)
+                    except Exception:
+                        self._f0_pending = None
+                if self._f0_pending is None:
+                    pitch, pitchf = self.get_f0(f0_tail, f0_key, f0method)
             feats = extract_hubert_features(
                 self.model,
                 feats,
@@ -321,38 +403,56 @@ class RVC:
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
-                # HuBERT hop=320@16k。只搜本块新帧 + 2 帧重叠，避免整段 extra 都走 CPU
+                # HuBERT hop=320@16k。只搜本块新帧 + 2 帧重叠
                 n_new = max(1, int(block_frame_16k) // 320 + 2)
                 start = max(int(skip_head) // 2, feats.shape[1] - n_new)
-                npy = feats[0][start:].cpu().numpy().astype("float32")
-                score, ix = self.index.search(npy, k=4)
-                valid = ix >= 0
-                if valid.any():
-                    weight = np.square(1.0 / (np.maximum(score, 0.0) + 1e-6))
-                    weight = np.where(valid, weight, 0.0)
-                    denom = weight.sum(axis=1, keepdims=True)
-                    use = denom[:, 0] > 0
-                    weight[use] /= denom[use]
-                    ix_safe = np.where(valid, ix, 0)
-                    retrieved = np.sum(
-                        self._gather_index_vectors(ix_safe, valid)
-                        * np.expand_dims(weight, axis=2),
-                        axis=1,
-                    )
-                    if self.config.is_half:
-                        retrieved = retrieved.astype("float16")
+                # ── 优化3：GPU 余弦 Top-K + 温度 Softmax（低显存自动回退 CPU）──
+                self._ensure_gpu_index()
+                if self.index_gpu is not None:
+                    q = feats[0][start:]
+                    qn = torch.nn.functional.normalize(q.float(), dim=-1)
+                    if self._index_norm.dtype == torch.float16:
+                        qn = qn.half()
+                    sim = qn @ self._index_norm
+                    top_sim, top_ix = sim.topk(k=4, dim=-1)
+                    w = torch.softmax(top_sim / self.index_temp, dim=-1)
+                    retrieved = (w.unsqueeze(-1) * self.index_gpu[top_ix]).sum(-2)
                     mixed = feats[0][start:]
-                    retrieved_t = torch.from_numpy(retrieved).to(
-                        device=mixed.device, dtype=mixed.dtype
-                    )
-                    use_t = torch.from_numpy(use).to(mixed.device)
-                    mixed[use_t] = (
-                        retrieved_t[use_t] * self.index_rate
-                        + (1.0 - self.index_rate) * mixed[use_t]
+                    mixed = (
+                        retrieved.to(dtype=mixed.dtype) * self.index_rate
+                        + (1.0 - self.index_rate) * mixed
                     )
                     feats[0][start:] = mixed
-                elif report_status:
-                    printt(i18n("索引检索失败或未启用"))
+                else:
+                    npy = feats[0][start:].cpu().numpy().astype("float32")
+                    score, ix = self.index.search(npy, k=4)
+                    valid = ix >= 0
+                    if valid.any():
+                        weight = np.square(1.0 / (np.maximum(score, 0.0) + 1e-6))
+                        weight = np.where(valid, weight, 0.0)
+                        denom = weight.sum(axis=1, keepdims=True)
+                        use = denom[:, 0] > 0
+                        weight[use] /= denom[use]
+                        ix_safe = np.where(valid, ix, 0)
+                        retrieved = np.sum(
+                            self._gather_index_vectors(ix_safe, valid)
+                            * np.expand_dims(weight, axis=2),
+                            axis=1,
+                        )
+                        if self.config.is_half:
+                            retrieved = retrieved.astype("float16")
+                        mixed = feats[0][start:]
+                        retrieved_t = torch.from_numpy(retrieved).to(
+                            device=mixed.device, dtype=mixed.dtype
+                        )
+                        use_t = torch.from_numpy(use).to(mixed.device)
+                        mixed[use_t] = (
+                            retrieved_t[use_t] * self.index_rate
+                            + (1.0 - self.index_rate) * mixed[use_t]
+                        )
+                        feats[0][start:] = mixed
+                    elif report_status:
+                        printt(i18n("索引检索失败或未启用"))
             else:
                 if report_status:
                     printt(i18n("索引检索失败或未启用"))
@@ -364,14 +464,14 @@ class RVC:
         factor = pow(2, self.formant_shift / 12)
         return_length2 = int(np.ceil(return_length * factor))
         if self.if_f0 == 1:
-            f0_extractor_frame = block_frame_16k + 800
-            if f0method == "rmvpe":
-                f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
-            pitch, pitchf = self.get_f0(
-                input_wav[-min(f0_extractor_frame, input_wav.shape[0]):],
-                self.f0_up_key - self.formant_shift,
-                f0method,
-            )
+            if self._f0_pending is not None:
+                # 等 F0 辅助流完成，再取回解码（HuBERT/检索已与其并行执行）
+                try:
+                    torch.cuda.current_stream().wait_event(self._f0_event)
+                    pitch, pitchf = self._finish_f0(self._f0_pending, f0_key)
+                except Exception:
+                    traceback.print_exc()
+                    pitch, pitchf = self.get_f0(f0_tail, f0_key, f0method)
             shift = block_frame_16k // 160
             self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
             self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()

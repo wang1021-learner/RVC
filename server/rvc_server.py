@@ -18,6 +18,7 @@ INFER_KEYS = (
     "block_time", "crossfade_time", "extra_time", "f0method",
     "I_noise_reduce", "O_noise_reduce", "rms_mix_rate", "threhold",
     "limiter_enable", "limiter_threshold_db",
+    "hf_mix_rate", "presence", "deesser_enable",
 )
 
 
