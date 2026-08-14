@@ -175,7 +175,8 @@ class RVCPipeline:
             if self.I_noise_reduce:
                 self._input_wav_denoise = torch.roll(self._input_wav_denoise, -self._block_frame, dims=0)
                 iw = self._input_wav[-self._sola_buffer_frame - self._block_frame:]
-                iw = self._tg(iw.unsqueeze(0), self._input_wav.unsqueeze(0)).squeeze(0)
+                ref = self._input_wav[-self._nr_ref_frame:]
+                iw = self._tg(iw.unsqueeze(0), ref.unsqueeze(0)).squeeze(0)
                 iw[:self._sola_buffer_frame] *= self._fade_in_window
                 iw[:self._sola_buffer_frame] += self._nr_buffer * self._fade_out_window
                 self._input_wav_denoise[-self._block_frame:] = iw[:self._block_frame]
@@ -218,6 +219,8 @@ class RVCPipeline:
         self._sola_search_frame = 3 * zc
         self._extra_frame = int(round(self.extra_time * self.samplerate / zc)) * zc
         total = self._extra_frame + cf + self._sola_search_frame + bf
+        # 输入降噪的参考窗口：300ms 足够统计噪声，不必送整条缓冲进 TorchGate
+        self._nr_ref_frame = min(total, 30 * zc)
         dev, dt = self.config.device, torch.float32
         self._input_wav = torch.zeros(total, device=dev, dtype=dt)
         self._input_wav_denoise = self._input_wav.clone()
@@ -254,7 +257,7 @@ class RVCPipeline:
             self._input_wav_res.copy_(0.05 * torch.sin(2 * np.pi * 220.0 * phase / 16000.0))
             if self.I_noise_reduce:
                 s = self._input_wav[-self._sola_buffer_frame - self._block_frame:].unsqueeze(0)
-                self._tg(s, self._input_wav.unsqueeze(0))
+                self._tg(s, self._input_wav[-self._nr_ref_frame:].unsqueeze(0))
             ri = self._input_wav[-self._block_frame - 2 * self._zc:]
             run_cuda_graph(self._resampler, "warmup-resample", lambda a: self._resampler(a), ri)
             _ = self.rvc.infer(self._input_wav_res, self._block_frame_16k, self._skip_head, self._return_length, self.f0method)

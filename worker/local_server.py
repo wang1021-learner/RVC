@@ -28,15 +28,23 @@ def package_root():
     return Path(__file__).resolve().parent.parent
 
 
-def source_dir():
-    return package_root() / "source"
-
-
 def runtime_python():
-    return package_root() / "runtime" / "python.exe"
+    """本机推理用的 Python：冻结版用包内 runtime，源码版用当前解释器。"""
+    if is_frozen():
+        return package_root() / "runtime" / "python.exe"
+    return Path(sys.executable)
+
+
+def source_dir():
+    """服务端源码根目录：冻结版为包内 source/，源码版为项目根目录。"""
+    if is_frozen():
+        return package_root() / "source"
+    return package_root()
 
 
 def runtime_installed():
+    if not is_frozen():
+        return True  # 源码模式：当前解释器已具备全部依赖
     return runtime_python().is_file()
 
 
@@ -53,11 +61,10 @@ def port_in_use(port, host="127.0.0.1"):
 class LocalServerPipeline(RVCClient):
     """本地子进程推理：与 RVCClient 同协议，额外管理服务进程生命周期。
 
-    属性 use_basenames=True：加载模型时只发送文件名，
-    由服务端在自己的 assets/weights、logs 目录解析（服务端已实现）。
+    模型路径原样透传：同一台机器上服务端可直接打开客户端选的文件；
+    只有文件名时由服务端在自己的 assets/weights、logs 目录解析。
     """
 
-    use_basenames = True
     is_remote = False      # 语义上是"本地模式"（不映射远程服务器路径）
     is_network = True      # 但底层是网络管线，断线时可走重连恢复
 
@@ -65,6 +72,7 @@ class LocalServerPipeline(RVCClient):
         super().__init__(server_url, on_status=on_status)
         self._proc = None
         self._owns_process = False
+        self._log_fh = None
 
     # ── 服务进程管理 ──
     def ensure_server(self, timeout=40.0):
@@ -81,13 +89,20 @@ class LocalServerPipeline(RVCClient):
             self._on_status("本地推理文件缺失，请重新安装")
             return False
         self._on_status("正在启动本地推理服务（首次约 10~30 秒）...")
+        # 服务端输出写入日志文件，方便排查（冻结版无控制台）
+        try:
+            log_dir = package_root() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            self._log_fh = open(log_dir / "local_server.log", "ab", buffering=0)
+        except Exception:
+            self._log_fh = None
         try:
             self._proc = subprocess.Popen(
                 [str(py), str(script), "--host", "127.0.0.1",
                  "--port", str(DEFAULT_LOCAL_PORT)],
                 cwd=str(src),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=self._log_fh or subprocess.DEVNULL,
+                stderr=self._log_fh or subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             self._owns_process = True
@@ -118,6 +133,12 @@ class LocalServerPipeline(RVCClient):
                 pass
         self._proc = None
         self._owns_process = False
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            except Exception:
+                pass
+            self._log_fh = None
 
     # ── 接口适配 ──
     def connect(self, timeout=5):

@@ -4,7 +4,7 @@ RVC 实时变声 - 桌面客户端
 ============================
 架构: MainWindow(UI) -> VCEngine(音频+信号) -> RVCClient(服务器推理)
 """
-import os, sys, json, queue, time, subprocess
+import os, sys, json, queue, time, subprocess, logging, traceback
 from pathlib import Path
 import numpy as np
 import wave as wave_mod
@@ -225,6 +225,45 @@ from tools.audio_meter import VUMeterWidget, calc_rms_db
 from tools.audio_process import AutoGain
 
 
+def setup_logging():
+    """应用日志落盘：logs/app.log（源码版=项目根，冻结版=exe 目录）。"""
+    try:
+        log_dir = package_root() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        root = logging.getLogger()
+        if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+            fh = logging.FileHandler(log_dir / "app.log", encoding="utf-8")
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s %(levelname)s %(name)s: %(message)s"))
+            root.addHandler(fh)
+            root.setLevel(logging.INFO)
+    except Exception:
+        pass
+
+
+def _excepthook(exc_type, exc, tb):
+    """未捕获异常：写入 crash.log 并弹窗提示（日志路径随包定位）。"""
+    logging.getLogger("crash").critical("未捕获异常", exc_info=(exc_type, exc, tb))
+    try:
+        log_dir = package_root() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        with open(log_dir / "crash.log", "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 60 + "\n" + text)
+    except Exception:
+        pass
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        if QApplication.instance() is not None:
+            QMessageBox.critical(
+                None, "程序错误",
+                "发生未处理的错误，日志已保存到 logs 目录（app.log / crash.log）\n\n"
+                + str(exc)[:300])
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc, tb)
+
+
 class LazyLocalPipeline:
     """启动时不立刻 import torch，第一次加载角色再进本机推理。"""
     is_remote = False
@@ -283,8 +322,9 @@ class LazyLocalPipeline:
 
 def make_pipeline(mode, server_url, on_status):
     if mode == "local":
-        if is_frozen():
-            # 冻结版：本地推理 = 本机子进程服务（不内置 torch，延迟连接）
+        if not os.environ.get("RVC_DIRECT_LOCAL"):
+            # 统一走本机子进程推理（崩溃隔离、单一代码路径、UI 启动不加载 torch）；
+            # 设置环境变量 RVC_DIRECT_LOCAL=1 可回退为进程内直连（旧行为）
             from worker.local_server import LocalServerPipeline
             return LocalServerPipeline(on_status=on_status)
         return LazyLocalPipeline(on_status)
@@ -942,12 +982,8 @@ class VCEngine(QObject):
                 to_server_path(speaker.model_path),
                 to_server_path(speaker.index_path) if speaker.index_path else "",
             )
-        # 冻结版本地子进程服务：只发文件名，由服务端在自己的目录解析
-        if getattr(self.pipeline, "use_basenames", False):
-            return (
-                Path(str(speaker.model_path)).name,
-                Path(str(speaker.index_path)).name if speaker.index_path else "",
-            )
+        # 本地模式（直连或本机子进程）：路径原样透传。
+        # 绝对路径由服务端直接打开；只有文件名时由服务端在自己的目录解析。
         return speaker.model_path or "", speaker.index_path or ""
 
     def _ensure_connected(self):
@@ -2610,6 +2646,8 @@ class SpeakerDialog(QDialog):
 # 入口
 # ==============================================================================
 if __name__ == "__main__":
+    setup_logging()
+    sys.excepthook = _excepthook
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE_QSS)

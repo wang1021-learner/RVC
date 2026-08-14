@@ -185,6 +185,15 @@ class RVC:
         except Exception:
             faiss.downcast_index(self.index).make_direct_map()
             self.index.reconstruct(0)
+        # 一次性预载全部索引向量，之后每块检索不再逐条 reconstruct_batch
+        try:
+            ntotal = int(getattr(self.index, "ntotal", 0) or 0)
+            if ntotal > 0:
+                self.big_npy = np.ascontiguousarray(
+                    self.index.reconstruct_n(0, ntotal), dtype=np.float32
+                )
+        except Exception:
+            self.big_npy = None
 
     def _gather_index_vectors(self, ix_safe, valid):
         if self.big_npy is not None:
