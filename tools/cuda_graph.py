@@ -179,7 +179,16 @@ class _GraphCache:
                     return function(*inputs)
             else:
                 self.entries.move_to_end(signature)
-        output = entry.replay(inputs)
+        try:
+            output = entry.replay(inputs)
+        except Exception:
+            # replay 失败（图内存状态/驱动校验问题）→ 丢弃该图并永久回退 eager
+            with self.lock:
+                self.entries.pop(signature, None)
+                self.failures.add(signature)
+                self.replay_count += 1
+            logger.exception("CUDA Graph replay failed for %s; falling back to eager", key)
+            return function(*inputs)
         with self.lock:
             self.replay_count += 1
         return output

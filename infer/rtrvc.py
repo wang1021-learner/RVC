@@ -1,4 +1,5 @@
 import traceback
+import os
 from time import time as ttime
 import faiss
 import numpy as np
@@ -15,12 +16,36 @@ from tools.cuda_graph import run_cuda_graph
 
 i18n = I18nAuto()
 
+_ASSET_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets")
+_RMVPE_PATH = os.path.join(_ASSET_ROOT, "rmvpe", "rmvpe.pt")
+
 
 def printt(strr, *args):
     if len(args) == 0:
         print(strr)
     else:
         print(strr % args)
+
+
+def _fill_short_uv(f0, max_gap=3):
+    """Keep unvoiced frames at 0. Only interpolate holes shorter than max_gap."""
+    f0 = np.asarray(f0, dtype=np.float32).copy()
+    voiced = f0 > 0
+    if not np.any(voiced):
+        return f0
+    n = f0.shape[0]
+    i = 0
+    while i < n:
+        if voiced[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not voiced[j]:
+            j += 1
+        if i > 0 and j < n and (j - i) <= max_gap:
+            f0[i:j] = np.interp(np.arange(i, j), [i - 1, j], [f0[i - 1], f0[j]])
+        i = j
+    return f0
 
 
 def get_synthesizer(pth_path, device=torch.device("cpu")):
@@ -81,10 +106,16 @@ class RVC:
             self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
             self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
             self.is_half = config.is_half
-            if index_rate != 0:
-                self.index = faiss.read_index(index_path)
-                self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
-                printt(i18n("已启用索引检索"))
+            if index_rate != 0 and index_path and os.path.exists(index_path):
+                try:
+                    self._load_faiss_index(index_path)
+                    printt(i18n("已启用索引检索"))
+                except Exception:
+                    traceback.print_exc()
+                    printt(i18n("索引检索失败"))
+                    index_rate = 0
+            else:
+                index_rate = 0
             self.pth_path = pth_path
             self.index_path = index_path
             self.index_rate = index_rate
@@ -95,6 +126,7 @@ class RVC:
                 1024, device=self.device, dtype=torch.float32
             )
             self.infer_count = 0
+            self.last_stage_ms = {}
 
             self.resample_kernel = {}
 
@@ -129,8 +161,10 @@ class RVC:
                 self.model_rmvpe = last_rvc.model_rmvpe
             if last_rvc is not None and hasattr(last_rvc, "model_fcpe"):
                 self.model_fcpe = last_rvc.model_fcpe
-        except:
-            printt(traceback.format_exc())
+        except Exception:
+            # 不吞异常：加载失败必须让调用方知道，避免半初始化对象后续崩溃
+            traceback.print_exc()
+            raise
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -138,11 +172,47 @@ class RVC:
     def change_formant(self, new_formant):
         self.formant_shift = new_formant
 
+    def _load_faiss_index(self, index_path):
+        self.index = faiss.read_index(index_path)
+        if hasattr(self.index, "nprobe"):
+            try:
+                self.index.nprobe = max(4, int(getattr(self.index, "nprobe", 1) or 1))
+            except Exception:
+                pass
+        self.big_npy = None
+        try:
+            self.index.reconstruct(0)
+        except Exception:
+            faiss.downcast_index(self.index).make_direct_map()
+            self.index.reconstruct(0)
+
+    def _gather_index_vectors(self, ix_safe, valid):
+        if self.big_npy is not None:
+            return self.big_npy[ix_safe]
+        flat = np.ascontiguousarray(ix_safe.reshape(-1), dtype=np.int64)
+        mask = valid.reshape(-1)
+        vecs = np.zeros((flat.size, self.index.d), dtype=np.float32)
+        ids = flat[mask]
+        if ids.size:
+            try:
+                got = self.index.reconstruct_batch(ids)
+            except Exception:
+                got = np.stack([self.index.reconstruct(int(i)) for i in ids], axis=0)
+            vecs[mask] = got
+        return vecs.reshape(ix_safe.shape + (self.index.d,))
+
     def change_index_rate(self, new_index_rate):
-        if new_index_rate != 0 and self.index_rate == 0:
-            self.index = faiss.read_index(self.index_path)
-            self.big_npy = self.index.reconstruct_n(0, self.index.ntotal)
-            printt(i18n("已启用索引检索"))
+        if new_index_rate != 0 and not hasattr(self, "index"):
+            if self.index_path and os.path.exists(self.index_path):
+                try:
+                    self._load_faiss_index(self.index_path)
+                    printt(i18n("已启用索引检索"))
+                except Exception:
+                    printt(i18n("不支持从该索引重建向量，已禁用索引检索"))
+                    new_index_rate = 0
+            else:
+                printt(i18n("未配置索引文件，忽略检索"))
+                new_index_rate = 0
         self.index_rate = new_index_rate
 
     def get_f0_post(self, f0):
@@ -181,9 +251,7 @@ class RVC:
         if len(f0) < p_len:
             f0 = np.pad(f0, (0, p_len - len(f0)))
         f0 = f0[:p_len]
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        f0 = _fill_short_uv(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -193,14 +261,11 @@ class RVC:
 
             printt(i18n("正在加载RMVPE模型"))
             self.model_rmvpe = RMVPE(
-                "assets/rmvpe/rmvpe.pt",
+                _RMVPE_PATH,
                 is_half=self.is_half,
                 device=self.device,
             )
-        f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        f0 = _fill_short_uv(self.model_rmvpe.infer_from_audio(x, thred=0.03))
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -216,9 +281,7 @@ class RVC:
             decoder_mode="local_argmax",
             threshold=0.006,
         ).squeeze().detach().cpu().numpy()
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        f0 = _fill_short_uv(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -249,25 +312,38 @@ class RVC:
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
-                npy = feats[0][skip_head // 2 :].cpu().numpy().astype("float32")
-                score, ix = self.index.search(npy, k=8)
-                if (ix >= 0).all():
-                    weight = np.square(1 / score)
-                    weight /= weight.sum(axis=1, keepdims=True)
-                    npy = np.sum(
-                        self.big_npy[ix] * np.expand_dims(weight, axis=2), axis=1
+                # HuBERT hop=320@16k。只搜本块新帧 + 2 帧重叠，避免整段 extra 都走 CPU
+                n_new = max(1, int(block_frame_16k) // 320 + 2)
+                start = max(int(skip_head) // 2, feats.shape[1] - n_new)
+                npy = feats[0][start:].cpu().numpy().astype("float32")
+                score, ix = self.index.search(npy, k=4)
+                valid = ix >= 0
+                if valid.any():
+                    weight = np.square(1.0 / (np.maximum(score, 0.0) + 1e-6))
+                    weight = np.where(valid, weight, 0.0)
+                    denom = weight.sum(axis=1, keepdims=True)
+                    use = denom[:, 0] > 0
+                    weight[use] /= denom[use]
+                    ix_safe = np.where(valid, ix, 0)
+                    retrieved = np.sum(
+                        self._gather_index_vectors(ix_safe, valid)
+                        * np.expand_dims(weight, axis=2),
+                        axis=1,
                     )
                     if self.config.is_half:
-                        npy = npy.astype("float16")
-                    feats[0][skip_head // 2 :] = (
-                        torch.from_numpy(npy).unsqueeze(0).to(self.device)
-                        * self.index_rate
-                        + (1 - self.index_rate) * feats[0][skip_head // 2 :]
+                        retrieved = retrieved.astype("float16")
+                    mixed = feats[0][start:]
+                    retrieved_t = torch.from_numpy(retrieved).to(
+                        device=mixed.device, dtype=mixed.dtype
                     )
-                else:
-                    printt(
-                        i18n("索引无效：必须使用added_xxxx.index，不能使用trained_xxxx.index")
+                    use_t = torch.from_numpy(use).to(mixed.device)
+                    mixed[use_t] = (
+                        retrieved_t[use_t] * self.index_rate
+                        + (1.0 - self.index_rate) * mixed[use_t]
                     )
+                    feats[0][start:] = mixed
+                elif report_status:
+                    printt(i18n("索引检索失败或未启用"))
             else:
                 if report_status:
                     printt(i18n("索引检索失败或未启用"))
@@ -283,15 +359,20 @@ class RVC:
             if f0method == "rmvpe":
                 f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
             pitch, pitchf = self.get_f0(
-                input_wav[-f0_extractor_frame:],
+                input_wav[-min(f0_extractor_frame, input_wav.shape[0]):],
                 self.f0_up_key - self.formant_shift,
                 f0method,
             )
             shift = block_frame_16k // 160
             self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
             self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-            self.cache_pitch[4 - pitch.shape[0] :] = pitch[3:-1]
-            self.cache_pitchf[4 - pitch.shape[0] :] = pitchf[3:-1]
+            if pitch.shape[0] >= 4:
+                p_slice = pitch[3:-1]
+                pf_slice = pitchf[3:-1]
+                n_elem = p_slice.shape[0]
+                if n_elem > 0:
+                    self.cache_pitch[-n_elem:] = p_slice
+                    self.cache_pitchf[-n_elem:] = pf_slice
             cache_pitch = self.cache_pitch[None, -p_len:]
             cache_pitchf = self.cache_pitchf[None, -p_len:] * return_length2 / return_length
         t4 = ttime()
@@ -354,6 +435,13 @@ class RVC:
                 infered_audio[:, : return_length * upp_res]
             )
         t5 = ttime()
+        # 分阶段耗时（毫秒），供 UI 仪表盘/排障使用；print 保持原有节流
+        self.last_stage_ms = {
+            "feature": round((t2 - t1) * 1000.0, 2),
+            "index": round((t3 - t2) * 1000.0, 2),
+            "pitch": round((t4 - t3) * 1000.0, 2),
+            "model": round((t5 - t4) * 1000.0, 2),
+        }
         if report_status:
             printt(
                 i18n("耗时：特征=%.3f秒，索引=%.3f秒，音高=%.3f秒，模型=%.3f秒"),

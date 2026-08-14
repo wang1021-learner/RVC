@@ -206,7 +206,7 @@ class Config:
             action="store_true",
             help="torch_dml",
         )
-        cmd_opts = parser.parse_args()
+        cmd_opts, _unknown = parser.parse_known_args()
 
         cmd_opts.port = cmd_opts.port if 0 <= cmd_opts.port <= 65535 else 7865
 
@@ -249,6 +249,10 @@ class Config:
 
         if self.n_cpu == 0:
             self.n_cpu = cpu_count()
+
+        if os.environ.get("RVC_FORCE_FP32", "0") == "1":
+            self.dtype = torch.float32
+            self.is_half = False
 
         if self.is_half:
             # 6G显存配置
