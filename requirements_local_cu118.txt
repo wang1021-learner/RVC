@@ -1,0 +1,13 @@
+# RVC 本地推理服务 精简依赖（单机版 runtime 用）
+# 搭配 torch/torchaudio cu118 安装：
+#   python -m pip install torch==2.7.1+cu118 torchaudio==2.7.1+cu118 \
+#       --index-url https://mirrors.nju.edu.cn/pytorch/whl/cu118 \
+#       --extra-index-url https://mirrors.pku.edu.cn/pypi/simple
+numpy>=1.26,<3
+scipy>=1.10
+librosa>=0.10
+soundfile>=0.13
+faiss-cpu>=1.7
+praat-parselmouth>=0.4.5
+transformers>=4.49
+websockets>=10.4

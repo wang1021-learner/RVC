@@ -1,0 +1,149 @@
+"""
+冻结版（打包 exe）本机推理：以子进程方式运行仓库内的 rvc_server.py。
+
+架构：客户端 exe 不内置 torch。打包时仓库源码/模型随包放在
+<包根>/source/ 下；客户点击「安装本地推理」后，安装器在 <包根>/runtime/
+装好嵌入式 Python + torch 等依赖。本模块负责在本地模式启动/回收该服务，
+并复用 RVCClient 的 WebSocket 协议（ws://127.0.0.1:8765）。
+"""
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from worker.rvc_client import RVCClient
+
+DEFAULT_LOCAL_PORT = 8765
+
+
+def is_frozen():
+    return bool(getattr(sys, "frozen", False))
+
+
+def package_root():
+    """包根目录：冻结版为 exe 所在目录，源码版为项目根目录。"""
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def source_dir():
+    return package_root() / "source"
+
+
+def runtime_python():
+    return package_root() / "runtime" / "python.exe"
+
+
+def runtime_installed():
+    return runtime_python().is_file()
+
+
+def port_in_use(port, host="127.0.0.1"):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.settimeout(0.3)
+        result = s.connect_ex((host, port))
+        return result == 0
+    finally:
+        s.close()
+
+
+class LocalServerPipeline(RVCClient):
+    """本地子进程推理：与 RVCClient 同协议，额外管理服务进程生命周期。
+
+    属性 use_basenames=True：加载模型时只发送文件名，
+    由服务端在自己的 assets/weights、logs 目录解析（服务端已实现）。
+    """
+
+    use_basenames = True
+    is_remote = False      # 语义上是"本地模式"（不映射远程服务器路径）
+    is_network = True      # 但底层是网络管线，断线时可走重连恢复
+
+    def __init__(self, server_url="ws://127.0.0.1:8765", on_status=None):
+        super().__init__(server_url, on_status=on_status)
+        self._proc = None
+        self._owns_process = False
+
+    # ── 服务进程管理 ──
+    def ensure_server(self, timeout=40.0):
+        """确保本机推理服务在运行；必要时拉起子进程并等它监听端口。"""
+        if self._connected or port_in_use(DEFAULT_LOCAL_PORT):
+            return True
+        if not runtime_installed():
+            self._on_status("本地推理未安装：请先点击「安装本地推理」")
+            return False
+        py = runtime_python()
+        src = source_dir()
+        script = src / "server" / "rvc_server.py"
+        if not py.is_file() or not script.is_file():
+            self._on_status("本地推理文件缺失，请重新安装")
+            return False
+        self._on_status("正在启动本地推理服务（首次约 10~30 秒）...")
+        try:
+            self._proc = subprocess.Popen(
+                [str(py), str(script), "--host", "127.0.0.1",
+                 "--port", str(DEFAULT_LOCAL_PORT)],
+                cwd=str(src),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            self._owns_process = True
+        except Exception as e:
+            self._on_status("本地推理启动失败: %s" % e)
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if port_in_use(DEFAULT_LOCAL_PORT):
+                return True
+            if self._proc is not None and self._proc.poll() is not None:
+                self._on_status("本地推理服务异常退出（检查显卡驱动与安装日志）")
+                return False
+            time.sleep(0.2)
+        self._on_status("本地推理服务启动超时")
+        return False
+
+    def stop_server(self):
+        """结束由本管线拉起的服务进程。"""
+        if self._proc is not None and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=3)
+            except Exception:
+                pass
+        self._proc = None
+        self._owns_process = False
+
+    # ── 接口适配 ──
+    def connect(self, timeout=5):
+        if not self.ensure_server():
+            return False
+        return super().connect(timeout)
+
+    def unload(self):
+        """停止推理并回收本管线拉起的服务进程（模型留在服务端）。"""
+        try:
+            self.stop()
+        except Exception:
+            pass
+        if self._owns_process:
+            self.stop_server()
+
+    def load_speaker(self, model_path, index_path="", pitch=0, index_rate=0.0,
+                     formant=0.0, **params):
+        if not self.ensure_server():
+            return False
+        return super().load_speaker(
+            model_path, index_path, pitch, index_rate, formant, **params)
+
+    def start(self, **params):
+        if not self.ensure_server():
+            return False
+        if not self._connected and not super().connect(5):
+            return False
+        return super().start(**params)

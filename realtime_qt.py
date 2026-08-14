@@ -4,7 +4,7 @@ RVC 实时变声 - 桌面客户端
 ============================
 架构: MainWindow(UI) -> VCEngine(音频+信号) -> RVCClient(服务器推理)
 """
-import os, sys, json, queue, time
+import os, sys, json, queue, time, subprocess
 from pathlib import Path
 import numpy as np
 import wave as wave_mod
@@ -220,6 +220,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
 from worker.rvc_client import RVCClient
+from worker.local_server import is_frozen, package_root, runtime_installed
 from tools.audio_meter import VUMeterWidget, calc_rms_db
 from tools.audio_process import AutoGain
 
@@ -282,6 +283,10 @@ class LazyLocalPipeline:
 
 def make_pipeline(mode, server_url, on_status):
     if mode == "local":
+        if is_frozen():
+            # 冻结版：本地推理 = 本机子进程服务（不内置 torch，延迟连接）
+            from worker.local_server import LocalServerPipeline
+            return LocalServerPipeline(on_status=on_status)
         return LazyLocalPipeline(on_status)
     client = RVCClient(server_url=server_url, on_status=on_status)
     client.connect(timeout=3)
@@ -937,6 +942,12 @@ class VCEngine(QObject):
                 to_server_path(speaker.model_path),
                 to_server_path(speaker.index_path) if speaker.index_path else "",
             )
+        # 冻结版本地子进程服务：只发文件名，由服务端在自己的目录解析
+        if getattr(self.pipeline, "use_basenames", False):
+            return (
+                Path(str(speaker.model_path)).name,
+                Path(str(speaker.index_path)).name if speaker.index_path else "",
+            )
         return speaker.model_path or "", speaker.index_path or ""
 
     def _ensure_connected(self):
@@ -1181,8 +1192,18 @@ class VCEngine(QObject):
         self._hard_stop()
 
     def _try_recover(self):
-        if not self.running or self.mode == "local":
+        if not self.running:
             return
+        # 纯本地直连管线（LazyLocalPipeline）不涉及网络，无需恢复；
+        # 冻结版本地子进程/远程服务器是网络管线，允许走重连逻辑
+        if self.mode == "local" and not getattr(self.pipeline, "is_network", False):
+            return
+        # 网络管线先强制断开（清掉失效连接），再重连恢复
+        if getattr(self.pipeline, "is_network", False):
+            try:
+                self.pipeline.abort()
+            except Exception:
+                pass
         if self.pipeline.is_connected() and self.pipeline.is_loaded:
             return
         now = time.time()
@@ -1364,6 +1385,11 @@ class MainWindow(QMainWindow):
         self._dev_timer.setInterval(2500)
         self._dev_timer.timeout.connect(self._poll_devices)
         self._dev_timer.start()
+        # 冻结版：定时刷新本地推理安装状态
+        self._install_timer = QTimer(self)
+        self._install_timer.setInterval(5000)
+        self._install_timer.timeout.connect(self._refresh_local_install)
+        self._install_timer.start()
 
     def _on_rms_levels(self, in_db, out_db):
         self.in_meter.set_level(in_db)
@@ -1546,6 +1572,23 @@ class MainWindow(QMainWindow):
         sl.addWidget(self.conn_btn)
         l.addWidget(self.server_row)
         self._sync_mode_ui()
+
+        # 冻结版：本地推理一键安装入口（源码运行时隐藏）
+        self.local_install_row = QWidget()
+        il = QHBoxLayout(self.local_install_row)
+        il.setContentsMargins(0, 0, 0, 0)
+        il.setSpacing(8)
+        self.local_install_lbl = QLabel("")
+        self.local_install_lbl.setWordWrap(True)
+        self.local_install_lbl.setStyleSheet("font-size:12px;color:#b45309;")
+        self.local_install_btn = QPushButton("安装本地推理")
+        self.local_install_btn.setObjectName("btnConnect")
+        self.local_install_btn.setToolTip("下载并安装本机推理环境（需 NVIDIA 显卡与网络）")
+        self.local_install_btn.clicked.connect(self._install_local)
+        il.addWidget(self.local_install_lbl, 1)
+        il.addWidget(self.local_install_btn)
+        l.addWidget(self.local_install_row)
+        self._refresh_local_install()
 
         dl = QGridLayout(); dl.setHorizontalSpacing(8); dl.setVerticalSpacing(8)
         dl.addWidget(self._lbl("输入"), 0, 0)
@@ -2088,6 +2131,13 @@ class MainWindow(QMainWindow):
                 pass
         if self.engine.running:
             self.engine._hard_stop()
+        # 冻结版：退出时回收本机子进程推理服务
+        pipe = getattr(self.engine, "pipeline", None)
+        if pipe is not None and getattr(pipe, "stop_server", None) is not None:
+            try:
+                pipe.stop_server()
+            except Exception:
+                pass
         e.accept()
 
     def keyPressEvent(self, e):
@@ -2319,6 +2369,37 @@ class MainWindow(QMainWindow):
                 self, "连接服务器",
                 "无法连接 " + url + NL + NL +
                 "请确认：服务器已启动、地址与端口正确（默认 8765）、防火墙已放行。")
+
+    # ── 冻结版：本地推理安装 ──
+    def _refresh_local_install(self):
+        if not is_frozen():
+            self.local_install_row.setVisible(False)
+            return
+        self.local_install_row.setVisible(True)
+        if runtime_installed():
+            self.local_install_lbl.setText("本地推理环境已安装（约 3.5GB）")
+            self.local_install_btn.setText("重新安装")
+        else:
+            self.local_install_lbl.setText(
+                "本地推理未安装：需要 NVIDIA 显卡，点击右侧按钮开始（需联网，约 3.5GB）")
+            self.local_install_btn.setText("安装本地推理")
+
+    def _install_local(self):
+        root = package_root()
+        bat = root / "install_local.bat"
+        if not bat.is_file():
+            QMessageBox.warning(self, "安装本地推理",
+                                "未找到 install_local.bat（安装包不完整）")
+            return
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "RVC 本地推理安装", str(bat)],
+                cwd=str(root))
+        except Exception as e:
+            QMessageBox.warning(self, "安装本地推理", "无法打开安装窗口: " + str(e))
+            return
+        self.status_bar.showMessage(
+            "安装窗口已打开。完成后本程序会自动检测，若未生效请重启本程序", 12000)
 
     def _apply_saved_params(self):
         s = self._settings
