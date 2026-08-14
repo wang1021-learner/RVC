@@ -103,7 +103,7 @@
       "model_path": "thchs_female_200e.pth",
       "index_path": "",
       "speaker_id": 0,
-      "pitch": 10,
+      "pitch": 12,
       "index_rate": 0.2,
       "formant": 0.0,
       "f0method": "rmvpe",
