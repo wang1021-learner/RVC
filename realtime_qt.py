@@ -102,15 +102,17 @@ class DeviceCombo(QComboBox):
     @staticmethod
     def _api_rank(api_name):
         n = (api_name or "").upper()
-        if "WASAPI" in n:
+        if "ASIO" in n:
             return 0
-        if "WDM" in n or "KS" in n:
+        if "WASAPI" in n:
             return 1
-        if "DIRECTSOUND" in n:
+        if "WDM" in n or "KS" in n:
             return 2
-        if "MME" in n:
+        if "DIRECTSOUND" in n:
             return 3
-        return 4
+        if "MME" in n:
+            return 4
+        return 5
 
     def populate(self, devs, apis, ch):
         """按 hostapi 分组填充，WASAPI 优先。"""
@@ -1093,12 +1095,36 @@ class VCEngine(QObject):
             latency="low",
         )
         errors = []
+
+        # 1. 优先探测是否为 ASIO 硬件设备（极低硬件延迟，不使用 WasapiSettings）
+        is_asio = False
+        try:
+            in_info = sd.query_devices(self.input_device) if self.input_device is not None else None
+            if in_info:
+                api_idx = in_info.get("hostapi", -1)
+                apis = sd.query_hostapis()
+                api_name = apis[api_idx]["name"].upper() if 0 <= api_idx < len(apis) else ""
+                if "ASIO" in api_name:
+                    is_asio = True
+        except Exception:
+            pass
+
+        if is_asio:
+            try:
+                self.stream = sd.Stream(**kwargs)
+                return True, "ASIO 硬件直通 (极低延迟)"
+            except Exception as e:
+                errors.append(e)
+
+        # 2. WASAPI 独占（次低延迟）
         try:
             self.stream = sd.Stream(
                 extra_settings=sd.WasapiSettings(exclusive=True), **kwargs)
             return True, "WASAPI 独占 (最低延迟)"
         except Exception as e:
             errors.append(e)
+
+        # 3. WASAPI 共享模式
         try:
             try:
                 extra = sd.WasapiSettings(exclusive=False, auto_convert=True)
@@ -1108,6 +1134,8 @@ class VCEngine(QObject):
             return True, "WASAPI 共享（独占失败: %s）" % _wasapi_fail_reason(errors[-1])
         except Exception as e:
             errors.append(e)
+
+        # 4. 系统默认共享回退
         try:
             self.stream = sd.Stream(**kwargs)
             return True, "系统共享（%s）" % _wasapi_fail_reason(errors[-1])
@@ -1710,6 +1738,14 @@ class MainWindow(QMainWindow):
         self.ts = QSpinBox(); self.ts.setRange(-80, 0); self.ts.setValue(-50)
         self.ts.setToolTip("低于此音量视为静音。-80 关闭门限")
         self.ts.valueChanged.connect(lambda v: setattr(self.engine, "threhold", v))
+        self.calib_noise_btn = QPushButton("测底噪")
+        self.calib_noise_btn.setObjectName("btnGhost")
+        self.calib_noise_btn.setToolTip("保持安静 1 秒，自动测定当前环境底噪并计算最优静音阈值")
+        self.calib_noise_btn.clicked.connect(self._auto_calibrate_noise)
+        self.ts_box = QWidget()
+        ts_l = QHBoxLayout(self.ts_box); ts_l.setContentsMargins(0, 0, 0, 0); ts_l.setSpacing(4)
+        ts_l.addWidget(self.ts, 1)
+        ts_l.addWidget(self.calib_noise_btn)
         self.rs = QDoubleSpinBox(); self.rs.setRange(0.0, 1.0); self.rs.setSingleStep(0.1)
         self.rs.setValue(0.3)
         self.rs.setToolTip("0=完全跟随输入音量，1=只保留变声自身音量")
@@ -1719,7 +1755,7 @@ class MainWindow(QMainWindow):
             ("块大小", self.bs),
             ("交叉淡入", self.xs),
             ("额外推理", self.es),
-            ("静音阈值", self.ts),
+            ("静音阈值", self.ts_box),
             ("音量保留", self.rs),
         ]
         for i, (name, w) in enumerate(rows):
@@ -2341,6 +2377,68 @@ class MainWindow(QMainWindow):
         self.engine.set_bypass(on)
         self.status_bar.showMessage("已旁通，输出原声" if on else "旁通已关，输出变声", 3000)
 
+    def _auto_calibrate_noise(self):
+        """1 秒环境底噪自动采样并校准静音阈值"""
+        in_id = self.ic.currentDeviceId()
+        self.calib_noise_btn.setEnabled(False)
+        self.calib_noise_btn.setText("采样中...")
+        self.status_bar.showMessage("请保持安静 1 秒，正在测定麦克风环境底噪...", 3000)
+
+        class CalibNoiseThread(QThread):
+            calib_done = Signal(object, str)
+
+            def __init__(self, dev_id, parent=None):
+                super().__init__(parent)
+                self.dev_id = dev_id
+
+            def run(self):
+                import sounddevice as sd
+                import numpy as np
+                import math, time
+                frames = []
+                try:
+                    def cb(indata, f, t, status):
+                        frames.append(indata[:, 0].copy() if indata.ndim > 1 else indata.copy())
+
+                    kwargs = dict(
+                        samplerate=48000,
+                        channels=1,
+                        dtype="float32",
+                        blocksize=480,
+                        callback=cb,
+                    )
+                    if self.dev_id is not None:
+                        kwargs["device"] = self.dev_id
+                    with sd.InputStream(**kwargs):
+                        time.sleep(1.0)
+                    if not frames:
+                        self.calib_done.emit(None, "未采集到音频帧")
+                        return
+                    raw = np.concatenate(frames)
+                    rms = float(np.sqrt(np.mean(np.square(raw)) + 1e-12))
+                    noise_db = int(round(20.0 * math.log10(rms + 1e-9)))
+                    target_thresh = max(-75, min(-30, noise_db + 6))
+                    self.calib_done.emit((noise_db, target_thresh), "")
+                except Exception as e:
+                    self.calib_done.emit(None, str(e))
+
+        self._calib_thread = CalibNoiseThread(in_id, self)
+        def _on_calib_finish(res, err):
+            self.calib_noise_btn.setEnabled(True)
+            self.calib_noise_btn.setText("测底噪")
+            if res is not None:
+                noise_db, target_thresh = res
+                self.ts.setValue(target_thresh)
+                self.status_bar.showMessage(
+                    f"✓ 底噪测定完成：当前环境底噪 {noise_db} dB，已自动设定静音阈值为 {target_thresh} dB",
+                    6000,
+                )
+            else:
+                self.status_bar.showMessage(f"底噪测定失败: {err}", 4000)
+
+        self._calib_thread.calib_done.connect(_on_calib_finish)
+        self._calib_thread.start()
+
     # ── 音质产品化：AGC / 监听 / 预设 / 阶段耗时 ──
     def _on_agc(self, on):
         self.engine.set_input_agc(on)
@@ -2699,10 +2797,23 @@ class SpeakerDialog(QDialog):
         self.si = QSpinBox(); self.si.setRange(0, 200); self.si.setValue(s.speaker_id)
         l.addRow("说话人ID:", self.si)
 
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([
+            "保持当前设置",
+            "女声角色 (男变女推荐 +12)",
+            "男声角色 (同性别推荐 0)",
+            "女声高音 (推荐 +14)",
+            "男声低音 (女变男推荐 -12)",
+        ])
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        l.addRow("音高推荐:", self.preset_combo)
+
         self.ps = QSpinBox(); self.ps.setRange(-36, 36); self.ps.setValue(s.pitch)
         self.ps.setSuffix(" 半音")
         self.ps.setToolTip("男转女 +12, 女转男 -12")
         l.addRow("音高偏移:", self.ps)
+
+        self.ne.textChanged.connect(self._on_name_auto_preset)
 
         self.irs = QDoubleSpinBox(); self.irs.setRange(0.0, 1.0); self.irs.setSingleStep(0.1)
         self.irs.setValue(s.index_rate)
@@ -2727,6 +2838,24 @@ class SpeakerDialog(QDialog):
         b = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         b.accepted.connect(self._ok); b.rejected.connect(self.reject)
         l.addRow(b)
+
+    def _on_preset_changed(self, idx):
+        if idx == 1:
+            self.ps.setValue(12)
+        elif idx == 2:
+            self.ps.setValue(0)
+        elif idx == 3:
+            self.ps.setValue(14)
+        elif idx == 4:
+            self.ps.setValue(-12)
+
+    def _on_name_auto_preset(self, text):
+        t = text.lower()
+        if any(k in t for k in ["女", "girl", "female", "sister", "妹", "娘"]) and self.ps.value() == 0:
+            self.ps.setValue(12)
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentIndex(1)
+            self.preset_combo.blockSignals(False)
 
     def _from_server(self):
         """从服务器拉取模型文件名列表，点选填入"""
