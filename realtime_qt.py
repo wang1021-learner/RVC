@@ -1036,8 +1036,7 @@ class VCEngine(QObject):
             if started is False:
                 raise RuntimeError("推理未能启动")
             self._in_residual = None
-            bf = getattr(self.pipeline, "_block_frame", 4800) or 4800
-            self._out_residual = np.zeros(bf, dtype=np.float32)
+            self._out_residual = np.array([], dtype=np.float32)
             self.xrun_count = 0
             self._drain_queue(self.input_queue)
             self._drain_queue(self.output_queue)
@@ -1409,12 +1408,12 @@ class VCEngine(QObject):
                     outdata[:, 1:] = outdata[:, :1]
             else:
                 n_avail = len(self._out_residual)
-                if n_avail > 0:
-                    outdata[:n_avail, 0] = self._out_residual
-                    outdata[n_avail:, 0] = 0.0
-                    self._out_residual = np.array([], dtype=np.float32)
-                else:
-                    outdata.fill(0.0)
+                n_take = min(n_avail, n_needed)
+                if n_take > 0:
+                    outdata[:n_take, 0] = self._out_residual[:n_take]
+                    self._out_residual = self._out_residual[n_take:]
+                if n_take < n_needed:
+                    outdata[n_take:, 0] = 0.0
                 if outdata.shape[1] > 1:
                     outdata[:, 1:] = outdata[:, :1]
                 self._on_worker_xrun()
