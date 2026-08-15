@@ -354,6 +354,8 @@ DEFAULT_PARAMS = {
     "hf_mix_rate": 0.3,
     "presence": 0.15,
     "deesser_enable": True,
+    "vad_enable": False,
+    "vad_threshold": 0.50,
 }
 
 # 场景预设：低延迟 / 高音质 / 游戏语音 / 唱歌
@@ -907,6 +909,8 @@ class VCEngine(QObject):
     hf_mix_rate = _prop("hf_mix_rate")
     presence = _prop("presence")
     deesser_enable = _prop("deesser_enable")
+    vad_enable = _prop("vad_enable")
+    vad_threshold = _prop("vad_threshold")
 
     def change_pitch(self, val):
         if self.pipeline is not None:
@@ -1769,10 +1773,24 @@ class MainWindow(QMainWindow):
         self.deess_cb.toggled.connect(lambda v: setattr(self.engine, "deesser_enable", v))
         l.addWidget(self.deess_cb, len(rows) + 4, 0, 1, 2)
 
+        # 智能人声识别 (VAD)
+        vr = QHBoxLayout(); vr.setSpacing(8)
+        self.vad_cb = QCheckBox("人声识别 (VAD)")
+        self.vad_cb.setToolTip("智能区分人声与环境杂音（键盘/敲击/风扇），非人声自动静音（实时生效）")
+        self.vad_cb.setChecked(False)
+        self.vad_cb.toggled.connect(lambda v: setattr(self.engine, "vad_enable", v))
+        vr.addWidget(self.vad_cb)
+        self.vad_th = QDoubleSpinBox(); self.vad_th.setRange(0.10, 0.90)
+        self.vad_th.setSingleStep(0.05); self.vad_th.setValue(0.50)
+        self.vad_th.setToolTip("人声置信度门限（0.50 为推荐平衡点）")
+        self.vad_th.valueChanged.connect(lambda v: setattr(self.engine, "vad_threshold", v))
+        vr.addWidget(self.vad_th); vr.addStretch()
+        l.addLayout(vr, len(rows) + 5, 0, 1, 2)
+
         # 分阶段耗时（本地模式）
         self.st_lbl = QLabel("阶段耗时: --")
         self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
-        l.addWidget(self.st_lbl, len(rows) + 5, 0, 1, 2)
+        l.addWidget(self.st_lbl, len(rows) + 6, 0, 1, 2)
         l.setColumnStretch(1, 1)
         root.addWidget(g1)
 
@@ -2572,6 +2590,13 @@ class MainWindow(QMainWindow):
                 pass
         if "deesser_enable" in s:
             self.deess_cb.setChecked(bool(s["deesser_enable"]))
+        if "vad_enable" in s:
+            self.vad_cb.setChecked(bool(s["vad_enable"]))
+        if "vad_threshold" in s:
+            try:
+                self.vad_th.setValue(float(s["vad_threshold"]))
+            except Exception:
+                pass
 
     def _restore_devices(self):
         self.ic.blockSignals(True)
@@ -2625,6 +2650,8 @@ class MainWindow(QMainWindow):
             "hf_mix_rate": float(self.hf_spin.value()),
             "presence": float(self.pres_spin.value()),
             "deesser_enable": bool(self.deess_cb.isChecked()),
+            "vad_enable": bool(self.vad_cb.isChecked()),
+            "vad_threshold": float(self.vad_th.value()),
         })
         try:
             save_user_settings(data)

@@ -537,6 +537,7 @@ class RMVPE:
             self.model = self.model.to(device)
         cents_mapping = 20 * np.arange(360) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))  # 368
+        self.cents_mapping_torch = torch.from_numpy(self.cents_mapping).float().to(self.device)
 
     def mel2hidden(self, mel):
         with torch.no_grad():
@@ -576,11 +577,48 @@ class RMVPE:
             audio,
         )
 
+    def to_local_average_cents_torch(self, salience, thred=0.05):
+        """GPU 向量化解码：使用 torch.gather 与广播，消除 Python for 循环"""
+        if salience.dim() == 3:
+            salience = salience.squeeze(0)
+        # salience: (n_frames, 360)
+        center = salience.argmax(dim=-1)  # (n_frames,)
+        salience_pad = F.pad(salience.float(), (4, 4), mode="constant", value=0.0)  # (n_frames, 368)
+        
+        # 构造每个 frame 对应的 9 个采样点索引 [center, center+1, ..., center+8] (对应 pad 后的 [center-4..center+4]+4)
+        offsets = torch.arange(9, device=salience.device)  # (9,)
+        indices = center.unsqueeze(-1) + offsets  # (n_frames, 9)
+        
+        # 提取局部 salience 和 cents
+        todo_salience = torch.gather(salience_pad, 1, indices)  # (n_frames, 9)
+        if self.cents_mapping_torch.device != salience.device:
+            self.cents_mapping_torch = self.cents_mapping_torch.to(salience.device)
+        todo_cents = self.cents_mapping_torch[indices]  # (n_frames, 9)
+        
+        product_sum = (todo_salience * todo_cents).sum(dim=-1)
+        weight_sum = todo_salience.sum(dim=-1).clamp(min=1e-8)
+        devided = product_sum / weight_sum
+        
+        maxx = salience.max(dim=-1).values
+        devided = torch.where(maxx > thred, devided, torch.zeros_like(devided))
+        return devided
+
+    def decode_torch(self, hidden, thred=0.03):
+        """GPU 向量化完整解码：直接返回设备上的 f0 Tensor"""
+        cents_pred = self.to_local_average_cents_torch(hidden, thred=thred)
+        f0 = torch.where(
+            cents_pred > 0,
+            10.0 * torch.pow(2.0, cents_pred / 1200.0),
+            torch.zeros_like(cents_pred),
+        )
+        return f0
+
     def decode(self, hidden, thred=0.03):
+        if torch.is_tensor(hidden):
+            return self.decode_torch(hidden, thred=thred)
         cents_pred = self.to_local_average_cents(hidden, thred=thred)
         f0 = 10 * (2 ** (cents_pred / 1200))
         f0[f0 == 10] = 0
-        # f0 = np.array([10 * (2 ** (cent_pred / 1200)) if cent_pred else 0 for cent_pred in cents_pred])
         return f0
 
     def infer_hidden(self, audio):
@@ -589,12 +627,15 @@ class RMVPE:
         return self.mel2hidden(mel)
 
     def decode_hidden(self, hidden, thred=0.03):
-        """CPU 部分：hidden -> f0 numpy（含取回同步）。"""
+        """CPU 部分：hidden -> f0 numpy（含取回同步，供外部非 GPU 链路兼容使用）。"""
+        if torch.is_tensor(hidden) and hidden.is_cuda:
+            f0_t = self.decode_torch(hidden, thred=thred)
+            return f0_t.cpu().numpy()
         if "privateuseone" not in str(self.device):
-            hidden = hidden.squeeze(0).cpu().numpy()
+            hidden = hidden.squeeze(0).cpu().numpy() if torch.is_tensor(hidden) else hidden
         else:
             hidden = hidden[0]
-        if self.is_half == True:
+        if hasattr(hidden, "astype") and self.is_half:
             hidden = hidden.astype("float32")
         return self.decode(hidden, thred=thred)
 

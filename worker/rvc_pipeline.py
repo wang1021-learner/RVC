@@ -3,7 +3,8 @@ import os, time, traceback
 import numpy as np, torch, torch.nn.functional as F, torchaudio.transforms as tat
 from configs.config import Config
 from infer import rtrvc as rvc_for_realtime
-from tools.dsp import DeEsser, OnePoleLP
+from tools.dsp import DeEsser, FirHighPass
+from tools.vad import VoiceActivityDetector
 from tools.output_protector import OutputProtector
 from tools.torchgate import TorchGate
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
@@ -31,6 +32,9 @@ class RVCPipeline:
         self.hf_mix_rate = 0.3
         self.presence = 0.15
         self.deesser_enable = True
+        # 智能人声识别 (VAD)
+        self.vad_enable = False
+        self.vad_threshold = 0.50
         self._active = False
         self.last_stage_ms = {}
 
@@ -172,15 +176,29 @@ class RVCPipeline:
             start_time = time.perf_counter()
             if indata.ndim > 1:
                 indata = indata.mean(axis=1)
+            bf = self._block_frame
+            bf16 = self._block_frame_16k
+            in_len = indata.shape[0]
+
+            # 滚动并写入输入缓冲
             self._input_wav = torch.roll(self._input_wav, -self._block_frame, dims=0)
             self._input_wav[-indata.shape[0]:] = torch.from_numpy(indata).to(self.config.device)
-            if self.threhold > -80:
-                self._gate_last_block(indata.shape[0])
+
+            # 智能人声识别 (VAD) 与静音门控协同
+            if self.vad_enable and hasattr(self, "_vad"):
+                wav_chunk = self._input_wav[-in_len:]
+                _, is_speech, _ = self._vad.process(wav_chunk, threshold=self.vad_threshold)
+                if not is_speech:
+                    self._input_wav[-in_len:].zero_()
+            elif self.threhold > -80:
+                self._gate_last_block(in_len)
+
             # 高频齿音直通：从 48k 原声提取 >6kHz 气音，与输入同延迟线滚动
             if self.hf_mix_rate > 0:
-                hf_new = self._hp_hf.highpass(self._input_wav[-indata.shape[0]:])
+                hf_new = self._hp_hf.highpass(self._input_wav[-in_len:])
                 self._hf_wav = torch.roll(self._hf_wav, -self._block_frame, dims=0)
-                self._hf_wav[-indata.shape[0]:] = hf_new
+                self._hf_wav[-in_len:] = hf_new
+
             self._input_wav_res = torch.roll(self._input_wav_res, -self._block_frame_16k, dims=0)
             if self.I_noise_reduce:
                 self._input_wav_denoise = torch.roll(self._input_wav_denoise, -self._block_frame, dims=0)
@@ -192,10 +210,14 @@ class RVCPipeline:
                 self._input_wav_denoise[-self._block_frame:] = iw[:self._block_frame]
                 self._nr_buffer[:] = iw[self._block_frame:]
                 ri = self._input_wav_denoise[-self._block_frame - 2 * self._zc:]
-                self._input_wav_res[-self._block_frame_16k - 160:] = run_cuda_graph(self._resampler, "in-resample", lambda a: self._resampler(a), ri)[160:]
+                self._input_wav_res[-self._block_frame_16k - 160:] = run_cuda_graph(
+                    self._resampler, "in-resample", lambda a: self._resampler(a), ri
+                )[160:]
             else:
-                ri = self._input_wav[-indata.shape[0] - 2 * self._zc:]
-                self._input_wav_res[-160 * (indata.shape[0] // self._zc + 1):] = run_cuda_graph(self._resampler, "in-resample", lambda a: self._resampler(a), ri)[160:]
+                ri = self._input_wav[-in_len - 2 * self._zc:]
+                self._input_wav_res[-160 * (in_len // self._zc + 1):] = run_cuda_graph(
+                    self._resampler, "in-resample", lambda a: self._resampler(a), ri
+                )[160:]
             infer_wav = self.rvc.infer(self._input_wav_res, self._block_frame_16k, self._skip_head, self._return_length, self.f0method)
             stage = getattr(self.rvc, "last_stage_ms", None)
             if stage:
@@ -256,11 +278,17 @@ class RVCPipeline:
             threshold_db=self.limiter_threshold_db,
             device=dev,
         )
-        # 音质增强：齿音提取高通 + 同构延迟线 + 临场感 + 去齿音
-        self._hp_hf = OnePoleLP(6000.0, self.samplerate, dev)
+        # 音质增强：齿音提取高通 + 同构延迟线 + 临场感 + 去齿音（FIR，单次 conv1d）
+        self._hp_hf = FirHighPass(6000.0, self.samplerate, dev)
         self._hf_wav = torch.zeros(total, device=dev, dtype=dt)
-        self._hp_pres = OnePoleLP(3000.0, self.samplerate, dev)
+        self._hp_pres = FirHighPass(3000.0, self.samplerate, dev)
         self._deesser = DeEsser(sample_rate=self.samplerate, device=dev)
+        # 智能人声识别 (VAD)
+        self._vad = VoiceActivityDetector(
+            sample_rate=self.samplerate,
+            threshold=self.vad_threshold,
+            device=dev,
+        )
 
     def _prewarm(self):
         if not cuda_graph_enabled(self.config.device):
@@ -300,7 +328,7 @@ class RVCPipeline:
             self.rvc.cache_pitchf.zero_()
         if hasattr(self, "_protector"):
             self._protector.reset()
-        for a in ("_hp_hf", "_hp_pres", "_deesser"):
+        for a in ("_hp_hf", "_hp_pres", "_deesser", "_vad"):
             obj = getattr(self, a, None)
             if obj is not None:
                 obj.reset()

@@ -336,7 +336,8 @@ class RVC:
                 is_half=self.is_half,
                 device=self.device,
             )
-        f0 = _fill_short_uv(self.model_rmvpe.infer_from_audio(x, thred=0.03))
+        f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+        f0 = _fill_short_uv(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
