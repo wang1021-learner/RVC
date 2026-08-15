@@ -289,11 +289,6 @@ class RVCPipeline:
             threshold=self.vad_threshold,
             device=dev,
         )
-        # 异步锁页输出缓冲（消除 GPU D2H 动态分配与流水线卡顿）
-        if "cuda" in str(dev):
-            self._pinned_out = torch.empty((self._block_frame, self.channels), dtype=torch.float32, pin_memory=True)
-        else:
-            self._pinned_out = None
 
     def _prewarm(self):
         if not cuda_graph_enabled(self.config.device):
@@ -328,8 +323,6 @@ class RVCPipeline:
             obj = getattr(self, a, None)
             if obj is not None:
                 obj.zero_()
-        if getattr(self, "_pinned_out", None) is not None:
-            self._pinned_out.zero_()
         if self.rvc is not None:
             self.rvc.cache_pitch.zero_()
             self.rvc.cache_pitchf.zero_()
