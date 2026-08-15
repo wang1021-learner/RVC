@@ -289,6 +289,11 @@ class RVCPipeline:
             threshold=self.vad_threshold,
             device=dev,
         )
+        # 异步锁页输出缓冲（消除 GPU D2H 动态分配与流水线卡顿）
+        if "cuda" in str(dev):
+            self._pinned_out = torch.empty((self._block_frame, self.channels), dtype=torch.float32, pin_memory=True)
+        else:
+            self._pinned_out = None
 
     def _prewarm(self):
         if not cuda_graph_enabled(self.config.device):
@@ -323,6 +328,8 @@ class RVCPipeline:
             obj = getattr(self, a, None)
             if obj is not None:
                 obj.zero_()
+        if getattr(self, "_pinned_out", None) is not None:
+            self._pinned_out.zero_()
         if self.rvc is not None:
             self.rvc.cache_pitch.zero_()
             self.rvc.cache_pitchf.zero_()
@@ -419,8 +426,10 @@ class RVCPipeline:
         if self.limiter_enable and hasattr(self, "_protector"):
             if abs(self._protector.threshold_db - self.limiter_threshold_db) > 0.01:
                 self._protector.set_threshold_db(self.limiter_threshold_db)
-            infer_wav[:self._block_frame] = self._protector.process(
-                infer_wav[:self._block_frame]
-            )
-        out = infer_wav[:self._block_frame].repeat(self.channels, 1).t().cpu().numpy()
+        if getattr(self, "_pinned_out", None) is not None and self._pinned_out.shape == (self._block_frame, self.channels):
+            out_gpu = infer_wav[:self._block_frame].unsqueeze(-1).expand(-1, self.channels)
+            self._pinned_out.copy_(out_gpu, non_blocking=True)
+            out = self._pinned_out.numpy()
+        else:
+            out = infer_wav[:self._block_frame].repeat(self.channels, 1).t().cpu().numpy()
         return infer_wav, out

@@ -825,8 +825,8 @@ class VCEngine(QObject):
         self.stream = None; self.running = False
         self.current_speaker = None
         self.input_device = None; self.output_device = None
-        self.input_queue = queue.Queue(maxsize=2)
-        self.output_queue = queue.Queue(maxsize=2)
+        self.input_queue = queue.Queue(maxsize=4)
+        self.output_queue = queue.Queue(maxsize=4)
         self._in_residual = None      # 输入弹性缓冲（变长块拼接）
         self._out_residual = np.array([], dtype=np.float32)   # 输出弹性缓冲
         self.worker_thread = None
@@ -1036,7 +1036,8 @@ class VCEngine(QObject):
             if started is False:
                 raise RuntimeError("推理未能启动")
             self._in_residual = None
-            self._out_residual = np.array([], dtype=np.float32)
+            bf = getattr(self.pipeline, "_block_frame", 4800) or 4800
+            self._out_residual = np.zeros(bf, dtype=np.float32)
             self.xrun_count = 0
             self._drain_queue(self.input_queue)
             self._drain_queue(self.output_queue)
@@ -1407,7 +1408,15 @@ class VCEngine(QObject):
                 if outdata.shape[1] > 1:
                     outdata[:, 1:] = outdata[:, :1]
             else:
-                outdata.fill(0.0)
+                n_avail = len(self._out_residual)
+                if n_avail > 0:
+                    outdata[:n_avail, 0] = self._out_residual
+                    outdata[n_avail:, 0] = 0.0
+                    self._out_residual = np.array([], dtype=np.float32)
+                else:
+                    outdata.fill(0.0)
+                if outdata.shape[1] > 1:
+                    outdata[:, 1:] = outdata[:, :1]
                 self._on_worker_xrun()
             dry = float(self.dry_mix)
             if dry > 0:
