@@ -184,12 +184,11 @@ class RVCPipeline:
             self._input_wav = torch.roll(self._input_wav, -self._block_frame, dims=0)
             self._input_wav[-indata.shape[0]:] = torch.from_numpy(indata).to(self.config.device)
 
-            # 智能人声识别 (VAD) 与静音门控协同
+            # 智能人声识别 (VAD) 与静音门控协同（平滑状态包络）
             if self.vad_enable and hasattr(self, "_vad"):
                 wav_chunk = self._input_wav[-in_len:]
-                _, is_speech, _ = self._vad.process(wav_chunk, threshold=self.vad_threshold)
-                if not is_speech:
-                    self._input_wav[-in_len:].zero_()
+                vad_out, _, _ = self._vad.process(wav_chunk, threshold=self.vad_threshold)
+                self._input_wav[-in_len:] = vad_out
             elif self.threhold > -80:
                 self._gate_last_block(in_len)
 

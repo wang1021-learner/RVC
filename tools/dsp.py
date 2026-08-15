@@ -55,8 +55,8 @@ class DeEsser:
     def __init__(
         self,
         sample_rate=48000,
-        threshold_db=-22.0,
-        ratio=0.7,
+        threshold_db=-20.0,
+        ratio=0.45,
         release_time=0.06,
         device="cpu",
     ):

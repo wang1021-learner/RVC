@@ -3,8 +3,9 @@ RVC 智能人声识别模块 (Voice Activity Detection, VAD)
 =====================================================
 功能：
 1. 智能区分人类发音（元音、辅音、语流）与环境杂音（机械键盘、敲击、风扇、电流）。
-2. 零吞字前瞻 (Lookahead) + 150ms 尾音平滑保持 (Hangover) 机制，彻底消除吃字头与断尾现象。
-3. 纯 GPU 向量化运算，单块判定耗时 < 0.2ms，零感知延迟。
+2. 全块多帧扫描 (Whole-Block Multi-Frame Scan)，杜绝中后段字头吞字。
+3. 状态性连续平滑增益包络 (Continuous Gain Envelope)，杜绝门控硬切引发的相位台阶与咔哒爆音。
+4. 纯 GPU 向量化与单次标量同步，零流水线阻塞与零感知延迟。
 """
 
 import math
@@ -32,8 +33,9 @@ class VoiceActivityDetector:
         self.hangover_frames = max(1, int(self.hangover_ms / 10.0))
         self._hangover_left = 0
         self._is_active = False
+        self._current_gain = 0.0
 
-        # 尝试加载本地 Silero VAD 模型（如有）
+        # 尝试加载本地 Silero JIT 模型（如有）
         self._silero_model = None
         self._init_silero()
 
@@ -55,6 +57,7 @@ class VoiceActivityDetector:
         """重置状态机"""
         self._hangover_left = 0
         self._is_active = False
+        self._current_gain = 0.0
         if self._silero_model is not None and hasattr(self._silero_model, "reset_states"):
             try:
                 self._silero_model.reset_states()
@@ -64,7 +67,7 @@ class VoiceActivityDetector:
     def detect_speech_prob(self, wav_48k: torch.Tensor, wav_16k: torch.Tensor = None) -> float:
         """
         计算输入音频块的人声置信度 (0.0 ~ 1.0)
-        结合元音共振峰、清辅音摩擦能量与自相关谐波周期性。
+        结合全块滑动多帧扫描、元音共振峰、清辅音摩擦能量与自相关谐波周期性。
         """
         if wav_48k.numel() < self.zc:
             return 0.0
@@ -78,39 +81,41 @@ class VoiceActivityDetector:
             except Exception:
                 pass
 
-        # ── 纯 GPU 自适应频谱谐波与共振峰特征分析 ──
-        # 1. 计算总能量
+        # ── 纯 GPU 自适应全块滑动频谱与谐波分析 ──
         rms = wav_48k.square().mean().sqrt().clamp(min=1e-8)
-        db = 20.0 * torch.log10(rms).item()
-        if db < -60.0:
+        db = 20.0 * torch.log10(rms)
+        if db < -65.0:
             return 0.0
 
         n = wav_48k.shape[0]
         n_fft = min(1024, 1 << (n.bit_length() - 1)) if n >= 256 else 256
-        if n < n_fft:
-            pad = n_fft - n
-            w_pad = F.pad(wav_48k, (0, pad))
-        else:
-            w_pad = wav_48k[:n_fft]
+        hop = n_fft // 2
 
-        # 2. 频域分析 (元音频段 300Hz ~ 3400Hz，清辅音/摩擦音频段 3400Hz ~ 8000Hz)
+        # 1. 全块展开切片多帧扫描（杜绝字头在块中后段被吞）
+        if n >= n_fft:
+            pad = (hop - (n - n_fft) % hop) % hop
+            w_padded = F.pad(wav_48k, (0, pad))
+            frames = w_padded.unfold(0, n_fft, hop)  # (num_frames, n_fft)
+        else:
+            frames = F.pad(wav_48k, (0, n_fft - n)).unsqueeze(0)  # (1, n_fft)
+
         window = torch.hann_window(n_fft, device=self.device)
-        spec = torch.fft.rfft(w_pad * window).abs()
-        freq_bin_hz = (self.sample_rate / 2.0) / (spec.shape[0] - 1)
+        spec = torch.fft.rfft(frames * window, dim=-1).abs()  # (num_frames, n_bins)
+        freq_bin_hz = (self.sample_rate / 2.0) / (spec.shape[-1] - 1)
 
         idx_low = max(1, int(300 / freq_bin_hz))
-        idx_mid = min(spec.shape[0] - 1, int(3400 / freq_bin_hz))
-        idx_high = min(spec.shape[0] - 1, int(8000 / freq_bin_hz))
+        idx_mid = min(spec.shape[-1] - 1, int(3400 / freq_bin_hz))
+        idx_high = min(spec.shape[-1] - 1, int(8000 / freq_bin_hz))
         idx_sub = max(1, int(80 / freq_bin_hz))
 
-        vocal_energy = spec[idx_low:idx_mid].square().sum()
-        fricative_energy = spec[idx_mid:idx_high].square().sum()
-        total_energy = spec[idx_sub:].square().sum().clamp(min=1e-8)
+        vocal_energy = spec[:, idx_low:idx_mid].square().sum(dim=-1)
+        fricative_energy = spec[:, idx_mid:idx_high].square().sum(dim=-1)
+        total_energy = spec[:, idx_sub:].square().sum(dim=-1).clamp(min=1e-8)
 
-        vocal_ratio = (vocal_energy / total_energy).item()
-        fricative_ratio = (fricative_energy / total_energy).item()
+        vocal_ratio = (vocal_energy / total_energy).amax()
+        fricative_ratio = (fricative_energy / total_energy).amax()
 
-        # 3. 谐波自相关分析（元音具有强周期性）
+        # 2. 谐波自相关分析（元音具有强周期性）
         down = wav_48k[:: (self.sample_rate // 16000)]
         d_len = down.shape[0]
         if d_len >= 160:
@@ -123,16 +128,20 @@ class VoiceActivityDetector:
             ).view(-1)
             center = max_lag
             lags = r[center + min_lag : center + max_lag]
-            norm = (down.square().sum() + 1e-8).item()
-            periodicity = float(lags.max().item() / norm) if lags.numel() > 0 else 0.0
+            norm = down.square().sum() + 1e-8
+            periodicity = (lags.amax() / norm).clamp(min=0.0) if lags.numel() > 0 else torch.tensor(0.0, device=self.device)
         else:
-            periodicity = 0.0
+            periodicity = torch.tensor(0.0, device=self.device)
 
-        # 4. 综合置信度评估（元音或辅音任一显著即判定为说话）
-        vowel_prob = 0.55 * vocal_ratio + 0.45 * min(1.0, periodicity * 1.8)
-        consonant_prob = min(1.0, fricative_ratio * 1.6) if db > -48.0 else 0.0
-        prob = max(vowel_prob, consonant_prob)
-        return float(max(0.0, min(1.0, prob)))
+        # 3. 综合置信度评估（单次标量合并，彻底消除多次 .item() 流水线同步）
+        vowel_prob = 0.55 * vocal_ratio + 0.45 * (periodicity * 1.8).clamp(max=1.0)
+        consonant_prob = torch.where(
+            db > -48.0,
+            (fricative_ratio * 1.6).clamp(max=1.0),
+            torch.tensor(0.0, device=self.device),
+        )
+        prob_tensor = torch.maximum(vowel_prob, consonant_prob).clamp(0.0, 1.0)
+        return float(prob_tensor.item())
 
     def process(
         self,
@@ -142,6 +151,7 @@ class VoiceActivityDetector:
     ) -> tuple[torch.Tensor, bool, float]:
         """
         对输入音频块进行智能人声活动过滤。
+        采用状态性连续平滑增益包络，杜绝任何断崖式硬切清零。
         
         返回:
             processed_wav: 经过平滑门控过滤的音频 Tensor
@@ -164,11 +174,22 @@ class VoiceActivityDetector:
             else:
                 self._is_active = False
 
-        if self._is_active:
-            return wav_48k, True, prob
-
-        # 非人声：应用软衰减淡出清零（防止突兀切断）
+        target_gain = 1.0 if self._is_active else 0.0
         n = wav_48k.shape[0]
-        fade_len = min(n, max(1, int(0.008 * self.sample_rate)))
-        out = torch.zeros_like(wav_48k)
-        return out, False, prob
+
+        # 连续状态性平滑包络（消除块边界硬切导致的直流台阶与咔哒爆音）
+        if self._current_gain == target_gain:
+            if target_gain == 1.0:
+                return wav_48k, True, prob
+            else:
+                return torch.zeros_like(wav_48k), False, prob
+        else:
+            gain_curve = torch.linspace(
+                self._current_gain,
+                target_gain,
+                n,
+                device=wav_48k.device,
+                dtype=wav_48k.dtype,
+            )
+            self._current_gain = target_gain
+            return wav_48k * gain_curve, self._is_active, prob
