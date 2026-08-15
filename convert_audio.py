@@ -22,16 +22,17 @@ import faiss
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.getcwd())
 
+from configs.config import Config
 from infer.module.models import SynthesizerTrnMs768NSFsid
 from infer.hubert import extract_hubert_features, load_hubert_model
 from infer.rmvpe import RMVPE
 
 
-def load_model(pth_path: str):
+def load_model(pth_path: str, device: torch.device, is_half: bool = False):
     cpt = torch.load(pth_path, map_location="cpu")
-    net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=False)
+    net_g = SynthesizerTrnMs768NSFsid(*cpt["config"], is_half=is_half)
     net_g.load_state_dict(cpt["weight"], strict=False)
-    net_g = net_g.float().cuda().eval()
+    net_g = (net_g.half() if is_half else net_g.float()).to(device).eval()
     net_g.remove_weight_norm()
     return net_g, cpt["config"][-1]
 
@@ -48,14 +49,20 @@ def convert_audio(
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_converted{ext}"
 
+    config = Config()
+    device = config.device
+    is_half = config.is_half
+    dtype = torch.float16 if is_half else torch.float32
+    print(f"使用设备: {device} (half={is_half})")
+
     print(f"加载模型: {pth_path}")
-    net_g, tgt_sr = load_model(pth_path)
+    net_g, tgt_sr = load_model(pth_path, device, is_half=is_half)
 
     print("加载 HuBERT 模型...")
-    hubert_model = load_hubert_model(torch.device("cuda"), is_half=False)
+    hubert_model = load_hubert_model(device, is_half=is_half)
 
     print("加载 RMVPE 模型...")
-    rmvpe_model = RMVPE("assets/rmvpe/rmvpe.pt", is_half=False, device=torch.device("cuda"))
+    rmvpe_model = RMVPE("assets/rmvpe/rmvpe.pt", is_half=is_half, device=device)
 
     index = None
     index_vectors = None
@@ -72,28 +79,28 @@ def convert_audio(
     audio_16k = librosa.resample(audio, orig_sr=sr, target_sr=16000)
 
     print("提取 HuBERT 特征...")
-    feats = torch.from_numpy(audio_16k).float().cuda().view(1, -1)
+    feats = torch.from_numpy(audio_16k).to(device=device, dtype=dtype).view(1, -1)
     feats = extract_hubert_features(hubert_model, feats, "v2")
 
     if index is not None and index_rate > 0:
         print(f"执行索引检索 (rate={index_rate})...")
-        npy = feats[0].cpu().numpy()
+        npy = feats[0].float().cpu().numpy()
         score, ix = index.search(npy, k=8)
         if (ix >= 0).all():
             weight = np.square(1 / np.maximum(score, 1e-6))
             weight /= weight.sum(axis=1, keepdims=True)
             npy_new = np.sum(index_vectors[ix] * np.expand_dims(weight, axis=2), axis=1)
             npy_mixed = index_rate * npy_new + (1 - index_rate) * npy
-            feats[0] = torch.from_numpy(npy_mixed).unsqueeze(0).cuda()
+            feats[0] = torch.from_numpy(npy_mixed).to(device=feats.device, dtype=feats.dtype)
 
     print("提取 F0...")
     f0_result = rmvpe_model.infer_from_audio(
-        torch.from_numpy(audio_16k).float().cuda(), thred=0.03
+        torch.from_numpy(audio_16k).float().to(device), thred=0.03
     )
     if isinstance(f0_result, np.ndarray):
-        f0 = torch.from_numpy(f0_result).float().cuda()
+        f0 = torch.from_numpy(f0_result).float().to(device)
     else:
-        f0 = f0_result.float().cuda()
+        f0 = f0_result.float().to(device)
 
     uv = f0 == 0
     if uv.any():
@@ -102,7 +109,7 @@ def convert_audio(
         f0_np[uv_np] = np.interp(
             np.where(uv_np)[0], np.where(~uv_np)[0], f0_np[~uv_np]
         )
-        f0 = torch.from_numpy(f0_np).cuda()
+        f0 = torch.from_numpy(f0_np).to(device)
 
     if pitch != 0:
         f0 = f0 * (2 ** (pitch / 12))
@@ -126,16 +133,16 @@ def convert_audio(
 
     print("生成转换音频...")
     with torch.no_grad():
-        sid = torch.LongTensor([0]).cuda()
+        sid = torch.LongTensor([0]).to(device)
         infered_audio = net_g.infer(
-            feats,
-            torch.LongTensor([p_len]).cuda(),
+            feats.to(dtype=dtype),
+            torch.LongTensor([p_len]).to(device),
             f0_coarse.unsqueeze(0),
-            f0.unsqueeze(0),
+            f0.unsqueeze(0).to(dtype=dtype),
             sid,
         )[0]
 
-    output = infered_audio.squeeze().cpu().numpy()
+    output = infered_audio.squeeze().float().cpu().numpy()
 
     print(f"保存输出: {output_path}")
     _save_audio(output_path, output, tgt_sr)
@@ -161,36 +168,38 @@ def _save_audio(path: str, audio: np.ndarray, sr: int):
         wf.writeframes(audio_int16.tobytes())
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="RVC 音色转换工具")
-    parser.add_argument("input", help="输入音频文件路径")
-    parser.add_argument("-o", "--output", help="输出音频文件路径")
+def main():
+    parser = argparse.ArgumentParser(description="RVC 批量音频转换工具")
+    parser.add_argument("input", help="输入音频文件路径 (wav, flac, mp3等)")
+    parser.add_argument("output", nargs="?", default=None, help="输出音频文件路径")
     parser.add_argument(
-        "-m",
         "--model",
+        "-m",
         default="assets/weights/thchs_female_100e.pth",
-        help="模型权重文件路径",
+        help="模型权重路径",
     )
     parser.add_argument(
-        "-i",
         "--index",
+        "-i",
         default="logs/thchs_v2/added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
-        help="FAISS 索引文件路径",
+        help="FAISS 索引路径",
     )
     parser.add_argument(
         "--index-rate",
+        "-r",
         type=float,
         default=0.5,
-        help="索引检索比例 (0.0-1.0, 默认0.5)",
+        help="特征检索比例 (0.0-1.0)",
     )
     parser.add_argument(
-        "--pitch",
-        type=int,
-        default=0,
-        help="音高调整（半音，男转女+12，女转男-12）",
+        "--pitch", "-p", type=int, default=0, help="变调 (半音, 男转女推荐+12)"
     )
 
     args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"错误: 输入文件不存在: {args.input}")
+        sys.exit(1)
 
     convert_audio(
         input_path=args.input,
@@ -200,3 +209,7 @@ if __name__ == "__main__":
         index_rate=args.index_rate,
         pitch=args.pitch,
     )
+
+
+if __name__ == "__main__":
+    main()

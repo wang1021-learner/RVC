@@ -200,19 +200,30 @@ Ubuntu 已在前面的系统依赖命令中安装 FFmpeg。Windows 用户可把�
 
 ## 开始使用
 
-启动 WebUI：
+### 1. 启动实时变声桌面客户端（推荐）
 
 ```bash
-python webui.py
+python realtime_qt.py
 ```
 
-无桌面的 Ubuntu 服务器：
+### 2. 启动独立/远程推理服务器
 
 ```bash
-python webui.py --noautoopen
+# 默认仅本地监听 127.0.0.1:8765
+python server/rvc_server.py
+
+# 局域网 / 远程服务器部署
+python server/rvc_server.py --host 0.0.0.0 --port 8765
 ```
 
-默认服务监听端口为 `7865`。用户自己的 `.pth` 模型放入 `assets/weights/`，`.index` 文件放入 `assets/indices/`。
+### 3. 批量音频离线转换
+
+```bash
+# 转换单个音频 (自动支持 CUDA/DirectML/CPU)
+python convert_audio.py input.wav output.wav -m assets/weights/your_model.pth -i logs/your_index.index
+```
+
+用户自定义模型放入 `assets/weights/`，`.index` 文件放入 `assets/indices/` 或 `logs/` 即可自动识别。
 
 ## 参考项目
 + [ContentVec](https://github.com/auspicious3000/contentvec/)

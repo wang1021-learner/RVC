@@ -24,7 +24,10 @@ class RVCClient:
         self.server_url = server_url
         self._on_status = on_status or (lambda _: None)
         self._ws = None
-        self._lock = threading.Lock()
+        # 拆分读写锁：发送(指令/音频块)与接收(推流响应)互不干扰，
+        # 彻底解决 recv_audio 阻塞导致变调指令静默丢弃的问题
+        self._send_lock = threading.Lock()
+        self._recv_lock = threading.Lock()
         self._connected = False
         self._model_loaded = False
         self._active = False          # 服务器推理是否激活（is_active 的真实依据）
@@ -64,7 +67,7 @@ class RVCClient:
             self._on_status(f"已连接服务器: {self.server_url}")
             # 查询服务器模型状态，同步本地标志（防服务器重启后状态错乱）
             try:
-                with self._lock:
+                with self._send_lock, self._recv_lock:
                     self._ws.settimeout(5.0)
                     self._ws.send(json.dumps({"action": "status"}))
                     resp = json.loads(self._ws.recv())
@@ -85,11 +88,11 @@ class RVCClient:
         """断开连接"""
         if self._ws:
             try:
-                with self._lock:
+                with self._send_lock:
                     self._ws.send(json.dumps({"action": "stop"}))
             except Exception:
                 pass
-            with self._lock:
+            with self._send_lock, self._recv_lock:
                 try: self._ws.close()
                 except Exception: pass
                 self._ws = None
@@ -120,7 +123,7 @@ class RVCClient:
         }
         self._on_status("正在加载模型...")
         try:
-            with self._lock:
+            with self._send_lock, self._recv_lock:
                 self._ws.settimeout(60.0)   # 模型加载可能 30s+
                 self._ws.send(json.dumps(cmd))
                 resp = json.loads(self._ws.recv())
@@ -148,7 +151,7 @@ class RVCClient:
         try:
             cmd = {"action": "start"}
             cmd.update(params)
-            with self._lock:
+            with self._send_lock, self._recv_lock:
                 # 改过参数时服务端要重新预热 CUDA Graph（10~20s），
                 # 此调用在后台线程执行，耐心等 60s 不误报失败
                 self._ws.settimeout(60.0)
@@ -185,21 +188,24 @@ class RVCClient:
         非阻塞：worker 正占用连接时放弃（服务器保持 active，状态由重连同步）"""
         if not self._ws:
             return
-        if not self._lock.acquire(timeout=0.1):
+        if not self._send_lock.acquire(timeout=0.1):
             return
         try:
             self._ws.send(json.dumps({"action": "stop"}))
             self._active = False
-            try:
-                # 收掉服务器的 stop 响应，避免残留污染下一个请求
-                self._ws.settimeout(0.2)
-                self._ws.recv()
-            except Exception:
-                pass
+            if self._recv_lock.acquire(timeout=0.2):
+                try:
+                    # 收掉服务器的 stop 响应，避免残留污染下一个请求
+                    self._ws.settimeout(0.2)
+                    self._ws.recv()
+                except Exception:
+                    pass
+                finally:
+                    self._recv_lock.release()
         except Exception:
             pass
         finally:
-            self._lock.release()
+            self._send_lock.release()
 
     def _silence(self, n):
         n = int(n) if n else (self._block_frame or 256)
@@ -215,7 +221,7 @@ class RVCClient:
         self._seq = (self._seq + 1) & 0xFFFFFFFF
         seq = self._seq
         payload = struct.pack(">II", seq, len(indata)) + indata.tobytes()
-        if not self._lock.acquire(timeout=0.2):
+        if not self._send_lock.acquire(timeout=0.2):
             return None
         try:
             if not self._ws or not self._connected:
@@ -226,14 +232,14 @@ class RVCClient:
             self._connected = False
             return None
         finally:
-            self._lock.release()
+            self._send_lock.release()
 
     def recv_audio(self, seq, n_in, t0, timeout=1.5):
         """接收与 seq 配对的音频响应。"""
         if not self._connected or not self._ws:
             return self._silence(n_in), 0
         deadline = time.time() + timeout
-        if not self._lock.acquire(timeout=timeout):
+        if not self._recv_lock.acquire(timeout=timeout):
             return self._silence(n_in), 0
         try:
             while True:
@@ -261,7 +267,7 @@ class RVCClient:
             self._connected = False
             return self._silence(n_in), 0
         finally:
-            self._lock.release()
+            self._recv_lock.release()
 
     def process_chunk(self, indata: np.ndarray):
         """兼容录音测试：发一块收一块。"""
@@ -284,7 +290,7 @@ class RVCClient:
         """
         if not self._ws or not self._connected:
             return False
-        if not self._lock.acquire(timeout=0.05):
+        if not self._send_lock.acquire(timeout=0.2):
             return False
         try:
             cmd = {"action": "configure"}
@@ -294,7 +300,7 @@ class RVCClient:
         except Exception:
             return False
         finally:
-            self._lock.release()
+            self._send_lock.release()
 
     def list_models(self):
         """从服务器获取模型文件列表（添加角色时选择用）"""
@@ -302,7 +308,7 @@ class RVCClient:
             if not self.connect(timeout=5):
                 return []
         try:
-            with self._lock:
+            with self._send_lock, self._recv_lock:
                 self._ws.settimeout(5.0)
                 self._ws.send(json.dumps({"action": "list_models"}))
                 resp = json.loads(self._ws.recv())
@@ -319,7 +325,7 @@ class RVCClient:
         if ws is None:
             return
         try:
-            with self._lock:
+            with self._recv_lock:
                 ws.settimeout(0.01)
                 while True:
                     ws.recv()
@@ -329,7 +335,7 @@ class RVCClient:
     def _send_live(self, **fields):
         if not self._ws or not self._connected:
             return False
-        if not self._lock.acquire(timeout=0.05):
+        if not self._send_lock.acquire(timeout=0.2):
             return False
         try:
             cmd = {"action": "set_live"}
@@ -339,7 +345,7 @@ class RVCClient:
         except Exception:
             return False
         finally:
-            self._lock.release()
+            self._send_lock.release()
 
     def change_pitch(self, val):
         self._send_live(pitch=int(val))

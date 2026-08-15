@@ -333,7 +333,7 @@ class RVCPipeline:
                 obj.reset()
 
     def _gate_last_block(self, n):
-        """在 GPU 上按 10ms 帧做静音门，避免 librosa 每块回 CPU。"""
+        """在 GPU 上按 10ms 帧做静音门（全向量化平滑掩码，避免 Python 逐帧循环）。"""
         wav = self._input_wav[-n:]
         zc = self._zc
         hist = torch.cat([self._gate_hist, wav])
@@ -341,27 +341,12 @@ class RVCPipeline:
         frames = F.pad(hist.view(1, 1, -1), (2 * zc, 2 * zc)).unfold(-1, 4 * zc, zc)
         rms = frames.pow(2).mean(-1).sqrt()[0, 0]
         db = 20.0 * torch.log10(rms.clamp(min=1e-8))
-        # hist 比本块多 4*zc，对齐到 wav 起点
-        offset = hist.shape[0] - n
-        fade = max(1, int(0.008 * self.samplerate))
-        n_frames = db.shape[0]
-        for i in range(n_frames):
-            if db[i] >= self.threhold:
-                continue
-            start = i * zc - offset
-            end = start + zc
-            if end <= 0 or start >= n:
-                continue
-            a = max(0, start)
-            b = min(n, end)
-            seg = wav[a:b]
-            if seg.numel() > 2 * fade:
-                t = torch.linspace(1.0, 0.0, fade, device=wav.device, dtype=wav.dtype)
-                seg[:fade] *= t
-                seg[fade:-fade] = 0
-                seg[-fade:] *= t.flip(0)
-            else:
-                seg.zero_()
+        if (db < self.threhold).any():
+            # 帧级门控增益 (0.0 / 1.0)
+            gain_frames = (db >= self.threhold).float().view(1, 1, -1)
+            # 线性插值到采样点级别，形成自然平滑的淡入淡出包络
+            gain_samples = F.interpolate(gain_frames, size=hist.shape[0], mode="linear", align_corners=False)[0, 0]
+            wav.mul_(gain_samples[-n:])
 
     def _rms_torch(self, x):
         """librosa.feature.rms(center=True) 的 GPU 等价实现, 避免每块 .cpu() 同步"""

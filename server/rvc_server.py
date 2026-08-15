@@ -172,12 +172,18 @@ class RVCServer:
             }))
 
     def _parse_audio(self, data: bytes):
+        if not data or len(data) < 8:
+            return None
         req_seq = struct.unpack(">I", data[:4])[0]
         n_samples = struct.unpack(">I", data[4:8])[0]
-        audio = np.frombuffer(data[8:8 + n_samples * 4], dtype=np.float32)
-        if len(audio) < n_samples:
-            print(f"[!] 音频数据不完整: 期望 {n_samples}, 实际 {len(audio)}")
+        # 边界与 DoS 防护（单块最大 4 秒 48k 采样点）
+        if n_samples <= 0 or n_samples > 192000:
             return None
+        expected_len = 8 + n_samples * 4
+        if len(data) < expected_len:
+            print(f"[!] 音频数据不完整: 期望 {n_samples} 采样点 ({expected_len} 字节), 实际 {len(data)} 字节")
+            return None
+        audio = np.frombuffer(data[8:expected_len], dtype=np.float32)
         return req_seq, np.asarray(audio, dtype=np.float32)
 
     def _infer_audio(self, audio):
@@ -227,7 +233,7 @@ class RVCServer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RVC 推理服务器")
-    parser.add_argument("--host", default="0.0.0.0", help="监听地址")
+    parser.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1 本地回环，局域网共享请输入 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8765, help="监听端口")
     args = parser.parse_args()
     asyncio.run(RVCServer(args.host, args.port).start())

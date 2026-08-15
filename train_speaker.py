@@ -211,6 +211,12 @@ def main():
     parser.add_argument("--skip-preprocess", action="store_true", help="跳过预处理 (切片+F0+特征)，直接训练")
     args = parser.parse_args()
 
+    train_dir = os.path.join(PROJECT_ROOT, "train")
+    if not os.path.isdir(train_dir):
+        print(f"\n[!] 提示: 当前仓库为轻量流式推理版，未包含模型训练套件 (train/ 目录)。")
+        print(f"    如需训练专属音色，请使用完整训练仓库训练后，将导出的 .pth 模型和 .index 索引放入 assets/weights/ 即可在客户端中即开即用。\n")
+        sys.exit(1)
+
     # 自动设置预训练模型路径
     if args.pretrained_g is None:
         default_g = os.path.join("assets", "pretrained_v2", f"f0G{args.sr}.pth")
