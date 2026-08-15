@@ -325,8 +325,8 @@ class LazyLocalPipeline:
 def make_pipeline(mode, server_url, on_status):
     if mode == "local":
         if not os.environ.get("RVC_DIRECT_LOCAL"):
-            # 统一走本机子进程推理（崩溃隔离、单一代码路径、UI 启动不加载 torch）；
-            # 设置环境变量 RVC_DIRECT_LOCAL=1 可回退为进程内直连（旧行为）
+            # 统一走本机子进程推理（崩溃隔离、单一代码路径、UI 启动 0.3 秒秒开）；
+            # 设置环境变量 RVC_DIRECT_LOCAL=1 可切换为进程内直连
             from worker.local_server import LocalServerPipeline
             return LocalServerPipeline(on_status=on_status)
         return LazyLocalPipeline(on_status)
@@ -493,78 +493,270 @@ SPEAKERS_FILE = PROJECT_ROOT / "speakers.json"
 WEIGHTS_DIR   = PROJECT_ROOT / "assets" / "weights"
 
 STYLE_QSS = """
-QMainWindow, QDialog { background-color: #e7ecf1; color: #1c2833; }
-QWidget { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 13px; }
+QMainWindow, QDialog {
+    background-color: #f8fafc;
+    color: #0f172a;
+}
+QWidget {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 13px;
+    color: #1e293b;
+}
+
+/* 顶部 Header */
 QFrame#header {
-    background-color: #f7f9fb; border: 1px solid #d5dde6;
-    border-radius: 12px;
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
 }
+QLabel#appTitle {
+    font-size: 16px;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: -0.2px;
+}
+
+/* 核心面板卡片 */
 QGroupBox {
-    border: 1px solid #d5dde6; border-radius: 12px; margin-top: 12px;
-    padding: 16px 12px 12px 12px; background-color: #ffffff;
-    font-weight: 600; color: #3d4f5f;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 14px 12px 10px 12px;
+    background-color: #ffffff;
+    font-weight: 600;
+    font-size: 13px;
+    color: #0f172a;
 }
-QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 8px; color: #0f766e; }
-QLabel#appTitle { font-size: 18px; font-weight: 700; color: #12352f; }
-QLabel#fieldLabel { color: #5d6d7e; font-size: 12px; font-weight: 600; }
-QLabel#chip { padding: 2px 0; }
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    background-color: #ffffff;
+    color: #0f172a;
+    font-weight: 600;
+}
+
+QLabel#fieldLabel {
+    color: #64748b;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+/* 下拉菜单 */
 QComboBox {
     combobox-popup: 0;
-    background-color: #ffffff; border: 1px solid #cfd8e3;
-    border-radius: 8px; padding: 5px 10px; min-height: 22px;
-    font-size: 13px; color: #1c2833;
+    background-color: #ffffff;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 4px 8px;
+    min-height: 24px;
+    font-size: 13px;
+    color: #111827;
 }
-QComboBox:hover { border-color: #0f766e; }
-QComboBox::drop-down {
-    subcontrol-origin: padding; subcontrol-position: top right;
-    width: 22px; border: none;
+QComboBox:hover {
+    border-color: #9ca3af;
 }
-QComboBox QAbstractItemView {
-    background-color: #ffffff; border: 1px solid #cfd8e3;
-    border-radius: 8px; padding: 4px; outline: none;
-    max-height: 280px;
-    selection-background-color: #d1fae5; selection-color: #134e4a;
-}
-QComboBox QAbstractItemView::item { min-height: 24px; padding: 3px 8px; }
-QScrollBar:vertical { border: none; background: #eef2f6; width: 8px; border-radius: 4px; }
-QScrollBar::handle:vertical { background: #b7c3ce; border-radius: 4px; min-height: 20px; }
-QScrollBar::handle:vertical:hover { background: #8fa0ae; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
-QSpinBox, QDoubleSpinBox, QLineEdit {
-    background-color: #fff; border: 1px solid #cfd8e3;
-    border-radius: 8px; padding: 4px 8px; min-height: 22px;
-}
-QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus, QComboBox:focus {
+QComboBox:focus {
     border-color: #0f766e;
 }
-QCheckBox { spacing: 8px; color: #3d4f5f; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 20px;
+    border: none;
+}
+QComboBox QAbstractItemView {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 6px;
+    padding: 4px;
+    outline: none;
+    max-height: 280px;
+    selection-background-color: #f3f4f6;
+    selection-color: #111827;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 24px;
+    padding: 3px 6px;
+    border-radius: 4px;
+}
+
+/* 滚动条 */
+QScrollBar:vertical {
+    border: none;
+    background: transparent;
+    width: 6px;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical {
+    background: #e2e8f0;
+    border-radius: 3px;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #cbd5e1;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+/* 输入框与数值调节器 */
+QSpinBox, QDoubleSpinBox, QLineEdit {
+    background-color: #ffffff;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 4px 6px;
+    min-height: 24px;
+    color: #111827;
+    font-size: 13px;
+}
+QSpinBox:hover, QDoubleSpinBox:hover, QLineEdit:hover {
+    border-color: #9ca3af;
+}
+QSpinBox:focus, QDoubleSpinBox:focus, QLineEdit:focus {
+    border-color: #0f766e;
+}
+
+/* 滑块 */
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #e5e7eb;
+    border-radius: 2px;
+}
+QSlider::sub-page:horizontal {
+    background: #0f766e;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    background: #ffffff;
+    border: 1.5px solid #0f766e;
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}
+
+/* 单选与复选框 */
+QCheckBox, QRadioButton {
+    spacing: 6px;
+    color: #374151;
+    font-weight: 500;
+}
 QCheckBox::indicator {
-    width: 16px; height: 16px; border: 2px solid #b8c4d0;
-    border-radius: 4px; background-color: #fff;
+    width: 15px;
+    height: 15px;
+    border: 1px solid #9ca3af;
+    border-radius: 4px;
+    background-color: #ffffff;
 }
-QCheckBox::indicator:checked { background-color: #0f766e; border-color: #0f766e; }
+QCheckBox::indicator:hover {
+    border-color: #0f766e;
+}
+QCheckBox::indicator:checked {
+    background-color: #0f766e;
+    border-color: #0f766e;
+}
+QRadioButton::indicator {
+    width: 15px;
+    height: 15px;
+    border: 1px solid #9ca3af;
+    border-radius: 8px;
+    background-color: #ffffff;
+}
+QRadioButton::indicator:hover {
+    border-color: #0f766e;
+}
+QRadioButton::indicator:checked {
+    background-color: #0f766e;
+    border-color: #0f766e;
+}
+
+/* 按钮系统 */
 QPushButton {
-    background-color: #eef3f6; color: #1c2833;
-    border: 1px solid #cfd8e3; border-radius: 8px;
-    padding: 7px 12px; font-weight: 600;
+    background-color: #ffffff;
+    color: #374151;
+    border: 1px solid #d1d5db;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-weight: 500;
+    font-size: 13px;
 }
-QPushButton:hover { background-color: #e1eaef; border-color: #b7c6d1; }
-QPushButton:pressed { background-color: #d4e0e7; }
-QPushButton#btnGhost { background: transparent; }
-QPushButton#btnConnect { background-color: #0f766e; color: #fff; border: none; min-width: 72px; }
-QPushButton#btnConnect:hover { background-color: #0d9488; }
-QPushButton#btnStart { font-size: 16px; padding: 14px 20px; border-radius: 10px; border: none; }
-QPushButton#btnStart[state="off"] { background-color: #15803d; color: #fff; }
-QPushButton#btnStart[state="off"]:hover { background-color: #16a34a; }
-QPushButton#btnStart[state="on"] { background-color: #b91c1c; color: #fff; }
-QPushButton#btnStart[state="on"]:hover { background-color: #dc2626; }
-QPushButton#btnStart:disabled { background-color: #b8c4ce; color: #fff; }
-QLabel { color: #1c2833; }
-QStatusBar { background-color: #f7f9fb; color: #6b7c8a; border-top: 1px solid #d5dde6; }
+QPushButton:hover {
+    background-color: #f9fafb;
+    border-color: #9ca3af;
+    color: #111827;
+}
+QPushButton:pressed {
+    background-color: #f3f4f6;
+}
+QPushButton#btnGhost {
+    background-color: #f9fafb;
+    border: 1px solid #e5e7eb;
+    color: #4b5563;
+    padding: 4px 10px;
+}
+QPushButton#btnGhost:hover {
+    background-color: #f3f4f6;
+    border-color: #d1d5db;
+    color: #111827;
+}
+QPushButton#btnConnect {
+    background-color: #0f766e;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-weight: 600;
+    min-width: 64px;
+}
+QPushButton#btnConnect:hover {
+    background-color: #115e59;
+}
+
+/* 启动/停止主操作按钮 */
+QPushButton#btnStart {
+    font-size: 15px;
+    font-weight: 700;
+    padding: 10px 20px;
+    border-radius: 8px;
+    border: none;
+}
+QPushButton#btnStart[state="off"] {
+    background-color: #15803d;
+    color: #ffffff;
+}
+QPushButton#btnStart[state="off"]:hover {
+    background-color: #16a34a;
+}
+QPushButton#btnStart[state="on"] {
+    background-color: #dc2626;
+    color: #ffffff;
+}
+QPushButton#btnStart[state="on"]:hover {
+    background-color: #ef4444;
+}
+QPushButton#btnStart:disabled {
+    background-color: #e5e7eb;
+    color: #9ca3af;
+}
+
+/* 角色卡片 */
 QFrame#roleCard {
-    background: #f0fdfa; border: 1px solid #99f6e4; border-radius: 10px;
+    background-color: #f9fafb;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
 }
-QSplitter::handle { background: #d5dde6; width: 1px; }
+
+/* 状态栏 */
+QStatusBar {
+    background-color: #ffffff;
+    color: #6b7280;
+    border-top: 1px solid #e5e7eb;
+}
+QSplitter::handle {
+    background: #e5e7eb;
+    width: 1px;
+}
 """
 
 # 状态灯颜色
@@ -803,6 +995,24 @@ class RecThread(QThread):
             self.done.emit("", str(e))
 
 
+class EngineStartThread(QThread):
+    """后台执行启动/重建声卡流的阻塞部分（网络等待、CUDA 预热、声卡打开）。
+
+    UI 线程只负责发起与信号响应，绝不进入等待——杜绝"未响应"。
+    """
+
+    def __init__(self, engine, action, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.action = action
+
+    def run(self):
+        if self.action == "start":
+            self.engine._start_blocking()
+        elif self.action == "reopen":
+            self.engine._reopen_blocking()
+
+
 # ==============================================================================
 # 推理引擎（本地）
 # ==============================================================================
@@ -1024,10 +1234,19 @@ class VCEngine(QObject):
         return ok
 
     def start(self):
+        """异步启动：网络等待 / CUDA 预热 / 声卡打开全部在后台线程，UI 永不阻塞。"""
         self._fade_epoch += 1
         if self.stream is not None or self.running:
             self._hard_stop()
+        if getattr(self, "_start_thread", None) is not None and self._start_thread.isRunning():
+            return
+        self._start_thread = EngineStartThread(self, "start", parent=self)
+        self._start_thread.start()
+
+    def _start_blocking(self):
         if not self._ensure_connected() or not self._ensure_model():
+            self.status_msg.emit("无法启动：请先加载角色模型")
+            self.load_failed.emit("模型未加载")
             return
         try:
             params = self.merged_params()
@@ -1041,9 +1260,9 @@ class VCEngine(QObject):
             self._drain_queue(self.input_queue)
             self._drain_queue(self.output_queue)
 
-            # 输入 AGC（按当前采样率重建，静音/增益状态清零）
+            # 输入 AGC（按当前采样率重建，静音/增益状态清零，动态绑定当前静音门限）
             if self.input_agc:
-                self.agc = AutoGain(sample_rate=self.pipeline.samplerate)
+                self.agc = AutoGain(sample_rate=self.pipeline.samplerate, gate_db=float(self.threhold))
             else:
                 self.agc = None
 
@@ -1149,17 +1368,26 @@ class VCEngine(QObject):
             return False, str(e)
 
     def reopen_stream(self, input_device, output_device):
-        """运行中只重建声卡流，不断开服务器、不重载模型。"""
+        """运行中只重建声卡流（后台执行），不断开服务器、不重载模型。"""
         self.input_device = input_device
         self.output_device = output_device
         if not self.running:
             return True, ""
+        if getattr(self, "_start_thread", None) is not None and self._start_thread.isRunning():
+            self.status_msg.emit("正在切换设备，请稍候...")
+            return True, ""
+        self.status_msg.emit("正在切换设备...")
+        self._start_thread = EngineStartThread(self, "reopen", parent=self)
+        self._start_thread.start()
+        return True, ""
+
+    def _reopen_blocking(self):
         self._close_stream_only()
         ok, msg = self._open_stream()
         if not ok:
             self.status_msg.emit("切换设备失败: " + msg)
             self._hard_stop()
-            return False, msg
+            return
         self._fade_in_left = int(0.04 * self.pipeline.samplerate)
         self._fade_out_left = 0
         try:
@@ -1167,9 +1395,8 @@ class VCEngine(QObject):
         except Exception as e:
             self.status_msg.emit("切换设备失败: " + str(e))
             self._hard_stop()
-            return False, str(e)
+            return
         self.status_msg.emit("已切换设备 · " + msg)
-        return True, msg
 
     def _on_monitor(self, outdata, frames, times, status):
         """监听流回调：从队列取变声结果播放，空则补零（绝不阻塞）。"""
@@ -1486,7 +1713,7 @@ class MainWindow(QMainWindow):
 
     def _on_xrun(self, xruns):
         self.xrun_label.setText(f"卡顿 {xruns}")
-        self.xrun_label.setStyleSheet("font-size:12px;font-weight:700;color:#b91c1c;" if xruns > 0 else "font-size:12px;font-weight:700;color:#6b7c8a;")
+        self.xrun_label.setStyleSheet("font-size:12px;font-weight:700;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:4px 8px;" if xruns > 0 else "font-size:12px;font-weight:700;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:4px 8px;")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -1517,44 +1744,56 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_ui(self):
-        self.resize(1240, 760)
-        self.setMinimumSize(1120, 680)
+        self.resize(1220, 750)
+        self.setMinimumSize(1100, 660)
         central = QWidget(); self.setCentralWidget(central)
         root = QVBoxLayout(central)
-        root.setContentsMargins(12, 12, 12, 8)
+        root.setContentsMargins(12, 12, 12, 10)
         root.setSpacing(10)
 
+        # ── 顶部 Header 状态栏 ──
         header = QFrame(); header.setObjectName("header")
         top = QHBoxLayout(header)
-        top.setContentsMargins(14, 10, 14, 10)
+        top.setContentsMargins(14, 8, 14, 8)
         top.setSpacing(12)
+
         title = QLabel("RVC 实时变声")
         title.setObjectName("appTitle")
         top.addWidget(title)
+
         self.in_meter = VUMeterWidget(title="输入")
         self.out_meter = VUMeterWidget(title="输出")
         top.addWidget(self.in_meter)
         top.addWidget(self.out_meter)
         top.addStretch()
+
+        # 状态微型标签
+        self.badge_box = QFrame()
+        self.badge_box.setStyleSheet("background:#f3f4f6;border:1px solid #e5e7eb;border-radius:6px;")
+        bh = QHBoxLayout(self.badge_box); bh.setContentsMargins(8, 3, 8, 3); bh.setSpacing(6)
         self.light = QLabel()
-        self.light.setFixedSize(10, 10)
-        self.light.setStyleSheet(f"background:{LIGHT_GRAY};border-radius:5px;")
-        top.addWidget(self.light)
+        self.light.setFixedSize(7, 7)
+        self.light.setStyleSheet(f"background:{LIGHT_GRAY};border-radius:3px;")
+        bh.addWidget(self.light)
         self.state_label = QLabel("未加载模型")
-        self.state_label.setObjectName("chip")
-        self.state_label.setStyleSheet("font-size:12px;font-weight:700;color:#6b7c8a;")
-        top.addWidget(self.state_label)
+        self.state_label.setStyleSheet("font-size:12px;font-weight:600;color:#6b7280;")
+        bh.addWidget(self.state_label)
+        top.addWidget(self.badge_box)
+
         self.latency_label = QLabel("延迟 --ms")
-        self.latency_label.setStyleSheet("font-size:12px;font-weight:700;color:#15803d;")
+        self.latency_label.setStyleSheet("font-size:12px;font-weight:600;color:#15803d;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:3px 8px;")
         top.addWidget(self.latency_label)
+
         self.e2e_label = QLabel("端到端 --ms")
-        self.e2e_label.setStyleSheet("font-size:12px;font-weight:700;color:#7c3aed;")
+        self.e2e_label.setStyleSheet("font-size:12px;font-weight:600;color:#6d28d9;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;padding:3px 8px;")
         top.addWidget(self.e2e_label)
+
         self.xrun_label = QLabel("卡顿 0")
-        self.xrun_label.setStyleSheet("font-size:12px;font-weight:700;color:#6b7c8a;")
+        self.xrun_label.setStyleSheet("font-size:12px;font-weight:600;color:#6b7280;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:3px 8px;")
         top.addWidget(self.xrun_label)
         root.addWidget(header)
 
+        # ── 三栏主体布局 ──
         sp = QSplitter(Qt.Horizontal)
         sp.addWidget(self._build_left())
         sp.addWidget(self._build_mid())
@@ -1562,7 +1801,7 @@ class MainWindow(QMainWindow):
         sp.setStretchFactor(0, 0)
         sp.setStretchFactor(1, 1)
         sp.setStretchFactor(2, 0)
-        sp.setSizes([300, 580, 330])
+        sp.setSizes([300, 560, 360])
         root.addWidget(sp, 1)
 
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
@@ -1574,7 +1813,7 @@ class MainWindow(QMainWindow):
         l.setSpacing(8)
 
         self.sc = create_styled_combo(max_visible=12)
-        self.sc.setMinimumHeight(34)
+        self.sc.setMinimumHeight(32)
         self.sc.currentIndexChanged.connect(self._sel)
         l.addWidget(self.sc)
 
@@ -1586,13 +1825,13 @@ class MainWindow(QMainWindow):
 
         self.cur_card = QFrame(); self.cur_card.setObjectName("roleCard")
         cv = QVBoxLayout(self.cur_card)
-        cv.setContentsMargins(10, 10, 10, 10); cv.setSpacing(4)
+        cv.setContentsMargins(10, 8, 10, 8); cv.setSpacing(3)
         self.cur_name = QLabel("未选择角色")
-        self.cur_name.setStyleSheet("font-size:14px;font-weight:700;color:#134e4a;")
+        self.cur_name.setStyleSheet("font-size:13px;font-weight:700;color:#111827;")
         self.cur_model = QLabel("")
-        self.cur_model.setStyleSheet("font-size:11px;color:#6b7c8a;")
+        self.cur_model.setStyleSheet("font-size:11px;color:#6b7280;")
         self.cur_info = QLabel("")
-        self.cur_info.setStyleSheet("font-size:11px;color:#6b7c8a;")
+        self.cur_info.setStyleSheet("font-size:11px;color:#6b7280;")
         cv.addWidget(self.cur_name); cv.addWidget(self.cur_model); cv.addWidget(self.cur_info)
         l.addWidget(self.cur_card)
 
@@ -1707,10 +1946,11 @@ class MainWindow(QMainWindow):
         self.sb = QPushButton("启动变声")
         self.sb.setObjectName("btnStart")
         self.sb.setProperty("state", "off")
-        self.sb.setMinimumHeight(48)
+        self.sb.setMinimumHeight(46)
         self.sb.clicked.connect(self._tg)
         l.addWidget(self.sb)
         self.rec_btn = QPushButton("录音测试 10 秒")
+        self.rec_btn.setMinimumHeight(36)
         self.rec_btn.setToolTip("录 10 秒，用当前角色变声后保存并播放")
         self.rec_btn.clicked.connect(self._rec)
         l.addWidget(self.rec_btn)
@@ -1913,13 +2153,9 @@ class MainWindow(QMainWindow):
             self._show_dev_hint(err)
             self.status_bar.showMessage(err, 8000)
             return
-        ok, msg = self.engine.reopen_stream(in_id, out_id)
-        if not ok:
-            self._show_dev_hint(msg)
-            self.status_bar.showMessage("切换设备失败: " + msg, 8000)
-        else:
-            self._clear_dev_hint()
-            self.status_bar.showMessage("已切换设备 · " + msg, 5000)
+        # 切换设备在后台执行，结果由引擎状态消息回报
+        self._clear_dev_hint()
+        self.engine.reopen_stream(in_id, out_id)
         self._persist_settings()
 
     def _align_device_apis(self, changed):
@@ -2180,25 +2416,32 @@ class MainWindow(QMainWindow):
     def _on_start_failed(self, msg):
         """启动变声失败：常驻提示 + 弹窗。"""
         text = (msg or "未知错误").strip()
+        self.sb.setEnabled(True)
+        self.sb.setText("启动变声")
+        self.sb.setProperty("state", "off")
+        self.sb.style().unpolish(self.sb); self.sb.style().polish(self.sb)
+        self._set_light(LIGHT_RED, "启动失败")
         self._show_dev_hint("启动失败: " + text[:200])
         self.status_bar.showMessage("启动失败: " + text, 8000)
         QMessageBox.warning(self, "启动失败", text[:300])
 
     def _set_light(self, color, text):
-        self.light.setStyleSheet(f"background:{color};border-radius:5px;")
+        self.light.setStyleSheet(f"background:{color};border-radius:4px;")
         self.state_label.setText(text)
-        self.state_label.setStyleSheet(
-            "font-size:12px;font-weight:700;color:" + ("#134e4a" if color != LIGHT_GRAY else "#6b7c8a"))
+        c = "#0f766e" if color == LIGHT_GREEN else ("#d97706" if color == LIGHT_YELLOW else ("#dc2626" if color == LIGHT_RED else "#64748b"))
+        self.state_label.setStyleSheet(f"font-size:12px;font-weight:700;color:{c};")
 
     def _on_started(self):
         self._set_light(LIGHT_GREEN, "运行中")
         self._clear_dev_hint()
+        self.sb.setEnabled(True)
         self.sb.setText("停止变声")
         self.sb.setProperty("state", "on")
         self.sb.style().unpolish(self.sb); self.sb.style().polish(self.sb)
 
     def _on_stopped(self):
         self._set_light(LIGHT_GRAY, "已停止")
+        self.sb.setEnabled(True)
         self.sb.setText("启动变声")
         self.sb.setProperty("state", "off")
         self.sb.style().unpolish(self.sb); self.sb.style().polish(self.sb)
@@ -2248,9 +2491,16 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_infer_time(self, ms):
-        c = "#27ae60" if ms < 50 else ("#f39c12" if ms < 100 else "#e74c3c")
+        if ms < 50:
+            c, bg, bd = "#059669", "#ecfdf5", "#a7f3d0"
+        elif ms < 100:
+            c, bg, bd = "#d97706", "#fffbeb", "#fde68a"
+        else:
+            c, bg, bd = "#dc2626", "#fef2f2", "#fecaca"
         self.latency_label.setText(f"延迟 {ms}ms")
-        self.latency_label.setStyleSheet(f"font-size:12px;font-weight:700;color:{c};")
+        self.latency_label.setStyleSheet(
+            f"font-size:12px;font-weight:700;color:{c};background:{bg};border:1px solid {bd};border-radius:6px;padding:4px 8px;"
+        )
 
     def _tg(self):
         if self.engine.running:
@@ -2266,6 +2516,10 @@ class MainWindow(QMainWindow):
             return
         self.engine.input_device = in_id
         self.engine.output_device = out_id
+        # 启动全程异步：按钮立即反馈"启动中"，后台完成后由信号切回
+        self.sb.setEnabled(False)
+        self.sb.setText("启动中…")
+        self._set_light(LIGHT_YELLOW, "启动中…")
         self.engine.start()
         self._persist_settings()
 
@@ -2311,6 +2565,14 @@ class MainWindow(QMainWindow):
                 pass
         if self.engine.running:
             self.engine._hard_stop()
+        # 启动线程仍在后台执行时：先中断再等待，避免退出后流被拉起
+        st = getattr(self.engine, "_start_thread", None)
+        if st is not None and st.isRunning():
+            try:
+                self.engine._hard_stop()
+                st.wait(2000)
+            except Exception:
+                pass
         # 冻结版：退出时回收本机子进程推理服务
         pipe = getattr(self.engine, "pipeline", None)
         if pipe is not None and getattr(pipe, "stop_server", None) is not None:
@@ -2438,7 +2700,7 @@ class MainWindow(QMainWindow):
                 noise_db, target_thresh = res
                 self.ts.setValue(target_thresh)
                 self.status_bar.showMessage(
-                    f"✓ 底噪测定完成：当前环境底噪 {noise_db} dB，已自动设定静音阈值为 {target_thresh} dB",
+                    f"✓ 底噪测定完成：当前环境底噪 {noise_db} dB，已自动设定静音阈值与 AGC 门限为 {target_thresh} dB",
                     6000,
                 )
             else:

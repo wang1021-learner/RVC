@@ -104,7 +104,7 @@
       "index_path": "",
       "speaker_id": 0,
       "pitch": 12,
-      "index_rate": 0.5,
+      "index_rate": 0.4,
       "formant": 0.0,
       "f0method": "rmvpe",
       "I_noise_reduce": false,

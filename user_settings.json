@@ -7,10 +7,10 @@
   "output_api": 2,
   "block_time": 0.15,
   "crossfade_time": 0.03,
-  "extra_time": 10.0,
+  "extra_time": 1.0,
   "f0method": "rmvpe",
-  "threhold": -69,
-  "rms_mix_rate": 0.3,
+  "threhold": -60,
+  "rms_mix_rate": 0.0,
   "I_noise_reduce": true,
   "O_noise_reduce": true,
   "formant": 0.0,
@@ -20,10 +20,10 @@
   "monitor_enabled": false,
   "monitor_volume": 0.8,
   "limiter_enable": true,
-  "limiter_threshold_db": -0.5,
+  "limiter_threshold_db": -3.0,
   "hf_mix_rate": 0.0,
-  "presence": 1.0,
+  "presence": 0.2,
   "deesser_enable": false,
   "vad_enable": true,
-  "vad_threshold": 0.5
+  "vad_threshold": 0.6
 }

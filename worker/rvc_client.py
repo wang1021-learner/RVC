@@ -149,7 +149,9 @@ class RVCClient:
             cmd = {"action": "start"}
             cmd.update(params)
             with self._lock:
-                self._ws.settimeout(5.0)
+                # 改过参数时服务端要重新预热 CUDA Graph（10~20s），
+                # 此调用在后台线程执行，耐心等 60s 不误报失败
+                self._ws.settimeout(60.0)
                 self._ws.send(json.dumps(cmd))
                 resp = json.loads(self._ws.recv())
             if isinstance(resp, dict) and "error" in resp:
@@ -190,7 +192,7 @@ class RVCClient:
             self._active = False
             try:
                 # 收掉服务器的 stop 响应，避免残留污染下一个请求
-                self._ws.settimeout(1.0)
+                self._ws.settimeout(0.2)
                 self._ws.recv()
             except Exception:
                 pass
@@ -275,20 +277,21 @@ class RVCClient:
         return self.connect(timeout=3)
 
     def configure(self, **kwargs):
-        """发送配置命令到服务器。拿不到锁就放弃，避免卡住 UI。"""
+        """参数配置：发了即走（Fire-and-Forget），绝不等待回包卡 UI。
+
+        服务端对 configure 不再回包（与 set_live 一致），
+        因此不存在残留响应污染后续请求的问题。
+        """
         if not self._ws or not self._connected:
             return False
-        if not self._lock.acquire(timeout=0.2):
+        if not self._lock.acquire(timeout=0.05):
             return False
         try:
             cmd = {"action": "configure"}
             cmd.update(kwargs)
-            self._ws.settimeout(2.0)
             self._ws.send(json.dumps(cmd))
-            resp = json.loads(self._ws.recv())
-            return resp.get("status") == "ok"
+            return True
         except Exception:
-            self._drain()
             return False
         finally:
             self._lock.release()

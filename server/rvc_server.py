@@ -130,8 +130,8 @@ class RVCServer:
                 }
             await websocket.send(json.dumps(await self._on_infer_thread(_load)))
         elif action == "configure":
+            # 客户端 Fire-and-Forget：不回包，避免客户端等待与响应残留
             await self._on_infer_thread(self._apply_infer_params, cmd)
-            await websocket.send(json.dumps({"status": "ok", "action": "configure"}))
             print("[*] 参数已更新")
         elif action == "set_live":
             def _live():
