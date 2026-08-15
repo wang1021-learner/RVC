@@ -103,7 +103,7 @@ class VoiceActivityDetector:
         spec = torch.fft.rfft(frames * window, dim=-1).abs()  # (num_frames, n_bins)
         freq_bin_hz = (self.sample_rate / 2.0) / (spec.shape[-1] - 1)
 
-        idx_low = max(1, int(300 / freq_bin_hz))
+        idx_low = max(1, int(100 / freq_bin_hz))
         idx_mid = min(spec.shape[-1] - 1, int(3400 / freq_bin_hz))
         idx_high = min(spec.shape[-1] - 1, int(8000 / freq_bin_hz))
         idx_sub = max(1, int(80 / freq_bin_hz))
@@ -128,7 +128,9 @@ class VoiceActivityDetector:
             ).view(-1)
             center = max_lag
             lags = r[center + min_lag : center + max_lag]
-            norm = down.square().sum() + 1e-8
+            # 归一化必须用相关窗口的能量（前 max_lag 样本），
+            # 用整块能量会把周期置信度压低 4 倍导致语音漏检
+            norm = down[:max_lag].square().sum() + 1e-8
             periodicity = (lags.amax() / norm).clamp(min=0.0) if lags.numel() > 0 else torch.tensor(0.0, device=self.device)
         else:
             periodicity = torch.tensor(0.0, device=self.device)
