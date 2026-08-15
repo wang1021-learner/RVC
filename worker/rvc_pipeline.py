@@ -293,7 +293,7 @@ class RVCPipeline:
         if not cuda_graph_enabled(self.config.device):
             return
         try:
-            self._on_status("CUDA Graph warmup...")
+            self._on_status("正在预热 CUDA Graph 加速图...")
             n = self._input_wav_res.shape[0]
             phase = torch.arange(n, device=self.config.device, dtype=torch.float32)
             self._input_wav_res.copy_(0.05 * torch.sin(2 * np.pi * 220.0 * phase / 16000.0))
@@ -310,9 +310,9 @@ class RVCPipeline:
                 tmp = self.rvc.infer(self._input_wav_res, self._block_frame_16k, self._skip_head, self._return_length, self.f0method)
                 self._tg(tmp.unsqueeze(0), self._output_buffer.unsqueeze(0))
             torch.cuda.synchronize(self.config.device)
-            self._on_status("CUDA Graph ready")
+            self._on_status("CUDA Graph 加速就绪")
         except Exception:
-            self._on_status(f"Warmup failed:\n{traceback.format_exc()}")
+            self._on_status(f"CUDA Graph 预热失败:\n{traceback.format_exc()}")
         finally:
             self._zero_buffers()
 

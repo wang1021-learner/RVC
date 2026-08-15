@@ -2127,15 +2127,15 @@ class MainWindow(QMainWindow):
                 lines = f.readlines()
             for line in reversed(lines):
                 low = line.lower()
-                if "graph ready" in low:
+                if "加速就绪" in line or "graph ready" in low:
                     return "预热完成，即将就绪"
-                if "warmup" in low:
-                    return "正在预热 CUDA Graph"
+                if "正在预热" in line or "warmup" in low:
+                    return "正在预热加速图"
                 if "rmvpe" in low or "fcpe" in low or "音高" in line:
                     return "正在加载音高模型"
                 if "加载模型" in line or "loading" in low:
                     return "正在加载角色模型"
-                if "客户端连接" in line or "server 启动" in low:
+                if "客户端连接" in line or "server 启动" in low or "服务已启动" in line:
                     return "推理服务已启动"
             return None
         except Exception:
