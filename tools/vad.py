@@ -21,7 +21,7 @@ class VoiceActivityDetector:
         self,
         sample_rate: int = 48000,
         threshold: float = 0.5,
-        hangover_ms: float = 350.0,
+        hangover_ms: float = 40.0,
         device: str = "cuda",
     ):
         self.sample_rate = int(sample_rate)
@@ -34,6 +34,7 @@ class VoiceActivityDetector:
         self._hangover_left = 0
         self._is_active = False
         self._current_gain = 0.0
+        self._delay = None
 
         # 尝试加载本地 Silero JIT 模型（如有）
         self._silero_model = None
@@ -58,6 +59,7 @@ class VoiceActivityDetector:
         self._hangover_left = 0
         self._is_active = False
         self._current_gain = 0.0
+        self._delay = None
         if self._silero_model is not None and hasattr(self._silero_model, "reset_states"):
             try:
                 self._silero_model.reset_states()
@@ -76,8 +78,10 @@ class VoiceActivityDetector:
         if self._silero_model is not None and wav_16k is not None:
             try:
                 with torch.no_grad():
-                    prob = self._silero_model(wav_16k.view(1, -1), 16000).item()
-                    return float(prob)
+                    prob = self._silero_model(wav_16k.view(1, -1), 16000)
+                    if torch.is_tensor(prob):
+                        return prob.reshape(()).to(dtype=torch.float32)
+                    return torch.tensor(float(prob), device=self.device)
             except Exception:
                 pass
 
@@ -142,8 +146,7 @@ class VoiceActivityDetector:
             (fricative_ratio * 1.6).clamp(max=1.0),
             torch.tensor(0.0, device=self.device),
         )
-        prob_tensor = torch.maximum(vowel_prob, consonant_prob).clamp(0.0, 1.0)
-        return float(prob_tensor.item())
+        return torch.maximum(vowel_prob, consonant_prob).clamp(0.0, 1.0)
 
     def process(
         self,
@@ -152,46 +155,42 @@ class VoiceActivityDetector:
         threshold: float = None,
     ) -> tuple[torch.Tensor, bool, float]:
         """
-        对输入音频块进行智能人声活动过滤。
-        采用状态性连续平滑增益包络，杜绝任何断崖式硬切清零。
-        
-        返回:
-            processed_wav: 经过平滑门控过滤的音频 Tensor
-            is_speech: 当前块是否判定为人声
-            prob: 计算得到的人声概率 (0.0 ~ 1.0)
+        1 帧 look-ahead（10ms）+ 短 hangover。
+        增益在 GPU 上算完，只在返回 Python 标记时同步一次标量。
         """
         th = float(threshold if threshold is not None else self.threshold)
-        prob = self.detect_speech_prob(wav_48k, wav_16k)
+        zc = self.zc
+        if self._delay is None or self._delay.shape[0] != zc or self._delay.device != wav_48k.device:
+            self._delay = torch.zeros(zc, device=wav_48k.device, dtype=wav_48k.dtype)
+        combined = torch.cat([self._delay, wav_48k])
+        self._delay = wav_48k[-zc:].detach()
+        delayed = combined[: wav_48k.shape[0]]
 
-        is_current_speech = prob >= th
-
-        # 状态机：人声判定与尾音保持 (Hangover)
-        if is_current_speech:
+        prob_t = self.detect_speech_prob(combined, wav_16k)
+        if not torch.is_tensor(prob_t):
+            prob_t = torch.tensor(float(prob_t), device=wav_48k.device)
+        active_t = prob_t >= th
+        if bool(active_t.detach()):
             self._hangover_left = self.hangover_frames
             self._is_active = True
+        elif self._hangover_left > 0:
+            self._hangover_left -= 1
+            self._is_active = True
         else:
-            if self._hangover_left > 0:
-                self._hangover_left -= 1
-                self._is_active = True
-            else:
-                self._is_active = False
+            self._is_active = False
 
         target_gain = 1.0 if self._is_active else 0.0
-        n = wav_48k.shape[0]
-
-        # 连续状态性平滑包络（消除块边界硬切导致的直流台阶与咔哒爆音）
+        n = delayed.shape[0]
         if self._current_gain == target_gain:
-            if target_gain == 1.0:
-                return wav_48k, True, prob
-            else:
-                return torch.zeros_like(wav_48k), False, prob
+            out = delayed if target_gain == 1.0 else torch.zeros_like(delayed)
         else:
             gain_curve = torch.linspace(
                 self._current_gain,
                 target_gain,
                 n,
-                device=wav_48k.device,
-                dtype=wav_48k.dtype,
+                device=delayed.device,
+                dtype=delayed.dtype,
             )
             self._current_gain = target_gain
-            return wav_48k * gain_curve, self._is_active, prob
+            out = delayed * gain_curve
+        return out, self._is_active, float(prob_t.detach())

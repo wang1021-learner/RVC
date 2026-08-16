@@ -155,7 +155,7 @@ class _GraphCache:
         self.eviction_count = 0
         self.capture_ms = 0.0
 
-    def run(self, key, function, inputs):
+    def run(self, key, function, inputs, allow_capture=True):
         signature = key + tuple(_tensor_signature(value) for value in inputs)
         with self.lock:
             if signature in self.failures:
@@ -163,6 +163,9 @@ class _GraphCache:
                 return function(*inputs)
             entry = self.entries.get(signature)
             if entry is None:
+                if not allow_capture:
+                    self.fallback_count += 1
+                    return function(*inputs)
                 try:
                     entry = _CapturedCall(function, inputs)
                     self.entries[signature] = entry
@@ -194,14 +197,36 @@ class _GraphCache:
         return output
 
 
-def run_cuda_graph(owner, namespace, function, *inputs):
+_tls = threading.local()
+
+
+def graph_capture_allowed():
+    return getattr(_tls, "allow_capture", True)
+
+
+class graph_hot_path:
+    """热路径：禁止首次 CUDA Graph 捕获，避免实时块里卡 100ms+。"""
+
+    def __enter__(self):
+        self._prev = getattr(_tls, "allow_capture", True)
+        _tls.allow_capture = False
+        return self
+
+    def __exit__(self, *exc):
+        _tls.allow_capture = self._prev
+        return False
+
+
+def run_cuda_graph(owner, namespace, function, *inputs, allow_capture=None):
     if not inputs or not cuda_graph_enabled(inputs[0].device):
         return function(*inputs)
+    if allow_capture is None:
+        allow_capture = graph_capture_allowed()
     cache = getattr(owner, "_rvc_cuda_graph_cache", None)
     if cache is None:
         cache = _GraphCache()
         setattr(owner, "_rvc_cuda_graph_cache", cache)
-    return cache.run((str(namespace),), function, tuple(inputs))
+    return cache.run((str(namespace),), function, tuple(inputs), allow_capture=allow_capture)
 
 
 def clear_cuda_graph_cache(owner):

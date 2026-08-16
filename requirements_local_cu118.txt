@@ -11,3 +11,5 @@ faiss-cpu>=1.7
 praat-parselmouth>=0.4.5
 transformers>=4.49
 websockets>=10.4
+# ONNX Runtime（GPU，HuBERT/RMVPE 加速）；torch cu118 已自带 CUDA 11 运行库
+onnxruntime-gpu>=1.18.0,<1.19

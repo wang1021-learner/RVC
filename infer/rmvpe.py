@@ -382,7 +382,31 @@ class RMVPE:
         self.mel_extractor = MelSpectrogram(
             is_half, 128, 16000, 1024, 160, None, 30, 8000
         ).to(device)
-        if "privateuseone" in str(device):
+        self._ort_sess = None
+        onnx_path = os.path.splitext(model_path)[0] + ".onnx"
+        if not os.path.isfile(onnx_path):
+            try:
+                from infer.export_onnx import export_rmvpe
+                from tools.ort_backend import onnx_available
+
+                if onnx_available():
+                    exported = export_rmvpe(model_path)
+                    if exported is not None:
+                        onnx_path = str(exported)
+            except Exception:
+                logger.exception("RMVPE ONNX export skipped")
+        if os.path.isfile(onnx_path):
+            try:
+                from tools.ort_backend import create_session
+
+                sess = create_session(onnx_path)
+                if sess is not None:
+                    self._ort_sess = sess
+                    self.model = sess
+                    logger.info("RMVPE via ONNX %s", onnx_path)
+            except Exception:
+                logger.exception("RMVPE ONNX load failed")
+        if self._ort_sess is None and "privateuseone" in str(device):
             import onnxruntime as ort
 
             ort_session = ort.InferenceSession(
@@ -390,7 +414,8 @@ class RMVPE:
                 providers=["DmlExecutionProvider"],
             )
             self.model = ort_session
-        else:
+            self._ort_sess = ort_session
+        elif self._ort_sess is None:
             if str(self.device) == "cuda":
                 self.device = torch.device("cuda:0")
 
@@ -418,13 +443,13 @@ class RMVPE:
             n_pad = 32 * ((n_frames - 1) // 32 + 1) - n_frames
             if n_pad > 0:
                 mel = F.pad(mel, (0, n_pad), mode="constant")
-            if "privateuseone" in str(self.device):
+            if self._ort_sess is not None or "privateuseone" in str(self.device):
+                import numpy as np
+
+                mel_np = mel.detach().float().cpu().numpy() if torch.is_tensor(mel) else mel
                 onnx_input_name = self.model.get_inputs()[0].name
-                onnx_outputs_names = self.model.get_outputs()[0].name
-                hidden = self.model.run(
-                    [onnx_outputs_names],
-                    input_feed={onnx_input_name: mel.cpu().numpy()},
-                )[0]
+                hidden = self.model.run(None, {onnx_input_name: mel_np})[0]
+                hidden = torch.from_numpy(np.ascontiguousarray(hidden)).to(self.device)
             else:
                 mel = mel.half() if self.is_half else mel.float()
                 hidden = run_cuda_graph(

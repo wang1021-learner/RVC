@@ -2,7 +2,8 @@
 """
 RVC 实时变声 - 桌面客户端
 ============================
-架构: MainWindow(UI) -> VCEngine(音频+信号) -> RVCClient(服务器推理)
+架构: MainWindow(UI) -> VCEngine(音频+信号) -> 本地 RVCPipeline / 远程 RVCClient
+源码本地默认进程内推理；打包 exe 才走本机子进程。
 """
 import os, sys, json, queue, time, subprocess, logging, traceback
 from pathlib import Path
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QRadioButton, QFileDialog, QGroupBox, QMessageBox,
     QLineEdit, QStatusBar, QSplitter, QSlider,
     QDialog, QDialogButtonBox, QFormLayout, QFrame, QListView,
-    QInputDialog,
+    QInputDialog, QScrollArea, QTabWidget,
 )
 from PySide6.QtGui import (QDragEnterEvent, QDropEvent, QColor,
     QStandardItemModel, QStandardItem)
@@ -39,7 +40,6 @@ class DeviceItemDelegate(QStyledItemDelegate):
         is_group = index.data(Qt.UserRole + 1) == "group"
 
         if is_group:
-            # 分组标题: 浅灰底 + 小字
             painter.save()
             painter.fillRect(option.rect, QColor("#f0f3f7"))
             painter.setPen(QColor("#7f8c8d"))
@@ -61,7 +61,6 @@ class DeviceItemDelegate(QStyledItemDelegate):
         elif option.state & QStyle.State_MouseOver:
             painter.fillRect(option.rect, QColor("#eef4fa"))
 
-        # 图标 + 主名 (Line 1)
         painter.setPen(QColor("#2c3e50"))
         f = painter.font(); f.setPointSize(10); f.setBold(False)
         painter.setFont(f)
@@ -217,13 +216,223 @@ def create_styled_combo(min_width=0, max_visible=8):
     cb.setMaxVisibleItems(max_visible)
     return cb
 
+
+class SpeakerCardList(QWidget):
+    """角色卡片列表，接口对齐 QComboBox 的常用方法。"""
+    currentIndexChanged = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items = []
+        self._index = -1
+        self._blocked = False
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setMinimumHeight(140)
+        self._scroll.setMaximumHeight(220)
+        self._inner = QWidget()
+        self._box = QVBoxLayout(self._inner)
+        self._box.setContentsMargins(0, 0, 0, 0)
+        self._box.setSpacing(6)
+        self._box.addStretch(1)
+        self._scroll.setWidget(self._inner)
+        root.addWidget(self._scroll)
+
+    def blockSignals(self, on):
+        self._blocked = bool(on)
+        return super().blockSignals(on)
+
+    def clear(self):
+        while self._box.count() > 1:
+            item = self._box.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._items = []
+        self._index = -1
+
+    def addItem(self, text):
+        card = QFrame()
+        card.setObjectName("speakerCard")
+        card.setProperty("selected", False)
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(2)
+        title = QLabel(str(text).strip())
+        title.setObjectName("cardTitle")
+        title.setStyleSheet("font-size:13px;font-weight:700;")
+        lay.addWidget(title)
+        idx = len(self._items)
+        card.mousePressEvent = lambda e, i=idx: self.setCurrentIndex(i)
+        self._box.insertWidget(self._box.count() - 1, card)
+        self._items.append(card)
+
+    def currentIndex(self):
+        return self._index
+
+    def setCurrentIndex(self, idx):
+        if idx < 0 or idx >= len(self._items):
+            return
+        if idx == self._index:
+            return
+        self._index = idx
+        for i, card in enumerate(self._items):
+            card.setProperty("selected", i == idx)
+            card.style().unpolish(card)
+            card.style().polish(card)
+        if not self._blocked:
+            self.currentIndexChanged.emit(idx)
+
+    def count(self):
+        return len(self._items)
+
+
+class CableWizard(QDialog):
+    """检测虚拟声卡；没有则给出安装入口。"""
+
+    def __init__(self, parent, input_combo, output_combo):
+        super().__init__(parent)
+        self.setWindowTitle("虚拟声卡向导")
+        self.setMinimumWidth(560)
+        self.ic = input_combo
+        self.oc = output_combo
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.setSpacing(12)
+
+        # 1. 状态
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet("color:#334155;font-size:13px;")
+        lay.addLayout(self._section("状态", self.hint))
+
+        # 2. 检测到的虚拟声卡
+        self.list_lbl = QLabel()
+        self.list_lbl.setWordWrap(True)
+        self.list_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addLayout(self._section("检测到的虚拟声卡", self.list_lbl))
+
+        # 3. 路由自检（卡片样式，单独成块）
+        self.route_lbl = QLabel()
+        self.route_lbl.setWordWrap(True)
+        lay.addLayout(self._section("路由自检", self.route_lbl))
+
+        # 安装入口
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        for name, url in INSTALL_URLS:
+            b = QPushButton("打开 " + name)
+            b.setObjectName("btnGhost")
+            b.clicked.connect(lambda _, u=url: open_install_page(u))
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+        # 应用 / 刷新
+        apply_row = QHBoxLayout()
+        apply_row.setSpacing(8)
+        self.use_out = QPushButton("设为输出")
+        self.use_out.setObjectName("btnConnect")
+        self.use_out.setToolTip("把 RVC 输出设备设为这条虚拟线")
+        self.use_out.clicked.connect(self._apply_out)
+        self.use_in = QPushButton("设为输入")
+        self.use_in.setObjectName("btnGhost")
+        self.use_in.setToolTip("把 RVC 输入设备设为这条虚拟线")
+        self.use_in.clicked.connect(self._apply_in)
+        refresh_btn = QPushButton("重新检测")
+        refresh_btn.setObjectName("btnGhost")
+        refresh_btn.clicked.connect(self.refresh)
+        apply_row.addWidget(self.use_out)
+        apply_row.addWidget(self.use_in)
+        apply_row.addWidget(refresh_btn)
+        lay.addLayout(apply_row)
+
+        close = QDialogButtonBox(QDialogButtonBox.Close)
+        close.rejected.connect(self.reject)
+        close.accepted.connect(self.accept)
+        lay.addWidget(close)
+        self._found = []
+        self.refresh()
+
+    def _section(self, title, widget):
+        """区块：小标题 + 内容，视觉分隔，避免多个标签挤成一团。"""
+        box = QVBoxLayout()
+        box.setSpacing(5)
+        hdr = QLabel(title)
+        hdr.setStyleSheet("font-size:12px;font-weight:700;color:#64748b;")
+        box.addWidget(hdr)
+        box.addWidget(widget)
+        return box
+
+    def refresh(self):
+        try:
+            devs = sd.query_devices()
+            apis = sd.query_hostapis()
+        except Exception as e:
+            self.hint.setText("无法读取音频设备: " + str(e))
+            self._found = []
+            return
+        self._found = find_virtual_devices(devs, apis)
+        check = route_self_check(devs, apis)
+        color = "#059669" if check["ok"] else "#d97706"
+        self.route_lbl.setText(check["message"])
+        self.route_lbl.setStyleSheet(
+            "color:%s;font-weight:600;background:#f8fafc;border:1px solid #e2e8f0;"
+            "border-radius:6px;padding:8px 10px;" % color
+        )
+        if self._found:
+            lines = []
+            for d in self._found:
+                lines.append(
+                    "· %s  [%s]  入%d / 出%d"
+                    % (d["name"], d["api"] or "?", d["in_ch"], d["out_ch"])
+                )
+            self.hint.setText("已检测到虚拟声卡。把它设为「输出」，游戏/Discord 里选同一条虚拟线当麦克风。")
+            self.list_lbl.setText("\n".join(lines))
+            self.use_out.setEnabled(True)
+            self.use_in.setEnabled(any(d["in_ch"] > 0 for d in self._found))
+        else:
+            self.hint.setText(
+                "没有检测到 VB-Cable / VoiceMeeter 等虚拟声卡。\n"
+                "安装后点「刷新设备」，再把输出选成 CABLE Input，其它软件选 CABLE Output 当麦克风。"
+            )
+            self.list_lbl.setText("推荐：VB-Audio Cable（免费）。")
+            self.use_out.setEnabled(False)
+            self.use_in.setEnabled(False)
+
+    def _pick(self, need_in=False, need_out=False):
+        for d in self._found:
+            if need_out and d["out_ch"] > 0:
+                return d
+            if need_in and d["in_ch"] > 0:
+                return d
+        return self._found[0] if self._found else None
+
+    def _apply_out(self):
+        d = self._pick(need_out=True)
+        if not d:
+            return
+        self.oc.selectByNameApi(d["name"])
+        self.accept()
+
+    def _apply_in(self):
+        d = self._pick(need_in=True)
+        if not d:
+            return
+        self.ic.selectByNameApi(d["name"])
+        self.accept()
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
 from worker.rvc_client import RVCClient
 from worker.local_server import is_frozen, package_root, runtime_installed
-from tools.audio_meter import VUMeterWidget, calc_rms_db
+from tools.audio_meter import VUMeterWidget, SpectrumWidget, calc_rms_db, spec_bins
+from tools.virtual_cable import find_virtual_devices, is_virtual_name, INSTALL_URLS, open_install_page, route_self_check
 from tools.audio_process import AutoGain
 
 
@@ -269,6 +478,7 @@ def _excepthook(exc_type, exc, tb):
 class LazyLocalPipeline:
     """启动时不立刻 import torch，第一次加载角色再进本机推理。"""
     is_remote = False
+    is_network = False
 
     def __init__(self, on_status):
         self._on_status = on_status
@@ -298,6 +508,12 @@ class LazyLocalPipeline:
             return self._real._block_frame
         return None
 
+    @property
+    def last_stage_ms(self):
+        if self._real is None:
+            return {}
+        return getattr(self._real, "last_stage_ms", {}) or {}
+
     def is_connected(self):
         return True
 
@@ -322,17 +538,23 @@ class LazyLocalPipeline:
         return getattr(self._ensure(), name)
 
 
+def _use_local_subprocess():
+    """打包 exe 默认子进程隔离；源码默认进程内。环境变量可强制切换。"""
+    if os.environ.get("RVC_DIRECT_LOCAL") == "1":
+        return False
+    if os.environ.get("RVC_LOCAL_SUBPROCESS") == "1":
+        return True
+    return bool(is_frozen())
+
+
 def make_pipeline(mode, server_url, on_status):
     if mode == "local":
-        if not os.environ.get("RVC_DIRECT_LOCAL"):
-            # 统一走本机子进程推理（崩溃隔离、单一代码路径、UI 启动 0.3 秒秒开）；
-            # 设置环境变量 RVC_DIRECT_LOCAL=1 可切换为进程内直连
+        if _use_local_subprocess():
             from worker.local_server import LocalServerPipeline
             return LocalServerPipeline(on_status=on_status)
         return LazyLocalPipeline(on_status)
-    client = RVCClient(server_url=server_url, on_status=on_status)
-    client.connect(timeout=3)
-    return client
+    # 不在构造时 connect：远程未启动会卡住 UI 数秒
+    return RVCClient(server_url=server_url, on_status=on_status)
 
 NL = chr(10)
 SETTINGS_FILE = PROJECT_ROOT / "user_settings.json"
@@ -343,9 +565,9 @@ SERVER_MODEL_DIR = SERVER_ROOT + "/assets/weights"
 SERVER_INDEX_DIR = SERVER_ROOT + "/logs/thchs_v2"
 RESTART_KEYS = ("block_time", "crossfade_time", "extra_time", "I_noise_reduce", "O_noise_reduce")
 DEFAULT_PARAMS = {
-    "block_time": 0.08,
+    "block_time": 0.06,
     "crossfade_time": 0.02,
-    "extra_time": 1.5,
+    "extra_time": 0.8,
     "f0method": "rmvpe",
     "I_noise_reduce": False,
     "O_noise_reduce": False,
@@ -353,9 +575,9 @@ DEFAULT_PARAMS = {
     "threhold": -50,
     "limiter_enable": True,
     "limiter_threshold_db": -1.0,
-    "hf_mix_rate": 0.3,
-    "presence": 0.15,
-    "deesser_enable": True,
+    "hf_mix_rate": 0.2,
+    "presence": 0.10,
+    "deesser_enable": False,
     "vad_enable": False,
     "vad_threshold": 0.50,
 }
@@ -365,7 +587,7 @@ BUILTIN_PRESETS = [
     {
         "name": "低延迟",
         "params": {
-            "block_time": 0.05, "crossfade_time": 0.01, "extra_time": 0.8,
+            "block_time": 0.04, "crossfade_time": 0.01, "extra_time": 0.6,
             "f0method": "rmvpe", "rms_mix_rate": 0.5, "threhold": -50,
             "I_noise_reduce": False, "O_noise_reduce": False,
         },
@@ -373,23 +595,33 @@ BUILTIN_PRESETS = [
     {
         "name": "高音质",
         "params": {
-            "block_time": 0.1, "crossfade_time": 0.03, "extra_time": 2.0,
+            "block_time": 0.08, "crossfade_time": 0.03, "extra_time": 1.2,
             "f0method": "rmvpe", "rms_mix_rate": 0.3, "threhold": -55,
-            "I_noise_reduce": True, "O_noise_reduce": False,
+            "I_noise_reduce": False, "O_noise_reduce": False,
         },
     },
     {
         "name": "游戏语音",
         "params": {
-            "block_time": 0.06, "crossfade_time": 0.02, "extra_time": 1.0,
+            "block_time": 0.05, "crossfade_time": 0.015, "extra_time": 0.7,
             "f0method": "rmvpe", "rms_mix_rate": 0.6, "threhold": -45,
-            "I_noise_reduce": True, "O_noise_reduce": False,
+            "I_noise_reduce": False, "O_noise_reduce": False,
+        },
+    },
+    {
+        "name": "通话",
+        "params": {
+            "block_time": 0.06, "crossfade_time": 0.02, "extra_time": 0.8,
+            "f0method": "rmvpe", "rms_mix_rate": 0.5, "threhold": -50,
+            "I_noise_reduce": False, "O_noise_reduce": False,
+            "hf_mix_rate": 0.2, "presence": 0.10,
+            "deesser_enable": False, "vad_enable": False,
         },
     },
     {
         "name": "唱歌",
         "params": {
-            "block_time": 0.06, "crossfade_time": 0.02, "extra_time": 1.5,
+            "block_time": 0.06, "crossfade_time": 0.02, "extra_time": 1.2,
             "f0method": "rmvpe", "rms_mix_rate": 0.0, "threhold": -60,
             "I_noise_reduce": False, "O_noise_reduce": True,
         },
@@ -492,7 +724,7 @@ def to_server_path(local_path: str) -> str:
 SPEAKERS_FILE = PROJECT_ROOT / "speakers.json"
 WEIGHTS_DIR   = PROJECT_ROOT / "assets" / "weights"
 
-STYLE_QSS = """
+LIGHT_QSS = """
 QMainWindow, QDialog {
     background-color: #f8fafc;
     color: #0f172a;
@@ -581,7 +813,14 @@ QComboBox QAbstractItemView::item {
     border-radius: 4px;
 }
 
-/* 滚动条 */
+/* 滚动区域与滚动条 */
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
 QScrollBar:vertical {
     border: none;
     background: transparent;
@@ -746,6 +985,15 @@ QFrame#roleCard {
     border: 1px solid #e5e7eb;
     border-radius: 8px;
 }
+QFrame#speakerCard {
+    background-color: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+}
+QFrame#speakerCard[selected="true"] {
+    background-color: #ecfdf5;
+    border: 1px solid #0f766e;
+}
 
 /* 状态栏 */
 QStatusBar {
@@ -757,7 +1005,39 @@ QSplitter::handle {
     background: #e5e7eb;
     width: 1px;
 }
+
+/* 分段页签 QTabWidget */
+QTabWidget::pane {
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background-color: #ffffff;
+    top: -1px;
+}
+QTabBar::tab {
+    background-color: #f1f5f9;
+    color: #64748b;
+    border: 1px solid #e2e8f0;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-right: 4px;
+}
+QTabBar::tab:hover {
+    background-color: #e2e8f0;
+    color: #0f172a;
+}
+QTabBar::tab:selected {
+    background-color: #ffffff;
+    color: #0f766e;
+    border-bottom: 2px solid #0f766e;
+}
 """
+
+STYLE_QSS = LIGHT_QSS
+UI_DARK = False
 
 # 状态灯颜色
 LIGHT_GRAY  = "#bdc3c7"   # 未加载
@@ -863,6 +1143,7 @@ class ModelLoader(QThread):
 class InferenceWorkerThread(QThread):
     infer_done = Signal(int, float, float)  # elapsed_ms, in_rms_db, out_rms_db
     stage_stats = Signal(dict)              # 本地模式分阶段耗时 {feature,index,pitch,model}
+    spectrum = Signal(object)
     xrun_occurred = Signal()
     need_recover = Signal()
 
@@ -887,6 +1168,10 @@ class InferenceWorkerThread(QThread):
                 pass
             self.xrun_occurred.emit()
         self.infer_done.emit(elapsed_ms, in_rms, calc_rms_db(out_block))
+        try:
+            self.spectrum.emit(spec_bins(out_block))
+        except Exception:
+            pass
 
     def run(self):
         from collections import deque
@@ -996,9 +1281,9 @@ class RecThread(QThread):
 
 
 class EngineStartThread(QThread):
-    """后台执行启动/重建声卡流的阻塞部分（网络等待、CUDA 预热、声卡打开）。
+    """后台执行启动/重建/停机的阻塞部分（网络等待、CUDA 预热、声卡打开、等推理退出）。
 
-    UI 线程只负责发起与信号响应，绝不进入等待——杜绝"未响应"。
+    UI 线程只负责发起与信号响应，绝不进入 wait——杜绝"未响应"。
     """
 
     def __init__(self, engine, action, parent=None):
@@ -1011,6 +1296,8 @@ class EngineStartThread(QThread):
             self.engine._start_blocking()
         elif self.action == "reopen":
             self.engine._reopen_blocking()
+        elif self.action == "stop":
+            self.engine._hard_stop()
 
 
 # ==============================================================================
@@ -1021,6 +1308,7 @@ class VCEngine(QObject):
     started_ok = Signal(); stopped_ok = Signal()
     load_failed = Signal(str)
     rms_levels = Signal(float, float)  # in_db, out_db
+    spectrum = Signal(object)
     xrun_signal = Signal(int)         # total_xruns
     fade_done = Signal()
     loop_latency = Signal(float)      # 端到端延迟(ms)：output DAC time - input ADC time
@@ -1037,11 +1325,19 @@ class VCEngine(QObject):
         self.input_device = None; self.output_device = None
         self.input_queue = queue.Queue(maxsize=4)
         self.output_queue = queue.Queue(maxsize=4)
-        self._in_residual = None      # 输入弹性缓冲（变长块拼接）
-        self._out_residual = np.array([], dtype=np.float32)   # 输出弹性缓冲
+        self._in_buf = np.zeros(0, dtype=np.float32)
+        self._in_n = 0
+        self._out_buf = np.zeros(0, dtype=np.float32)
+        self._out_n = 0
+        self._in_pool = []
+        self._pool_i = 0
+        self._last_out = np.zeros(0, dtype=np.float32)
+        self._last_out_n = 0
+        self._mon_scratch = np.zeros(0, dtype=np.float32)
         self.worker_thread = None
         self._zombie_threads = []   # 超时未退出的线程，等 finished 再删，避免销毁运行中的线程
         self.xrun_count = 0
+        self._xrun_emitted = 0
         self._params = dict(DEFAULT_PARAMS)
         self._formant = 0.0
         self.dry_mix = 0.0
@@ -1052,6 +1348,12 @@ class VCEngine(QObject):
         self._last_recover = 0.0
         self._fade_epoch = 0
         self._pending_fade_epoch = -1
+        self._stop_requested = False
+        self._emit_stopped = True
+        self._fade_done_flag = False
+        self._true_e2e_ms = 0.0
+        self._slow_streak = 0
+        self._adapted = False
         # 输入 AGC / 监听混音 / 端到端延迟
         self.input_agc = False
         self.agc = None
@@ -1062,6 +1364,10 @@ class VCEngine(QObject):
         self.monitor_queue = queue.Queue(maxsize=8)
         self._loop_lat_ema = None
         self.fade_done.connect(self._on_fade_done, Qt.QueuedConnection)
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setInterval(50)
+        self._stats_timer.timeout.connect(self._flush_callback_stats)
+        self._stats_timer.start()
 
     def merged_params(self, speaker=None):
         """全局高级参数 + 指定角色的角色级覆盖（默认当前角色）。"""
@@ -1189,8 +1495,12 @@ class VCEngine(QObject):
         mode = "local" if mode == "local" else "server"
         if mode == self.mode:
             return
-        if self.running:
-            self._hard_stop()
+        if self.running or self.stream is not None:
+            self._emit_stopped = False
+            try:
+                self._hard_stop()
+            finally:
+                self._emit_stopped = True
         self._dispose_pipeline()
         self.mode = mode
         self.current_speaker = None
@@ -1233,17 +1543,43 @@ class VCEngine(QObject):
             self.status_msg.emit("请先加载角色模型")
         return ok
 
+    def _engine_busy(self):
+        t = getattr(self, "_start_thread", None)
+        return t is not None and t.isRunning()
+
     def start(self):
         """异步启动：网络等待 / CUDA 预热 / 声卡打开全部在后台线程，UI 永不阻塞。"""
         self._fade_epoch += 1
-        if self.stream is not None or self.running:
-            self._hard_stop()
-        if getattr(self, "_start_thread", None) is not None and self._start_thread.isRunning():
+        self._stop_requested = False
+        if self._engine_busy():
+            self.status_msg.emit("正在处理，请稍候...")
             return
         self._start_thread = EngineStartThread(self, "start", parent=self)
         self._start_thread.start()
 
+    def _alloc_rt_buffers(self, block):
+        """音频回调用的预分配缓冲：回调内不再 numpy 拼接/新建数组。"""
+        cap = max(int(block) * 4, 1024)
+        self._in_buf = np.zeros(cap, dtype=np.float32)
+        self._in_n = 0
+        self._out_buf = np.zeros(cap, dtype=np.float32)
+        self._out_n = 0
+        # 槽位多于队列深度，避免回调复用工人尚未读完的数组
+        self._in_pool = [np.zeros(block, dtype=np.float32) for _ in range(32)]
+        self._pool_i = 0
+        self._last_out = np.zeros(max(block, 1), dtype=np.float32)
+        self._last_out_n = 0
+        self._mon_scratch = np.zeros(max(block, 1), dtype=np.float32)
+
     def _start_blocking(self):
+        if self.stream is not None or self.running:
+            self._emit_stopped = False
+            try:
+                self._hard_stop()
+            finally:
+                self._emit_stopped = True
+        if self._stop_requested:
+            return
         if not self._ensure_connected() or not self._ensure_model():
             self.status_msg.emit("无法启动：请先加载角色模型")
             self.load_failed.emit("模型未加载")
@@ -1254,9 +1590,16 @@ class VCEngine(QObject):
             started = self.pipeline.start(**params)
             if started is False:
                 raise RuntimeError("推理未能启动")
-            self._in_residual = None
-            self._out_residual = np.array([], dtype=np.float32)
+            if self._stop_requested:
+                self._hard_stop()
+                return
+            self._alloc_rt_buffers(int(getattr(self.pipeline, "_block_frame", 0) or 4800))
             self.xrun_count = 0
+            self._xrun_emitted = 0
+            self._true_e2e_ms = 0.0
+            self._loop_lat_ema = None
+            self._slow_streak = 0
+            self._adapted = False
             self._drain_queue(self.input_queue)
             self._drain_queue(self.output_queue)
 
@@ -1270,6 +1613,7 @@ class VCEngine(QObject):
                 self.pipeline, self.input_queue, self.output_queue, self)
             self.worker_thread.infer_done.connect(self._on_worker_infer_done)
             self.worker_thread.stage_stats.connect(self.stage_stats)
+            self.worker_thread.spectrum.connect(self.spectrum)
             self.worker_thread.xrun_occurred.connect(self._on_worker_xrun)
             self.worker_thread.need_recover.connect(self._try_recover)
             self.worker_thread.start()
@@ -1283,8 +1627,14 @@ class VCEngine(QObject):
                 return
             self._fade_in_left = int(0.04 * self.pipeline.samplerate)
             self._fade_out_left = 0
+            if self._stop_requested:
+                self._hard_stop()
+                return
             self.stream.start()
             self._open_monitor()
+            if self._stop_requested:
+                self._hard_stop()
+                return
             self.started_ok.emit()
             self.status_msg.emit("实时转换已启动 · " + msg)
         except Exception as e:
@@ -1360,6 +1710,7 @@ class VCEngine(QObject):
             return True, "系统共享（%s）" % _wasapi_fail_reason(errors[-1])
         except Exception as e:
             errors.append(e)
+
         try:
             kwargs["channels"] = 2
             self.stream = sd.Stream(**kwargs)
@@ -1373,7 +1724,7 @@ class VCEngine(QObject):
         self.output_device = output_device
         if not self.running:
             return True, ""
-        if getattr(self, "_start_thread", None) is not None and self._start_thread.isRunning():
+        if self._engine_busy():
             self.status_msg.emit("正在切换设备，请稍候...")
             return True, ""
         self.status_msg.emit("正在切换设备...")
@@ -1456,8 +1807,11 @@ class VCEngine(QObject):
         except queue.Full:
             pass
 
-    def _report_loop_latency(self, times):
-        """端到端延迟 = 输出 DAC 时刻 - 输入 ADC 时刻（PortAudio 时间戳）。"""
+    def _report_loop_latency(self, times, frames):
+        """嘴到耳 ≈ PortAudio(DAC−ADC) + 一块算法延迟 + 队列积压。
+
+        回调里只写数值，由 UI 定时器取出，避免 PortAudio 线程发 Qt 信号。
+        """
         if times is None:
             return
         try:
@@ -1465,16 +1819,58 @@ class VCEngine(QObject):
             dac = getattr(times, "outputBufferDacTime", 0.0) or 0.0
             if adc <= 0 or dac <= 0:
                 return
-            ms = (dac - adc) * 1000.0
-            if not (0 < ms < 5000):
+            pa_ms = (dac - adc) * 1000.0
+            if not (0 < pa_ms < 5000):
                 return
+            sr = float(getattr(self.pipeline, "samplerate", 0) or 0)
+            # 算法延迟地板是管线块，不是声卡回调帧；队列里每个元素也是一块管线块
+            alg = int(getattr(self.pipeline, "_block_frame", 0) or frames)
+            block_ms = (1000.0 * alg / sr) if sr > 0 else 0.0
+            queued = 0
+            try:
+                queued = self.input_queue.qsize() + self.output_queue.qsize()
+            except Exception:
+                pass
+            true_ms = pa_ms + block_ms + queued * block_ms
             if self._loop_lat_ema is None:
-                self._loop_lat_ema = ms
+                self._loop_lat_ema = true_ms
             else:
-                self._loop_lat_ema += (ms - self._loop_lat_ema) * 0.05
-            self.loop_latency.emit(self._loop_lat_ema)
+                self._loop_lat_ema += (true_ms - self._loop_lat_ema) * 0.08
+            self._true_e2e_ms = self._loop_lat_ema
         except Exception:
             pass
+
+    def _flush_callback_stats(self):
+        if self.xrun_count != self._xrun_emitted:
+            self._xrun_emitted = self.xrun_count
+            self.xrun_signal.emit(self.xrun_count)
+        if self.running and self._true_e2e_ms > 0:
+            self.loop_latency.emit(self._true_e2e_ms)
+        if self._fade_done_flag:
+            self._fade_done_flag = False
+            self.fade_done.emit()
+
+    def request_hard_stop(self):
+        """后台停机，UI 线程只发起。"""
+        self._stop_requested = True
+        self._fade_epoch += 1
+        if self._engine_busy():
+            action = getattr(self._start_thread, "action", "")
+            if action == "stop":
+                return
+            # start/reopen 线程会在关键点看到 _stop_requested
+            return
+        if not self.running and self.stream is None and self.worker_thread is None:
+            return
+        self._start_thread = EngineStartThread(self, "stop", parent=self)
+        self._start_thread.start()
+
+    def wait_idle(self, timeout_ms=2500):
+        t = getattr(self, "_start_thread", None)
+        if t is not None and t.isRunning():
+            t.wait(timeout_ms)
+        if self.running or self.stream is not None or self.worker_thread is not None:
+            self._hard_stop()
 
     def stop(self):
         if self.running and self.stream is not None and self._fade_out_left <= 0:
@@ -1483,14 +1879,14 @@ class VCEngine(QObject):
             self._fade_out_total = max(1, int(0.04 * self.pipeline.samplerate))
             self._fade_out_left = self._fade_out_total
             return
-        self._hard_stop()
+        self.request_hard_stop()
 
     def _on_fade_done(self):
         if self._pending_fade_epoch != self._fade_epoch:
             return
         if not self.running:
             return
-        self._hard_stop()
+        self.request_hard_stop()
 
     def _try_recover(self):
         if not self.running:
@@ -1553,36 +1949,122 @@ class VCEngine(QObject):
             else:
                 self.worker_thread.deleteLater()
             self.worker_thread = None
-        self.stopped_ok.emit()
-        self.status_msg.emit("已停止")
+        if self._emit_stopped:
+            self.stopped_ok.emit()
+            self.status_msg.emit("已停止")
 
     def _on_worker_infer_done(self, elapsed_ms, in_db, out_db):
         self.infer_time.emit(elapsed_ms)
         self.rms_levels.emit(in_db, out_db)
+        self._adapt_if_slow(elapsed_ms)
+
+    def _adapt_if_slow(self, elapsed_ms):
+        budget = max(20.0, float(self.block_time) * 1000.0)
+        if elapsed_ms > budget * 0.95:
+            self._slow_streak += 1
+        else:
+            self._slow_streak = max(0, self._slow_streak - 1)
+        if self._adapted or self._slow_streak < 6:
+            return
+        self._adapted = True
+        if self.vad_enable:
+            self.vad_enable = False
+        if self.deesser_enable:
+            self.deesser_enable = False
+        try:
+            cur = float(self.current_speaker.index_rate) if self.current_speaker else 0.0
+        except Exception:
+            cur = 0.0
+        if cur > 0.35:
+            self.change_index_rate(0.35)
+            if self.current_speaker is not None:
+                self.current_speaker.index_rate = 0.35
+        self.status_msg.emit("推理偏慢：已自动关 VAD/去齿音并降低检索，稳住实时")
 
     def _on_worker_xrun(self):
         self.xrun_count += 1
-        self.xrun_signal.emit(self.xrun_count)
 
     def _apply_edge_fade(self, outdata):
         n = len(outdata)
         if self._fade_in_left > 0:
             total = max(1, int(0.04 * self.pipeline.samplerate))
             done = total - self._fade_in_left
-            gains = np.clip((np.arange(n) + done) / total, 0.0, 1.0).astype(np.float32)
-            outdata[:, 0] *= gains
+            # 线性斜坡，避免每块 np.arange 分配
+            if n == 1:
+                outdata[0, 0] *= min(1.0, (done + 1) / total)
+            else:
+                g0 = done / total
+                g1 = (done + n) / total
+                outdata[:, 0] *= np.linspace(g0, g1, n, endpoint=False, dtype=np.float32).clip(0.0, 1.0)
             self._fade_in_left = max(0, self._fade_in_left - n)
         if self._fade_out_left > 0:
             total = max(1, self._fade_out_total)
             remaining = self._fade_out_left
-            gains = np.clip((remaining - np.arange(n)) / total, 0.0, 1.0).astype(np.float32)
-            outdata[:, 0] *= gains
+            if n == 1:
+                outdata[0, 0] *= max(0.0, remaining / total)
+            else:
+                g0 = remaining / total
+                g1 = (remaining - n) / total
+                outdata[:, 0] *= np.linspace(g0, g1, n, endpoint=False, dtype=np.float32).clip(0.0, 1.0)
             self._fade_out_left = max(0, self._fade_out_left - n)
             if self._fade_out_left <= 0:
-                self.fade_done.emit()
+                self._fade_done_flag = True
+
+    def _cb_push_in(self, mono):
+        n = int(mono.shape[0])
+        if n <= 0 or self._in_buf.size == 0:
+            return
+        if self._in_n + n > self._in_buf.shape[0]:
+            self._in_n = 0
+            self.xrun_count += 1
+        self._in_buf[self._in_n:self._in_n + n] = mono[:n]
+        self._in_n += n
+
+    def _cb_take_in(self, n):
+        if self._in_n < n or not self._in_pool:
+            return None
+        slot = self._in_pool[self._pool_i]
+        self._pool_i = (self._pool_i + 1) % len(self._in_pool)
+        if slot.shape[0] != n:
+            slot = np.zeros(n, dtype=np.float32)
+            self._in_pool[self._pool_i - 1] = slot
+        slot[:n] = self._in_buf[:n]
+        remain = self._in_n - n
+        if remain:
+            self._in_buf[:remain] = self._in_buf[n:self._in_n]
+        self._in_n = remain
+        return slot
+
+    def _cb_push_out(self, block):
+        if block is None or self._out_buf.size == 0:
+            return
+        src = block[:, 0] if getattr(block, "ndim", 1) > 1 else block
+        n = int(src.shape[0])
+        if n <= 0:
+            return
+        if self._out_n + n > self._out_buf.shape[0]:
+            self._out_n = 0
+            self.xrun_count += 1
+        self._out_buf[self._out_n:self._out_n + n] = np.asarray(src[:n], dtype=np.float32)
+        self._out_n += n
+
+    def _cb_fill_from_hold(self, dest):
+        n = dest.shape[0]
+        if self._last_out_n <= 0 or self._last_out.size == 0:
+            dest.fill(0.0)
+            return
+        src = self._last_out[:self._last_out_n]
+        # 连续欠载计数：前 3 块原样重复，之后线性淡到静音，避免循环同一块变成嗡鸣
+        self._hold_count = getattr(self, "_hold_count", 0) + 1
+        g = 1.0 if self._hold_count <= 3 else max(0.0, 1.0 - 0.25 * (self._hold_count - 3))
+        if src.shape[0] >= n:
+            dest[:] = src[:n] * g
+        else:
+            dest[:src.shape[0]] = src * g
+            dest[src.shape[0]:] = (src[-1] * g) if src.size else 0.0
 
     def _on_audio(self, indata, outdata, frames, times, status):
-        """音频回调：弹性缓冲输入凑整块，输出按需切分，推理不及时输出静音。"""
+        """音频回调：预分配环缓冲凑整块。欠载重复上一块，绝不在此发 Qt 信号。"""
         if not self.running:
             outdata.fill(0)
             return
@@ -1597,53 +2079,61 @@ class VCEngine(QObject):
                 if outdata.shape[1] > 1:
                     outdata[:, 1:] = outdata[:, :1]
                 self._apply_edge_fade(outdata)
-                self._push_monitor(outdata[:, 0].copy())
-                self._report_loop_latency(times)
+                self._push_monitor_view(outdata[:, 0], n_needed)
+                self._report_loop_latency(times, n_needed)
                 return
 
-            # 输入 AGC：电平归一化（本地/服务器模式都在发送前生效）
             if self.input_agc and self.agc is not None:
                 mono = self.agc.process(mono)
 
-            in_block = self.pipeline._block_frame
-            if len(mono) != in_block:
-                self._in_residual = (
-                    np.concatenate([self._in_residual, mono])
-                    if self._in_residual is not None else mono.copy()
-                )
-                while len(self._in_residual) >= in_block:
-                    chunk = self._in_residual[:in_block].astype(np.float32)
-                    self._in_residual = self._in_residual[in_block:]
-                    self._enqueue_input(chunk)
+            in_block = int(getattr(self.pipeline, "_block_frame", 0) or 0)
+            if in_block <= 0:
+                outdata.fill(0)
+                return
+            if mono.shape[0] == in_block and self._in_n == 0 and self._in_pool:
+                slot = self._in_pool[self._pool_i]
+                self._pool_i = (self._pool_i + 1) % len(self._in_pool)
+                if slot.shape[0] != in_block:
+                    slot = np.zeros(in_block, dtype=np.float32)
+                    self._in_pool[(self._pool_i - 1) % len(self._in_pool)] = slot
+                slot[:in_block] = mono[:in_block]
+                self._enqueue_input(slot)
             else:
-                self._enqueue_input(mono.astype(np.float32, copy=True))
+                self._cb_push_in(mono)
+                while True:
+                    chunk = self._cb_take_in(in_block)
+                    if chunk is None:
+                        break
+                    self._enqueue_input(chunk)
 
-            while len(self._out_residual) < n_needed:
+            while self._out_n < n_needed:
                 try:
                     block = self.output_queue.get_nowait()
-                    if block.ndim > 1:
-                        block = block[:, 0]
-                    self._out_residual = np.concatenate(
-                        [self._out_residual, block.astype(np.float32)]
-                    )
                 except queue.Empty:
                     break
-            if len(self._out_residual) >= n_needed:
-                outdata[:, 0] = self._out_residual[:n_needed]
-                self._out_residual = self._out_residual[n_needed:]
-                if outdata.shape[1] > 1:
-                    outdata[:, 1:] = outdata[:, :1]
+                self._cb_push_out(block)
+
+            if self._out_n >= n_needed:
+                outdata[:, 0] = self._out_buf[:n_needed]
+                remain = self._out_n - n_needed
+                if remain:
+                    self._out_buf[:remain] = self._out_buf[n_needed:self._out_n]
+                self._out_n = remain
+                hold_n = min(n_needed, self._last_out.shape[0])
+                self._last_out[:hold_n] = outdata[:hold_n, 0]
+                self._last_out_n = hold_n
+                self._hold_count = 0
             else:
-                n_avail = len(self._out_residual)
-                n_take = min(n_avail, n_needed)
+                n_take = min(self._out_n, n_needed)
                 if n_take > 0:
-                    outdata[:n_take, 0] = self._out_residual[:n_take]
-                    self._out_residual = self._out_residual[n_take:]
-                if n_take < n_needed:
-                    outdata[n_take:, 0] = 0.0
-                if outdata.shape[1] > 1:
-                    outdata[:, 1:] = outdata[:, :1]
-                self._on_worker_xrun()
+                    outdata[:n_take, 0] = self._out_buf[:n_take]
+                    self._out_n = 0
+                    self._cb_fill_from_hold(outdata[n_take:, 0])
+                else:
+                    self._cb_fill_from_hold(outdata[:, 0])
+                self.xrun_count += 1
+            if outdata.shape[1] > 1:
+                outdata[:, 1:] = outdata[:, :1]
             dry = float(self.dry_mix)
             if dry > 0:
                 n = min(len(mono), n_needed)
@@ -1651,10 +2141,23 @@ class VCEngine(QObject):
                 if outdata.shape[1] > 1:
                     outdata[:, 1:] = outdata[:, :1]
             self._apply_edge_fade(outdata)
-            self._push_monitor(outdata[:, 0].copy())
-            self._report_loop_latency(times)
+            self._push_monitor_view(outdata[:, 0], n_needed)
+            self._report_loop_latency(times, n_needed)
         except Exception:
             outdata.fill(0)
+
+    def _push_monitor_view(self, mono, n):
+        if not self.monitor_enabled or self.monitor_stream is None:
+            return
+        n = min(int(n), int(mono.shape[0]), int(self._mon_scratch.shape[0] or 0))
+        if n <= 0:
+            return
+        self._mon_scratch[:n] = mono[:n]
+        self._mon_scratch[:n] *= np.float32(self.monitor_volume)
+        try:
+            self.monitor_queue.put_nowait(self._mon_scratch[:n].copy())
+        except queue.Full:
+            pass
 
 
 # ==============================================================================
@@ -1664,7 +2167,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RVC 实时变声")
-        self.setMinimumSize(1040, 660)
+        self.setMinimumSize(1040, 640)
         self.setAcceptDrops(True)
         self.speaker_mgr = SpeakerManager()
         self._settings = load_user_settings()
@@ -1674,6 +2177,9 @@ class MainWindow(QMainWindow):
         self._load_gen = 0
         self._load_started = None       # 需在 _rl() 之前初始化（_rl 会触发加载）
         self._load_log_offset = 0
+        self._pending_after_stop = None
+        self._pending_speaker = None
+        self._pending_mode = None
         url = self._settings.get("server_url") or DEFAULT_SERVER_URL
         mode = self._settings.get("infer_mode") or "local"
         self.engine = VCEngine(mode=mode, server_url=url)
@@ -1686,7 +2192,10 @@ class MainWindow(QMainWindow):
         self.engine.xrun_signal.connect(self._on_xrun)
         self.engine.loop_latency.connect(self._on_loop_latency)
         self.engine.stage_stats.connect(self._on_stage_stats)
+        self.engine.spectrum.connect(self._on_spectrum)
+        self._dark = False
         self._build_ui()
+        self._apply_theme()
         self._apply_saved_params()
         self._rd(restore=False)
         self._restore_devices()
@@ -1710,6 +2219,29 @@ class MainWindow(QMainWindow):
     def _on_rms_levels(self, in_db, out_db):
         self.in_meter.set_level(in_db)
         self.out_meter.set_level(out_db)
+
+    def _on_spectrum(self, bins):
+        if hasattr(self, "spectrum"):
+            self.spectrum.set_bins(bins)
+
+    def _apply_theme(self):
+        global UI_DARK
+        UI_DARK = False
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(LIGHT_QSS)
+        if hasattr(self, "in_meter"):
+            self.in_meter.set_dark(False)
+        if hasattr(self, "out_meter"):
+            self.out_meter.set_dark(False)
+        if hasattr(self, "spectrum"):
+            self.spectrum.set_dark(False)
+
+    def _cable_wizard(self):
+        dlg = CableWizard(self, self.ic, self.oc)
+        if dlg.exec():
+            self._on_device_changed("output")
+            self._persist_settings()
 
     def _on_xrun(self, xruns):
         self.xrun_label.setText(f"卡顿 {xruns}")
@@ -1744,8 +2276,8 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_ui(self):
-        self.resize(1220, 750)
-        self.setMinimumSize(1100, 660)
+        self.resize(1200, 760)
+        self.setMinimumSize(1060, 680)
         central = QWidget(); self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 10)
@@ -1770,7 +2302,7 @@ class MainWindow(QMainWindow):
         # 状态微型标签
         self.badge_box = QFrame()
         self.badge_box.setStyleSheet("background:#f3f4f6;border:1px solid #e5e7eb;border-radius:6px;")
-        bh = QHBoxLayout(self.badge_box); bh.setContentsMargins(8, 3, 8, 3); bh.setSpacing(6)
+        bh = QHBoxLayout(self.badge_box); bh.setContentsMargins(8, 4, 8, 4); bh.setSpacing(6)
         self.light = QLabel()
         self.light.setFixedSize(7, 7)
         self.light.setStyleSheet(f"background:{LIGHT_GRAY};border-radius:3px;")
@@ -1780,16 +2312,18 @@ class MainWindow(QMainWindow):
         bh.addWidget(self.state_label)
         top.addWidget(self.badge_box)
 
-        self.latency_label = QLabel("延迟 --ms")
-        self.latency_label.setStyleSheet("font-size:12px;font-weight:600;color:#15803d;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:3px 8px;")
+        self.latency_label = QLabel("推理 --ms")
+        self.latency_label.setStyleSheet("font-size:12px;font-weight:600;color:#15803d;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:4px 8px;")
+        self.latency_label.setToolTip("单块推理耗时。超过块大小就会卡顿")
         top.addWidget(self.latency_label)
 
-        self.e2e_label = QLabel("端到端 --ms")
-        self.e2e_label.setStyleSheet("font-size:12px;font-weight:600;color:#6d28d9;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;padding:3px 8px;")
+        self.e2e_label = QLabel("嘴到耳 --ms")
+        self.e2e_label.setStyleSheet("font-size:12px;font-weight:600;color:#6d28d9;background:#f5f3ff;border:1px solid #ddd6fe;border-radius:6px;padding:4px 8px;")
+        self.e2e_label.setToolTip("估算的真实听感延迟：声卡缓冲 + 一块算法延迟 + 队列积压")
         top.addWidget(self.e2e_label)
 
         self.xrun_label = QLabel("卡顿 0")
-        self.xrun_label.setStyleSheet("font-size:12px;font-weight:600;color:#6b7280;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:3px 8px;")
+        self.xrun_label.setStyleSheet("font-size:12px;font-weight:600;color:#6b7280;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:4px 8px;")
         top.addWidget(self.xrun_label)
         root.addWidget(header)
 
@@ -1800,78 +2334,105 @@ class MainWindow(QMainWindow):
         sp.addWidget(self._build_right())
         sp.setStretchFactor(0, 0)
         sp.setStretchFactor(1, 1)
-        sp.setStretchFactor(2, 0)
-        sp.setSizes([300, 560, 360])
+        sp.setStretchFactor(2, 1)
+        sp.setSizes([260, 480, 380])
         root.addWidget(sp, 1)
 
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
 
     def _build_left(self):
-        g = QGroupBox("角色")
+        g = QGroupBox("角色配置")
         l = QVBoxLayout(g)
-        l.setContentsMargins(10, 16, 10, 10)
-        l.setSpacing(8)
+        l.setContentsMargins(12, 16, 12, 12)
+        l.setSpacing(10)
 
+        # 角色下拉选择
         self.sc = create_styled_combo(max_visible=12)
         self.sc.setMinimumHeight(32)
         self.sc.currentIndexChanged.connect(self._sel)
         l.addWidget(self.sc)
 
-        br = QHBoxLayout(); br.setSpacing(6)
+        # 角色增删改按钮行
+        br = QHBoxLayout()
+        br.setSpacing(6)
         for t, fn in [("添加", self._a), ("编辑", self._e), ("删除", self._d)]:
-            b = QPushButton(t); b.setObjectName("btnGhost"); b.clicked.connect(fn)
-            br.addWidget(b)
+            b = QPushButton(t)
+            b.setObjectName("btnGhost")
+            b.setMinimumHeight(28)
+            b.clicked.connect(fn)
+            br.addWidget(b, 1)
         l.addLayout(br)
 
-        self.cur_card = QFrame(); self.cur_card.setObjectName("roleCard")
+        # 当前角色信息展示卡片
+        self.cur_card = QFrame()
+        self.cur_card.setObjectName("roleCard")
         cv = QVBoxLayout(self.cur_card)
-        cv.setContentsMargins(10, 8, 10, 8); cv.setSpacing(3)
+        cv.setContentsMargins(12, 10, 12, 10)
+        cv.setSpacing(4)
         self.cur_name = QLabel("未选择角色")
-        self.cur_name.setStyleSheet("font-size:13px;font-weight:700;color:#111827;")
+        self.cur_name.setStyleSheet("font-size:14px;font-weight:700;color:#111827;")
         self.cur_model = QLabel("")
         self.cur_model.setStyleSheet("font-size:11px;color:#6b7280;")
         self.cur_info = QLabel("")
         self.cur_info.setStyleSheet("font-size:11px;color:#6b7280;")
-        cv.addWidget(self.cur_name); cv.addWidget(self.cur_model); cv.addWidget(self.cur_info)
+        cv.addWidget(self.cur_name)
+        cv.addWidget(self.cur_model)
+        cv.addWidget(self.cur_info)
         l.addWidget(self.cur_card)
 
+        # 实时调节面板
         live = QGroupBox("实时调节")
         gl = QGridLayout(live)
-        gl.setContentsMargins(8, 14, 8, 8)
-        gl.setHorizontalSpacing(8); gl.setVerticalSpacing(6)
-        self.live_pitch = QSpinBox(); self.live_pitch.setRange(-36, 36)
+        gl.setContentsMargins(10, 16, 10, 10)
+        gl.setHorizontalSpacing(10)
+        gl.setVerticalSpacing(8)
+
+        self.live_pitch = QSpinBox()
+        self.live_pitch.setRange(-36, 36)
         self.live_pitch.setSuffix(" 半音")
         self.live_pitch.valueChanged.connect(self._on_live_pitch)
-        self.live_index = QDoubleSpinBox(); self.live_index.setRange(0.0, 1.0)
+
+        self.live_index = QDoubleSpinBox()
+        self.live_index.setRange(0.0, 1.0)
         self.live_index.setSingleStep(0.1)
         self.live_index.valueChanged.connect(self._on_live_index)
-        self.live_formant = QDoubleSpinBox(); self.live_formant.setRange(-12.0, 12.0)
+
+        self.live_formant = QDoubleSpinBox()
+        self.live_formant.setRange(-12.0, 12.0)
         self.live_formant.setSingleStep(0.5)
         self.live_formant.valueChanged.connect(self._on_live_formant)
-        gl.addWidget(self._lbl("音高"), 0, 0); gl.addWidget(self.live_pitch, 0, 1)
-        gl.addWidget(self._lbl("检索"), 1, 0); gl.addWidget(self.live_index, 1, 1)
-        gl.addWidget(self._lbl("共振峰"), 2, 0); gl.addWidget(self.live_formant, 2, 1)
-        self.live_dry = QDoubleSpinBox(); self.live_dry.setRange(0.0, 1.0)
+
+        self.live_dry = QDoubleSpinBox()
+        self.live_dry.setRange(0.0, 1.0)
         self.live_dry.setSingleStep(0.1)
         self.live_dry.setToolTip("0=只听变声，1=只听原声")
         self.live_dry.valueChanged.connect(self._on_live_dry)
-        gl.addWidget(self._lbl("原声混合"), 3, 0); gl.addWidget(self.live_dry, 3, 1)
+
+        gl.addWidget(self._lbl("音高"), 0, 0)
+        gl.addWidget(self.live_pitch, 0, 1)
+        gl.addWidget(self._lbl("检索"), 1, 0)
+        gl.addWidget(self.live_index, 1, 1)
+        gl.addWidget(self._lbl("共振峰"), 2, 0)
+        gl.addWidget(self.live_formant, 2, 1)
+        gl.addWidget(self._lbl("原声混合"), 3, 0)
+        gl.addWidget(self.live_dry, 3, 1)
+
         self.bypass = QCheckBox("旁通（听原声）")
         self.bypass.setToolTip("快捷键 Ctrl+B")
         self.bypass.toggled.connect(self._on_bypass)
         gl.addWidget(self.bypass, 4, 0, 1, 2)
+        gl.setColumnStretch(1, 1)
+
         l.addWidget(live)
         l.addStretch(1)
         return g
 
     def _build_mid(self):
-        g = QGroupBox("转换")
+        g = QGroupBox("转换控制")
         l = QVBoxLayout(g)
         l.setContentsMargins(12, 16, 12, 12)
         l.setSpacing(10)
 
-        ml = QHBoxLayout(); ml.setSpacing(12)
-        ml.addWidget(self._lbl("模式"))
         self.mode_local = QRadioButton("本地推理")
         self.mode_server = QRadioButton("服务器")
         if self.engine.mode == "server":
@@ -1880,26 +2441,19 @@ class MainWindow(QMainWindow):
             self.mode_local.setChecked(True)
         self.mode_local.toggled.connect(lambda on: on and self._apply_mode("local"))
         self.mode_server.toggled.connect(lambda on: on and self._apply_mode("server"))
-        ml.addWidget(self.mode_local)
-        ml.addWidget(self.mode_server)
-        ml.addStretch(1)
-        l.addLayout(ml)
-
+        self.server_edit = QLineEdit(self._settings.get("server_url") or DEFAULT_SERVER_URL)
+        self.server_edit.setPlaceholderText("ws://主机:8765")
+        self.conn_btn = QPushButton("连接")
+        self.conn_btn.setObjectName("btnConnect")
+        self.conn_btn.setToolTip("改完地址后点这里，按新地址重连（不重新加载角色）")
+        self.conn_btn.clicked.connect(self._connect_server)
         self.server_row = QWidget()
         sl = QHBoxLayout(self.server_row)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(8)
         sl.addWidget(self._lbl("服务器"))
-        self.server_edit = QLineEdit(self._settings.get("server_url") or DEFAULT_SERVER_URL)
-        self.server_edit.setPlaceholderText("ws://主机:8765")
         sl.addWidget(self.server_edit, 1)
-        self.conn_btn = QPushButton("连接")
-        self.conn_btn.setObjectName("btnConnect")
-        self.conn_btn.setToolTip("改完地址后点这里，按新地址重连（不重新加载角色）")
-        self.conn_btn.clicked.connect(self._connect_server)
         sl.addWidget(self.conn_btn)
-        l.addWidget(self.server_row)
-        self._sync_mode_ui()
 
         # 冻结版：本地推理一键安装入口（源码运行时隐藏）
         self.local_install_row = QWidget()
@@ -1918,214 +2472,392 @@ class MainWindow(QMainWindow):
         l.addWidget(self.local_install_row)
         self._refresh_local_install()
 
-        dl = QGridLayout(); dl.setHorizontalSpacing(8); dl.setVerticalSpacing(8)
-        dl.addWidget(self._lbl("输入"), 0, 0)
+        # 音频设备选择
+        dl = QGridLayout()
+        dl.setHorizontalSpacing(10)
+        dl.setVerticalSpacing(8)
+
+        dl.addWidget(self._lbl("输入设备"), 0, 0)
         self.ic = DeviceCombo(direction="input")
+        self.ic.setMinimumHeight(30)
         self.ic.setToolTip("WASAPI 独占要求输入输出同一组 API；选择后会自动对齐另一侧")
         self.ic.currentIndexChanged.connect(lambda: self._on_device_changed("input"))
         dl.addWidget(self.ic, 0, 1)
-        dl.addWidget(self._lbl("输出"), 1, 0)
+
+        dl.addWidget(self._lbl("输出设备"), 1, 0)
         self.oc = DeviceCombo(direction="output")
+        self.oc.setMinimumHeight(30)
         self.oc.setToolTip("WASAPI 独占要求输入输出同一组 API；选择后会自动对齐另一侧")
         self.oc.currentIndexChanged.connect(lambda: self._on_device_changed("output"))
         dl.addWidget(self.oc, 1, 1)
+
         rb = QPushButton("刷新设备")
         rb.setObjectName("btnGhost")
+        rb.setMinimumHeight(28)
         rb.clicked.connect(lambda: self._rd())
-        dl.addWidget(rb, 2, 1, Qt.AlignRight)
+
+        cable_btn = QPushButton("虚拟声卡向导")
+        cable_btn.setObjectName("btnGhost")
+        cable_btn.setMinimumHeight(28)
+        cable_btn.setToolTip("检测 VB-Cable / VoiceMeeter，没有则打开安装页")
+        cable_btn.clicked.connect(self._cable_wizard)
+
+        row_btns = QHBoxLayout()
+        row_btns.setSpacing(8)
+        row_btns.addWidget(cable_btn, 1)
+        row_btns.addWidget(rb, 1)
+        dl.addLayout(row_btns, 2, 1)
         dl.setColumnStretch(1, 1)
         l.addLayout(dl)
 
-        # 设备错位/异常提示（常驻显示，比状态栏更醒目）
+        # 设备错位/异常提示（常驻显示）
         self.dev_hint = QLabel("")
         self.dev_hint.setWordWrap(True)
         self.dev_hint.setVisible(False)
         l.addWidget(self.dev_hint)
+
+        # 延迟/音质平衡滑杆
+        tq = QHBoxLayout()
+        tq.setSpacing(8)
+        tq.addWidget(self._lbl("延迟平衡"))
+        self.tq_fast = QLabel("更快(低延迟)")
+        self.tq_fast.setStyleSheet("font-size:11px;color:#64748b;")
+        tq.addWidget(self.tq_fast)
+        self.tq_slider = QSlider(Qt.Horizontal)
+        self.tq_slider.setRange(0, 100)
+        self.tq_slider.setValue(40)
+        self.tq_slider.setToolTip("同时调节块大小与额外上下文。偏左更低延迟，偏右更稳音色。下次启动生效。")
+        self.tq_slider.valueChanged.connect(self._on_tradeoff)
+        tq.addWidget(self.tq_slider, 1)
+        self.tq_hq = QLabel("更稳(好音质)")
+        self.tq_hq.setStyleSheet("font-size:11px;color:#64748b;")
+        tq.addWidget(self.tq_hq)
+        l.addLayout(tq)
+
+        # 输出频谱
+        self.spectrum = SpectrumWidget()
+        self.spectrum.setToolTip("输出频谱实时监视")
+        l.addWidget(self.spectrum)
         l.addStretch(1)
 
+        # 核心主按钮
         self.sb = QPushButton("启动变声")
         self.sb.setObjectName("btnStart")
         self.sb.setProperty("state", "off")
         self.sb.setMinimumHeight(46)
         self.sb.clicked.connect(self._tg)
         l.addWidget(self.sb)
-        self.rec_btn = QPushButton("录音测试 10 秒")
-        self.rec_btn.setMinimumHeight(36)
+
+        self.rec_btn = QPushButton("录音测试 (10 秒)")
+        self.rec_btn.setObjectName("btnGhost")
+        self.rec_btn.setMinimumHeight(34)
         self.rec_btn.setToolTip("录 10 秒，用当前角色变声后保存并播放")
         self.rec_btn.clicked.connect(self._rec)
         l.addWidget(self.rec_btn)
         return g
 
     def _build_right(self):
-        box = QWidget()
-        root = QVBoxLayout(box)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(10)
+        tabs = QTabWidget()
+        tabs.setObjectName("rightTabs")
 
-        # ── 高级参数 ──
-        g1 = QGroupBox("高级参数")
+        # ── Tab 1: 核心算法 ──
+        t1 = QWidget()
+        l1 = QVBoxLayout(t1)
+        l1.setContentsMargins(10, 14, 10, 10)
+        l1.setSpacing(10)
+
+        g1 = QGroupBox("算法核心参数")
         l = QGridLayout(g1)
         l.setContentsMargins(10, 16, 10, 10)
-        l.setHorizontalSpacing(8); l.setVerticalSpacing(6)
+        l.setHorizontalSpacing(10)
+        l.setVerticalSpacing(8)
 
-        self.fc = create_styled_combo(max_visible=10); self.fc.addItems(["rmvpe", "fcpe", "pm"])
+        self.fc = create_styled_combo(max_visible=10)
+        self.fc.addItems(["rmvpe", "fcpe", "pm"])
+        self.fc.setMinimumHeight(28)
         self.fc.currentTextChanged.connect(lambda v: setattr(self.engine, "f0method", v))
         self.fc.setToolTip("基频提取: rmvpe 最准, pm 最快")
-        self.bs = QDoubleSpinBox(); self.bs.setRange(0.05, 2.0); self.bs.setSingleStep(0.05)
-        self.bs.setValue(0.08)
-        self.bs.setToolTip("越小延迟越低。运行中修改将在下次启动后生效")
+
+        self.bs = QDoubleSpinBox()
+        self.bs.setRange(0.03, 0.5)
+        self.bs.setSingleStep(0.01)
+        self.bs.setValue(DEFAULT_PARAMS["block_time"])
+        self.bs.setDecimals(3)
+        self.bs.setSuffix(" s")
+        self.bs.setMinimumHeight(28)
+        self.bs.setToolTip("音频块时长（秒）。越小嘴到耳越低，GPU 越容易卡顿。运行中修改下次启动生效")
         self.bs.valueChanged.connect(lambda v: setattr(self.engine, "block_time", v))
-        self.xs = QDoubleSpinBox(); self.xs.setRange(0.01, 0.5); self.xs.setSingleStep(0.01)
-        self.xs.setValue(0.02)
+        self.bs.valueChanged.connect(lambda _: self._sync_tradeoff_slider())
+
+        self.xs = QDoubleSpinBox()
+        self.xs.setRange(0.01, 0.5)
+        self.xs.setSingleStep(0.01)
+        self.xs.setValue(DEFAULT_PARAMS["crossfade_time"])
+        self.xs.setSuffix(" s")
+        self.xs.setMinimumHeight(28)
         self.xs.setToolTip("运行中修改将在下次启动后生效")
         self.xs.valueChanged.connect(lambda v: setattr(self.engine, "crossfade_time", v))
-        self.es = QDoubleSpinBox(); self.es.setRange(0.5, 10.0); self.es.setSingleStep(0.5)
-        self.es.setValue(1.5)
-        self.es.setToolTip("越大音色越稳、延迟越高。运行中修改将在下次启动后生效")
+
+        self.es = QDoubleSpinBox()
+        self.es.setRange(0.4, 5.0)
+        self.es.setSingleStep(0.1)
+        self.es.setValue(DEFAULT_PARAMS["extra_time"])
+        self.es.setSuffix(" s")
+        self.es.setMinimumHeight(28)
+        self.es.setToolTip("上下文长度：越大音色越稳，但不增加听感延迟，只增加每块算力。运行中修改下次启动生效")
         self.es.valueChanged.connect(lambda v: setattr(self.engine, "extra_time", v))
-        self.ts = QSpinBox(); self.ts.setRange(-80, 0); self.ts.setValue(-50)
+
+        self.ts = QSpinBox()
+        self.ts.setRange(-80, 0)
+        self.ts.setValue(-50)
+        self.ts.setSuffix(" dB")
+        self.ts.setMinimumHeight(28)
         self.ts.setToolTip("低于此音量视为静音。-80 关闭门限")
         self.ts.valueChanged.connect(lambda v: setattr(self.engine, "threhold", v))
+
         self.calib_noise_btn = QPushButton("测底噪")
         self.calib_noise_btn.setObjectName("btnGhost")
+        self.calib_noise_btn.setFixedWidth(58)
+        self.calib_noise_btn.setMinimumHeight(28)
         self.calib_noise_btn.setToolTip("保持安静 1 秒，自动测定当前环境底噪并计算最优静音阈值")
         self.calib_noise_btn.clicked.connect(self._auto_calibrate_noise)
+
         self.ts_box = QWidget()
-        ts_l = QHBoxLayout(self.ts_box); ts_l.setContentsMargins(0, 0, 0, 0); ts_l.setSpacing(4)
+        ts_l = QHBoxLayout(self.ts_box)
+        ts_l.setContentsMargins(0, 0, 0, 0)
+        ts_l.setSpacing(6)
         ts_l.addWidget(self.ts, 1)
         ts_l.addWidget(self.calib_noise_btn)
-        self.rs = QDoubleSpinBox(); self.rs.setRange(0.0, 1.0); self.rs.setSingleStep(0.1)
+
+        self.rs = QDoubleSpinBox()
+        self.rs.setRange(0.0, 1.0)
+        self.rs.setSingleStep(0.1)
         self.rs.setValue(0.3)
+        self.rs.setMinimumHeight(28)
         self.rs.setToolTip("0=完全跟随输入音量，1=只保留变声自身音量")
         self.rs.valueChanged.connect(lambda v: setattr(self.engine, "rms_mix_rate", v))
+
         rows = [
-            ("F0", self.fc),
+            ("F0 算法", self.fc),
             ("块大小", self.bs),
             ("交叉淡入", self.xs),
-            ("额外推理", self.es),
+            ("额外上下文", self.es),
             ("静音阈值", self.ts_box),
             ("音量保留", self.rs),
         ]
         for i, (name, w) in enumerate(rows):
-            l.addWidget(self._lbl(name), i, 0)
+            lbl = self._lbl(name)
+            lbl.setMinimumHeight(28)
+            l.addWidget(lbl, i, 0)
             l.addWidget(w, i, 1)
+
         self.inc = QCheckBox("输入降噪")
+        self.inc.setMinimumHeight(26)
         self.inc.setToolTip("运行中修改将在下次启动后生效")
         self.inc.toggled.connect(lambda v: setattr(self.engine, "I_noise_reduce", v))
         self.onc = QCheckBox("输出降噪")
+        self.onc.setMinimumHeight(26)
         self.onc.setToolTip("运行中修改将在下次启动后生效")
         self.onc.toggled.connect(lambda v: setattr(self.engine, "O_noise_reduce", v))
-        nr = QHBoxLayout(); nr.setSpacing(12)
-        nr.addWidget(self.inc); nr.addWidget(self.onc); nr.addStretch()
-        l.addLayout(nr, len(rows), 0, 1, 2)
 
-        # 输出保护（直流高通 + 软限幅）
-        pr = QHBoxLayout(); pr.setSpacing(8)
+        nr = QHBoxLayout()
+        nr.setSpacing(12)
+        nr.addWidget(self.inc)
+        nr.addWidget(self.onc)
+        nr.addStretch()
+        l.addLayout(nr, len(rows), 0, 1, 2)
+        l.setColumnStretch(1, 1)
+        l1.addWidget(g1)
+        l1.addStretch(1)
+
+        # ── Tab 2: 音质增强 ──
+        t2 = QWidget()
+        l2 = QVBoxLayout(t2)
+        l2.setContentsMargins(10, 14, 10, 10)
+        l2.setSpacing(10)
+
+        g_dsp = QGroupBox("人声修饰与 DSP")
+        dl = QGridLayout(g_dsp)
+        dl.setContentsMargins(10, 16, 10, 10)
+        dl.setHorizontalSpacing(10)
+        dl.setVerticalSpacing(8)
+
+        # 输出保护
+        pr = QHBoxLayout()
+        pr.setSpacing(8)
         self.limiter_cb = QCheckBox("输出保护")
+        self.limiter_cb.setMinimumHeight(26)
         self.limiter_cb.setToolTip("直流高通 + 软限幅，防止爆音/直流偏移（实时生效）")
         self.limiter_cb.setChecked(True)
         self.limiter_cb.toggled.connect(lambda v: setattr(self.engine, "limiter_enable", v))
         pr.addWidget(self.limiter_cb)
-        self.limiter_th = QDoubleSpinBox(); self.limiter_th.setRange(-12.0, 0.0)
-        self.limiter_th.setSingleStep(0.5); self.limiter_th.setSuffix(" dB")
+
+        self.limiter_th = QDoubleSpinBox()
+        self.limiter_th.setRange(-12.0, 0.0)
+        self.limiter_th.setSingleStep(0.5)
+        self.limiter_th.setSuffix(" dB")
         self.limiter_th.setValue(-1.0)
+        self.limiter_th.setFixedWidth(82)
+        self.limiter_th.setMinimumHeight(26)
         self.limiter_th.setToolTip("起限阈值，-1 dB 为推荐值")
         self.limiter_th.valueChanged.connect(lambda v: setattr(self.engine, "limiter_threshold_db", v))
-        pr.addWidget(self.limiter_th); pr.addStretch()
-        l.addLayout(pr, len(rows) + 1, 0, 1, 2)
+        pr.addWidget(self.limiter_th)
+        dl.addLayout(pr, 0, 0, 1, 2)
 
-        # 高频齿音直通（找回 s/sh/f 等清辅音细节）
-        self.hf_spin = QDoubleSpinBox(); self.hf_spin.setRange(0.0, 1.0)
-        self.hf_spin.setSingleStep(0.05); self.hf_spin.setValue(0.3)
-        self.hf_spin.setToolTip("把原声 6kHz 以上的气音/齿音按比例混回输出，改善咬字清晰度；0=关闭")
-        self.hf_spin.valueChanged.connect(lambda v: setattr(self.engine, "hf_mix_rate", v))
-        l.addWidget(self._lbl("齿音保留"), len(rows) + 2, 0)
-        l.addWidget(self.hf_spin, len(rows) + 2, 1)
+        # 齿音保留
+        self.hf_spin = QDoubleSpinBox()
+        self.hf_spin.setRange(0.0, 1.0)
+        self.hf_spin.setSingleStep(0.05)
+        self.hf_spin.setValue(DEFAULT_PARAMS["hf_mix_rate"])
+        self.hf_spin.setMinimumHeight(28)
+        self.hf_spin.setToolTip("把原声 6kHz 以上的气音混回输出。与「去齿音」互斥。")
+        self.hf_spin.valueChanged.connect(self._on_hf_mix)
+        dl.addWidget(self._lbl("齿音保留"), 1, 0)
+        dl.addWidget(self.hf_spin, 1, 1)
 
-        # 临场感提升（3kHz 以上轻微增亮）
-        self.pres_spin = QDoubleSpinBox(); self.pres_spin.setRange(0.0, 1.0)
-        self.pres_spin.setSingleStep(0.05); self.pres_spin.setValue(0.15)
-        self.pres_spin.setToolTip("轻微提升人声穿透力，0=关闭，1=最大（约+2.5dB 高频搁架）")
+        # 临场感
+        self.pres_spin = QDoubleSpinBox()
+        self.pres_spin.setRange(0.0, 1.0)
+        self.pres_spin.setSingleStep(0.05)
+        self.pres_spin.setValue(DEFAULT_PARAMS["presence"])
+        self.pres_spin.setMinimumHeight(28)
+        self.pres_spin.setToolTip("轻微提升人声穿透力，0=关闭，1=最大")
         self.pres_spin.valueChanged.connect(lambda v: setattr(self.engine, "presence", v))
-        l.addWidget(self._lbl("临场感"), len(rows) + 3, 0)
-        l.addWidget(self.pres_spin, len(rows) + 3, 1)
+        dl.addWidget(self._lbl("临场感"), 2, 0)
+        dl.addWidget(self.pres_spin, 2, 1)
 
-        # 自适应去齿音
-        self.deess_cb = QCheckBox("去齿音")
-        self.deess_cb.setToolTip("监测 6kHz 以上能量，尖刺超标时自动软衰减（实时生效）")
-        self.deess_cb.setChecked(True)
-        self.deess_cb.toggled.connect(lambda v: setattr(self.engine, "deesser_enable", v))
-        l.addWidget(self.deess_cb, len(rows) + 4, 0, 1, 2)
+        # 去齿音
+        self.deess_cb = QCheckBox("自适应去齿音")
+        self.deess_cb.setMinimumHeight(26)
+        self.deess_cb.setToolTip("尖刺超标时软衰减。与「齿音保留」互斥。")
+        self.deess_cb.setChecked(DEFAULT_PARAMS["deesser_enable"])
+        self.deess_cb.toggled.connect(self._on_deesser)
+        dl.addWidget(self.deess_cb, 3, 0, 1, 2)
 
-        # 智能人声识别 (VAD)
-        vr = QHBoxLayout(); vr.setSpacing(8)
+        # 人声识别 (VAD)
+        vr = QHBoxLayout()
+        vr.setSpacing(8)
         self.vad_cb = QCheckBox("人声识别 (VAD)")
-        self.vad_cb.setToolTip("智能区分人声与环境杂音（键盘/敲击/风扇），非人声自动静音（实时生效）")
+        self.vad_cb.setMinimumHeight(26)
+        self.vad_cb.setToolTip("智能区分人声与环境杂音，非人声自动静音")
         self.vad_cb.setChecked(False)
         self.vad_cb.toggled.connect(lambda v: setattr(self.engine, "vad_enable", v))
         vr.addWidget(self.vad_cb)
-        self.vad_th = QDoubleSpinBox(); self.vad_th.setRange(0.10, 0.90)
-        self.vad_th.setSingleStep(0.05); self.vad_th.setValue(0.50)
+
+        self.vad_th = QDoubleSpinBox()
+        self.vad_th.setRange(0.10, 0.90)
+        self.vad_th.setSingleStep(0.05)
+        self.vad_th.setValue(0.50)
+        self.vad_th.setFixedWidth(82)
+        self.vad_th.setMinimumHeight(26)
         self.vad_th.setToolTip("人声置信度门限（0.50 为推荐平衡点）")
         self.vad_th.valueChanged.connect(lambda v: setattr(self.engine, "vad_threshold", v))
-        vr.addWidget(self.vad_th); vr.addStretch()
-        l.addLayout(vr, len(rows) + 5, 0, 1, 2)
+        vr.addWidget(self.vad_th)
+        dl.addLayout(vr, 4, 0, 1, 2)
 
-        # 分阶段耗时（本地模式）
+        # 阶段耗时
         self.st_lbl = QLabel("阶段耗时: --")
         self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
-        l.addWidget(self.st_lbl, len(rows) + 6, 0, 1, 2)
-        l.setColumnStretch(1, 1)
-        root.addWidget(g1)
+        dl.addWidget(self.st_lbl, 5, 0, 1, 2)
+        dl.setColumnStretch(1, 1)
+        l2.addWidget(g_dsp)
+        l2.addStretch(1)
 
-        # ── 音质与监听 ──
-        g2 = QGroupBox("音质与监听")
+        # ── Tab 3: 预设与监听 ──
+        t3 = QWidget()
+        l3 = QVBoxLayout(t3)
+        l3.setContentsMargins(10, 14, 10, 10)
+        l3.setSpacing(10)
+
+        g2 = QGroupBox("预设与监听")
         m = QGridLayout(g2)
         m.setContentsMargins(10, 16, 10, 10)
-        m.setHorizontalSpacing(8); m.setVerticalSpacing(6)
+        m.setHorizontalSpacing(10)
+        m.setVerticalSpacing(8)
 
         self.agc_cb = QCheckBox("输入自动增益 (AGC)")
+        self.agc_cb.setMinimumHeight(26)
         self.agc_cb.setToolTip("输入电平归一化，说话人远近变化时音色更稳定（实时生效）")
         self.agc_cb.toggled.connect(self._on_agc)
         m.addWidget(self.agc_cb, 0, 0, 1, 2)
 
-        m.addWidget(self._lbl("预设"), 1, 0)
-        pbtn_row = QHBoxLayout(); pbtn_row.setSpacing(6)
+        m.addWidget(self._lbl("预设方案"), 1, 0)
+        pbtn_row = QHBoxLayout()
+        pbtn_row.setSpacing(6)
         self._preset_map = load_presets()
         self.preset_cb = create_styled_combo()
+        self.preset_cb.setMinimumHeight(28)
         for p in self._preset_map:
             self.preset_cb.addItem(p["name"])
         pbtn_row.addWidget(self.preset_cb, 1)
-        pb_apply = QPushButton("应用"); pb_apply.setObjectName("btnGhost")
-        pb_apply.setToolTip("应用所选预设（需重启生效的参数会提示）")
+
+        pb_apply = QPushButton("应用")
+        pb_apply.setObjectName("btnGhost")
+        pb_apply.setFixedWidth(48)
+        pb_apply.setMinimumHeight(28)
+        pb_apply.setToolTip("应用所选预设")
         pb_apply.clicked.connect(self._apply_preset)
         pbtn_row.addWidget(pb_apply)
-        pb_save = QPushButton("保存"); pb_save.setObjectName("btnGhost")
+
+        pb_save = QPushButton("保存")
+        pb_save.setObjectName("btnGhost")
+        pb_save.setFixedWidth(48)
+        pb_save.setMinimumHeight(28)
         pb_save.setToolTip("把当前参数保存为用户预设")
         pb_save.clicked.connect(self._save_preset)
         pbtn_row.addWidget(pb_save)
         m.addLayout(pbtn_row, 1, 1)
 
-        mr = QHBoxLayout(); mr.setSpacing(8)
-        self.monitor_cb = QCheckBox("监听")
+        mr = QHBoxLayout()
+        mr.setSpacing(8)
+        self.monitor_cb = QCheckBox("耳机监听")
+        self.monitor_cb.setMinimumHeight(26)
         self.monitor_cb.setToolTip("把变声结果同时播放到第二输出设备（如耳机）")
         self.monitor_cb.toggled.connect(self._on_monitor_toggle)
         mr.addWidget(self.monitor_cb)
+
         self.monitor_vol = QSlider(Qt.Horizontal)
-        self.monitor_vol.setRange(0, 100); self.monitor_vol.setValue(80)
+        self.monitor_vol.setRange(0, 100)
+        self.monitor_vol.setValue(80)
         self.monitor_vol.setToolTip("监听音量")
         self.monitor_vol.valueChanged.connect(self._on_monitor_vol)
         mr.addWidget(self.monitor_vol, 1)
         m.addLayout(mr, 2, 0, 1, 2)
 
         self.mc = DeviceCombo(direction="output")
+        self.mc.setMinimumHeight(30)
         self.mc.setToolTip("监听输出设备（可不同于主输出）")
         self.mc.currentIndexChanged.connect(lambda: self._on_monitor_changed())
         m.addWidget(self.mc, 3, 0, 1, 2)
         m.setColumnStretch(1, 1)
-        root.addWidget(g2)
-        root.addStretch(1)
-        return box
+        l3.addWidget(g2)
+
+        # 远程服务器模式（可选）
+        g3 = QGroupBox("远程服务器模式（可选）")
+        g3.setCheckable(True)
+        g3.setChecked(self.engine.mode == "server")
+        g3.setToolTip("连接局域网/远程 RVC 推理服务器")
+        sg = QVBoxLayout(g3)
+        sg.setContentsMargins(10, 16, 10, 10)
+        sg.setSpacing(8)
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(12)
+        mode_row.addWidget(self.mode_local)
+        mode_row.addWidget(self.mode_server)
+        mode_row.addStretch(1)
+        sg.addLayout(mode_row)
+        sg.addWidget(self.server_row)
+        self.server_box = g3
+        g3.toggled.connect(self._on_server_box_toggled)
+        l3.addWidget(g3)
+        l3.addStretch(1)
+
+        self._sync_mode_ui()
+
+        tabs.addTab(t1, "核心算法")
+        tabs.addTab(t2, "人声增强")
+        tabs.addTab(t3, "预设与监听")
+        return tabs
 
     # ── 事件处理 ──
     def _show_dev_hint(self, text, warn=True):
@@ -2233,6 +2965,8 @@ class MainWindow(QMainWindow):
         return in_id, out_id, None
 
     def _rd(self, restore=True, reinit=True):
+        if getattr(self.engine, "running", False):
+            reinit = False
         in_name, in_api = self.ic.currentDeviceName(), self.ic.currentDeviceApi()
         out_name, out_api = self.oc.currentDeviceName(), self.oc.currentDeviceApi()
         mon_name, mon_api = self.mc.currentDeviceName(), self.mc.currentDeviceApi()
@@ -2272,7 +3006,7 @@ class MainWindow(QMainWindow):
             return
         _in, _out, err = self._resolve_selected(reinit=False)
         if err:
-            self.engine._hard_stop()
+            self.engine.request_hard_stop()
             self._show_dev_hint("音频设备已断开: " + err)
             self.status_bar.showMessage("音频设备已断开: " + err, 8000)
 
@@ -2287,7 +3021,7 @@ class MainWindow(QMainWindow):
         self.sc.blockSignals(True)
         self.sc.clear()
         for s in self.speaker_mgr.speakers:
-            self.sc.addItem("  " + s.name)
+            self.sc.addItem(s.name)
         if self.speaker_mgr.speakers:
             if self.engine.current_speaker:
                 names = [s.name for s in self.speaker_mgr.speakers]
@@ -2319,7 +3053,12 @@ class MainWindow(QMainWindow):
             self.sb.setEnabled(True)
             return
         if self.engine.running:
-            self.engine._hard_stop()
+            self._pending_speaker = s
+            self._pending_after_stop = "load"
+            self._set_light(LIGHT_YELLOW, "正在停止以便换角色...")
+            self.sb.setEnabled(False)
+            self.engine.request_hard_stop()
+            return
         self._set_light(LIGHT_YELLOW, "加载模型中...")
         self.sb.setEnabled(False)
         self._start_loading(s)
@@ -2396,7 +3135,16 @@ class MainWindow(QMainWindow):
         self.engine.change_index_rate(speaker.index_rate)
         self._set_light(LIGHT_GREEN, "就绪")
         self.sb.setEnabled(True)
-        self.status_bar.showMessage("模型已加载: " + speaker.name, 5000)
+        extra = ""
+        try:
+            pipe = self.engine.pipeline
+            rvc = getattr(getattr(pipe, "_real", None), "rvc", None) or getattr(pipe, "rvc", None)
+            lab = getattr(getattr(rvc, "model", None), "backend_label", None)
+            if lab:
+                extra = " · 特征 " + lab
+        except Exception:
+            extra = ""
+        self.status_bar.showMessage("模型已加载: " + speaker.name + extra, 6000)
         self._persist_settings()
 
     def _on_load_failed(self, err, gen=0):
@@ -2445,6 +3193,20 @@ class MainWindow(QMainWindow):
         self.sb.setText("启动变声")
         self.sb.setProperty("state", "off")
         self.sb.style().unpolish(self.sb); self.sb.style().polish(self.sb)
+        self.latency_label.setText("推理 --ms")
+        self.e2e_label.setText("嘴到耳 --ms")
+        action = self._pending_after_stop
+        self._pending_after_stop = None
+        if action == "load" and self._pending_speaker is not None:
+            speaker = self._pending_speaker
+            self._pending_speaker = None
+            self._set_light(LIGHT_YELLOW, "加载模型中...")
+            self.sb.setEnabled(False)
+            self._start_loading(speaker)
+        elif action == "mode" and self._pending_mode:
+            mode = self._pending_mode
+            self._pending_mode = None
+            self._apply_mode(mode)
 
     def _on_status(self, m):
         self.status_bar.showMessage(m, 5000)
@@ -2460,16 +3222,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_rec_thread") and self._rec_thread is not None and self._rec_thread.isRunning():
             QMessageBox.information(self, "提示", "录音正在进行中，请稍候...")
             return
-        # 用界面选的输入设备（按 名字+API 重解析，防同名设备匹配错）
         rec_dev = None
         in_name = self.ic.currentDeviceName()
         in_api = self.ic.currentDeviceApi()
         if in_name:
-            import sounddevice as sd
-            sd._terminate(); sd._initialize()
-            for i, d in enumerate(sd.query_devices()):
-                if d['name'] == in_name and d['hostapi'] == in_api and d['max_input_channels'] > 0:
-                    rec_dev = i; break
+            try:
+                for i, d in enumerate(sd.query_devices()):
+                    if d['name'] == in_name and d['hostapi'] == in_api and d['max_input_channels'] > 0:
+                        rec_dev = i
+                        break
+            except Exception:
+                rec_dev = None
         self.rec_btn.setEnabled(False)
         self.rec_btn.setText("录音中…")
         self._rec_thread = RecThread(self.engine, 10, rec_dev, self)
@@ -2491,13 +3254,14 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_infer_time(self, ms):
-        if ms < 50:
+        budget = max(30, int(float(self.engine.block_time) * 1000))
+        if ms < budget * 0.7:
             c, bg, bd = "#059669", "#ecfdf5", "#a7f3d0"
-        elif ms < 100:
+        elif ms < budget:
             c, bg, bd = "#d97706", "#fffbeb", "#fde68a"
         else:
             c, bg, bd = "#dc2626", "#fef2f2", "#fecaca"
-        self.latency_label.setText(f"延迟 {ms}ms")
+        self.latency_label.setText(f"推理 {ms}ms")
         self.latency_label.setStyleSheet(
             f"font-size:12px;font-weight:700;color:{c};background:{bg};border:1px solid {bd};border-radius:6px;padding:4px 8px;"
         )
@@ -2506,10 +3270,13 @@ class MainWindow(QMainWindow):
         if self.engine.running:
             self.engine.stop()
             return
+        if self.engine._engine_busy():
+            self.status_bar.showMessage("正在处理，请稍候...", 3000)
+            return
         if not self.engine.pipeline.is_loaded:
             QMessageBox.warning(self, "提示", "请先选择角色模型")
             return
-        in_id, out_id, err = self._resolve_selected(reinit=True)
+        in_id, out_id, err = self._resolve_selected(reinit=False)
         if err:
             self._show_dev_hint(err)
             QMessageBox.warning(self, "设备", err)
@@ -2563,16 +3330,10 @@ class MainWindow(QMainWindow):
                     self._zombie_loaders.append(t)
             except Exception:
                 pass
-        if self.engine.running:
-            self.engine._hard_stop()
-        # 启动线程仍在后台执行时：先中断再等待，避免退出后流被拉起
-        st = getattr(self.engine, "_start_thread", None)
-        if st is not None and st.isRunning():
-            try:
-                self.engine._hard_stop()
-                st.wait(2000)
-            except Exception:
-                pass
+        self.engine._stop_requested = True
+        if self.engine.running or self.engine._engine_busy():
+            self.engine.request_hard_stop()
+            self.engine.wait_idle(2000)
         # 冻结版：退出时回收本机子进程推理服务
         pipe = getattr(self.engine, "pipeline", None)
         if pipe is not None and getattr(pipe, "stop_server", None) is not None:
@@ -2710,6 +3471,51 @@ class MainWindow(QMainWindow):
         self._calib_thread.start()
 
     # ── 音质产品化：AGC / 监听 / 预设 / 阶段耗时 ──
+    def _on_tradeoff(self, val):
+        if getattr(self, "_tq_guard", False):
+            return
+        t = max(0.0, min(1.0, float(val) / 100.0))
+        block = round(0.03 + t * 0.07, 3)
+        extra = round(0.50 + t * 1.00, 2)
+        fade = round(0.01 + t * 0.02, 3)
+        self._tq_guard = True
+        try:
+            self.bs.setValue(block)
+            self.es.setValue(extra)
+            self.xs.setValue(fade)
+        finally:
+            self._tq_guard = False
+        self._persist_settings()
+
+    def _sync_tradeoff_slider(self):
+        if not hasattr(self, "tq_slider"):
+            return
+        block = float(self.bs.value())
+        t = (block - 0.03) / 0.07
+        self._tq_guard = True
+        try:
+            self.tq_slider.setValue(int(round(max(0.0, min(1.0, t)) * 100)))
+        finally:
+            self._tq_guard = False
+
+    def _on_hf_mix(self, v):
+        self.engine.hf_mix_rate = float(v)
+        if v > 0 and self.deess_cb.isChecked():
+            self.deess_cb.blockSignals(True)
+            self.deess_cb.setChecked(False)
+            self.deess_cb.blockSignals(False)
+            self.engine.deesser_enable = False
+        self._persist_settings()
+
+    def _on_deesser(self, on):
+        self.engine.deesser_enable = bool(on)
+        if on and self.hf_spin.value() > 0:
+            self.hf_spin.blockSignals(True)
+            self.hf_spin.setValue(0.0)
+            self.hf_spin.blockSignals(False)
+            self.engine.hf_mix_rate = 0.0
+        self._persist_settings()
+
     def _on_agc(self, on):
         self.engine.set_input_agc(on)
         self._persist_settings()
@@ -2750,7 +3556,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_loop_latency(self, ms):
-        self.e2e_label.setText(f"端到端 {ms:.0f}ms")
+        self.e2e_label.setText(f"嘴到耳 {ms:.0f}ms")
 
     def _on_stage_stats(self, s):
         try:
@@ -2785,6 +3591,14 @@ class MainWindow(QMainWindow):
             self.inc.setChecked(bool(params["I_noise_reduce"]))
         if "O_noise_reduce" in params:
             self.onc.setChecked(bool(params["O_noise_reduce"]))
+        if "deesser_enable" in params and hasattr(self, "deess_cb"):
+            self.deess_cb.setChecked(bool(params["deesser_enable"]))
+        if "hf_mix_rate" in params and hasattr(self, "hf_spin"):
+            self.hf_spin.setValue(float(params["hf_mix_rate"]))
+        if "presence" in params and hasattr(self, "pres_spin"):
+            self.pres_spin.setValue(float(params["presence"]))
+        if "vad_enable" in params and hasattr(self, "vad_cb"):
+            self.vad_cb.setChecked(bool(params["vad_enable"]))
         if "formant" in params and hasattr(self, "live_formant"):
             self.live_formant.setValue(float(params["formant"]))
         if "dry_mix" in params and hasattr(self, "live_dry"):
@@ -2825,6 +3639,10 @@ class MainWindow(QMainWindow):
             "O_noise_reduce": self.engine.O_noise_reduce,
             "rms_mix_rate": self.engine.rms_mix_rate,
             "threhold": self.engine.threhold,
+            "hf_mix_rate": float(self.hf_spin.value()) if hasattr(self, "hf_spin") else 0.2,
+            "presence": float(self.pres_spin.value()) if hasattr(self, "pres_spin") else 0.10,
+            "deesser_enable": bool(self.deess_cb.isChecked()) if hasattr(self, "deess_cb") else False,
+            "vad_enable": bool(self.vad_cb.isChecked()) if hasattr(self, "vad_cb") else False,
             "formant": float(self.live_formant.value()) if hasattr(self, "live_formant") else 0.0,
             "dry_mix": float(self.live_dry.value()) if hasattr(self, "live_dry") else 0.0,
         }
@@ -2834,7 +3652,10 @@ class MainWindow(QMainWindow):
             self._sync_mode_ui()
             return
         if self.engine.running:
-            self.engine._hard_stop()
+            self._pending_mode = mode
+            self._pending_after_stop = "mode"
+            self.engine.request_hard_stop()
+            return
         self._load_gen += 1
         self.engine.set_mode(mode)
         self._sync_mode_ui()
@@ -2847,10 +3668,27 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             "已切换到本地推理" if mode == "local" else "已切换到服务器", 4000)
 
+    def _on_server_box_toggled(self, on):
+        if on and self.engine.mode != "server":
+            self.mode_server.setChecked(True)
+        elif (not on) and self.engine.mode != "local":
+            self.mode_local.setChecked(True)
+
     def _sync_mode_ui(self):
         server = self.engine.mode == "server"
         if hasattr(self, "server_row"):
             self.server_row.setVisible(server)
+        if hasattr(self, "server_box"):
+            self.server_box.blockSignals(True)
+            self.server_box.setChecked(server)
+            self.server_box.blockSignals(False)
+        if hasattr(self, "mode_local"):
+            self.mode_local.blockSignals(True)
+            self.mode_server.blockSignals(True)
+            self.mode_local.setChecked(not server)
+            self.mode_server.setChecked(server)
+            self.mode_local.blockSignals(False)
+            self.mode_server.blockSignals(False)
 
     def _connect_server(self):
         url = self.server_edit.text().strip() or DEFAULT_SERVER_URL
@@ -2965,6 +3803,9 @@ class MainWindow(QMainWindow):
                 self.vad_th.setValue(float(s["vad_threshold"]))
             except Exception:
                 pass
+        if self.deess_cb.isChecked() and self.hf_spin.value() > 0:
+            self.deess_cb.setChecked(False)
+        self._sync_tradeoff_slider()
 
     def _restore_devices(self):
         self.ic.blockSignals(True)
@@ -2983,6 +3824,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "server_edit"):
             data["server_url"] = self.server_edit.text().strip() or DEFAULT_SERVER_URL
         data["infer_mode"] = self.engine.mode
+        data["theme"] = "dark" if getattr(self, "_dark", True) else "light"
         # 设备字段：下拉框未填充（启动早期）时不写回 None，避免覆盖已保存的选择
         in_name = self.ic.currentDeviceName()
         out_name = self.oc.currentDeviceName()

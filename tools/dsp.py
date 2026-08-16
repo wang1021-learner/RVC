@@ -15,6 +15,40 @@ import torch
 import torch.nn.functional as F
 
 
+class DelayLine:
+    """2× 环形延迟线：push 后 latest(m) 是连续切片，热路径不 roll。"""
+
+    def __init__(self, n, device, dtype):
+        self.n = int(n)
+        self.buf = torch.zeros(max(self.n * 2, 2), device=device, dtype=dtype)
+        self.w = self.n
+
+    def reset(self):
+        self.buf.zero_()
+        self.w = self.n
+
+    def zero_(self):
+        self.reset()
+
+    def push(self, x):
+        if x is None:
+            return
+        if x.dim() > 1:
+            x = x.reshape(-1)
+        k = int(x.shape[0])
+        if k <= 0:
+            return
+        if self.w + k > self.buf.shape[0]:
+            self.buf[: self.n].copy_(self.buf[self.w - self.n : self.w])
+            self.w = self.n
+        self.buf[self.w : self.w + k] = x[:k]
+        self.w += k
+
+    def latest(self, m=None):
+        m = self.n if m is None else int(m)
+        return self.buf[self.w - m : self.w]
+
+
 class FirHighPass:
     """线性相位 FIR 高通（firls 设计，overlap 状态跨块连续）。"""
 

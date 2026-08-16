@@ -48,6 +48,36 @@ def _fill_short_uv(f0, max_gap=3):
     return f0
 
 
+def _fill_short_uv_torch(f0, max_gap=3):
+    """GPU：只填两侧都有浊音、且长度不超过 max_gap 的短洞。"""
+    out = f0.reshape(-1)
+    inf = out.new_full((), 1.0e6)
+    left_val = out.clone()
+    left_dist = torch.where(out > 0, torch.zeros_like(out), inf.expand_as(out))
+    right_val = out.clone()
+    right_dist = left_dist.clone()
+    for _ in range(int(max_gap)):
+        pv = torch.roll(left_val, 1)
+        pd = torch.roll(left_dist, 1)
+        pv[0] = 0
+        pd[0] = inf
+        take = (out <= 0) & (pv > 0) & ((pd + 1) < left_dist)
+        left_val = torch.where(take, pv, left_val)
+        left_dist = torch.where(take, pd + 1, left_dist)
+        nv = torch.roll(right_val, -1)
+        nd = torch.roll(right_dist, -1)
+        nv[-1] = 0
+        nd[-1] = inf
+        take = (out <= 0) & (nv > 0) & ((nd + 1) < right_dist)
+        right_val = torch.where(take, nv, right_val)
+        right_dist = torch.where(take, nd + 1, right_dist)
+    gap = left_dist + right_dist - 1
+    fill = (out <= 0) & (left_dist < inf) & (right_dist < inf) & (gap <= max_gap)
+    w = left_dist / (left_dist + right_dist).clamp(min=1e-6)
+    filled = left_val * (1.0 - w) + right_val * w
+    return torch.where(fill, filled, out)
+
+
 def get_synthesizer(pth_path, device=torch.device("cpu")):
     from infer.module.models import (
         SynthesizerTrnMs256NSFsid,
@@ -141,6 +171,10 @@ class RVC:
             self._index_norm = None
             self._gpu_index_checked = False
             self.index_temp = 0.05  # Softmax 温度：越小越接近硬选择（余弦相似度分布较窄）
+            self._feat_cache = None
+            self._hubert_win = None
+            self._p_len_tensor = None
+            self._sid_tensor = None
 
             self.resample_kernel = {}
 
@@ -179,6 +213,9 @@ class RVC:
             # 不吞异常：加载失败必须让调用方知道，避免半初始化对象后续崩溃
             traceback.print_exc()
             raise
+
+    def reset_feat_cache(self):
+        self._feat_cache = None
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -263,14 +300,58 @@ class RVC:
         raise ValueError(f"F0 method does not support GPU split: {method}")
 
     def _finish_f0(self, pending, f0_up_key):
-        """F0 提取的 CPU 部分：同步取回并解码（在主流等待事件后调用）。"""
+        """F0 解码留在 GPU，避免每块 .cpu()。"""
         hidden, method = pending
         if method == "rmvpe":
-            f0 = self.model_rmvpe.decode_hidden(hidden, thred=0.03)
-            f0 = _fill_short_uv(f0)
-            f0 *= pow(2, f0_up_key / 12)
+            f0 = self.model_rmvpe.decode_torch(hidden, thred=0.03)
+            f0 = _fill_short_uv_torch(f0)
+            f0 = f0 * pow(2, f0_up_key / 12)
             return self.get_f0_post(f0)
         raise ValueError(f"F0 method does not support GPU split: {method}")
+
+    def _feat_dim(self):
+        return 768 if getattr(self, "version", "v2") == "v2" else 256
+
+    def _extract_feats_incremental(self, wav_1d, block_frame_16k):
+        """只跑最近固定窗的 HuBERT，结果拼进滚动缓存。窗长固定以便 CUDA Graph。"""
+        hop = 320
+        overlap = 4
+        cnn_pad = 640
+        new_frames = max(1, int(block_frame_16k) // hop)
+        if self._hubert_win is None:
+            win = (new_frames + overlap) * hop + cnn_pad
+            self._hubert_win = int((win + 159) // 160 * 160)
+        win = int(self._hubert_win)
+        if self.config.is_half:
+            wav = wav_1d.half().view(1, -1)
+        else:
+            wav = wav_1d.float().view(1, -1)
+        full_frames = max(1, wav.shape[1] // hop)
+        tail = wav[:, -min(win, wav.shape[1]):]
+        if tail.shape[1] < win:
+            tail = F.pad(tail, (win - tail.shape[1], 0))
+        new_feats = extract_hubert_features(self.model, tail, self.version)
+        dtype = new_feats.dtype
+        dim = new_feats.shape[-1]
+        if (
+            self._feat_cache is None
+            or self._feat_cache.shape[1] != full_frames
+            or self._feat_cache.shape[2] != dim
+        ):
+            self._feat_cache = torch.zeros(
+                1, full_frames, dim, device=self.device, dtype=dtype
+            )
+        if new_frames < full_frames:
+            shifted = self._feat_cache[:, new_frames:, :]
+        else:
+            shifted = self._feat_cache[:, :0, :]
+        need = full_frames - shifted.shape[1]
+        if new_feats.shape[1] >= need:
+            tail_feats = new_feats[:, -need:, :]
+        else:
+            tail_feats = F.pad(new_feats, (0, 0, need - new_feats.shape[1], 0))
+        self._feat_cache = torch.cat([shifted, tail_feats], dim=1).contiguous()
+        return torch.cat((self._feat_cache, self._feat_cache[:, -1:, :]), 1)
 
     def change_index_rate(self, new_index_rate):
         if new_index_rate != 0 and not hasattr(self, "index"):
@@ -369,21 +450,22 @@ class RVC:
         self.infer_count += 1
         t1 = ttime()
         with torch.no_grad():
-            if self.config.is_half:
-                feats = input_wav.half().view(1, -1)
-            else:
-                feats = input_wav.float().view(1, -1)
-            padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
-            # ── 优化4：F0 提取（GPU 部分）先在辅助流发射，与 HuBERT 并行 ──
+            # ── F0：固定 2560 点窗（160ms@16k），与 HuBERT 并行 ──
             self._f0_pending = None
             self._f0_event = None
+            f0_key = self.f0_up_key - self.formant_shift
             if self.if_f0 == 1:
-                f0_extractor_frame = block_frame_16k + 800
                 if f0method == "rmvpe":
-                    f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
-                f0_tail = input_wav[-min(f0_extractor_frame, input_wav.shape[0]):]
-                f0_key = self.f0_up_key - self.formant_shift
-                if self._f0_stream is not None and f0method in ("rmvpe",):
+                    f0_win = 2560
+                    n = input_wav.shape[0]
+                    if n >= f0_win:
+                        f0_tail = input_wav[-f0_win:]
+                    else:
+                        f0_tail = F.pad(input_wav, (f0_win - n, 0))
+                else:
+                    f0_extractor_frame = block_frame_16k + 800
+                    f0_tail = input_wav[-min(f0_extractor_frame, input_wav.shape[0]):]
+                if self._f0_stream is not None and f0method == "rmvpe":
                     try:
                         with torch.cuda.stream(self._f0_stream):
                             self._f0_stream.wait_stream(torch.cuda.current_stream())
@@ -394,13 +476,12 @@ class RVC:
                         self._f0_pending = None
                 if self._f0_pending is None:
                     pitch, pitchf = self.get_f0(f0_tail, f0_key, f0method)
-            feats = extract_hubert_features(
-                self.model,
-                feats,
-                self.version,
-                padding_mask=padding_mask,
-            )
-            feats = torch.cat((feats, feats[:, -1:, :]), 1)
+            if os.environ.get("RVC_FULL_HUBERT") == "1":
+                src = input_wav.half() if self.config.is_half else input_wav.float()
+                feats = extract_hubert_features(self.model, src.view(1, -1), self.version)
+                feats = torch.cat((feats, feats[:, -1:, :]), 1)
+            else:
+                feats = self._extract_feats_incremental(input_wav, block_frame_16k)
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
@@ -487,9 +568,14 @@ class RVC:
             cache_pitchf = self.cache_pitchf[None, -p_len:] * return_length2 / return_length
         t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
-        feats = feats[:, :p_len, :]
-        p_len_tensor = torch.LongTensor([p_len]).to(self.device)
-        sid = torch.LongTensor([0]).to(self.device)
+        feats = feats[:, :p_len, :].contiguous()
+        if getattr(self, "_p_len_value", None) != p_len:
+            self._p_len_value = p_len
+            self._p_len_tensor = torch.tensor([p_len], device=self.device, dtype=torch.long)
+        if self._sid_tensor is None:
+            self._sid_tensor = torch.tensor([0], device=self.device, dtype=torch.long)
+        p_len_tensor = self._p_len_tensor
+        sid = self._sid_tensor
         skip_head_value = int(skip_head)
         return_length_value = int(return_length)
         return_length2_value = int(return_length2)
