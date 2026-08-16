@@ -20,6 +20,7 @@ xcopy /e /i /q "dist\RVC实时变声" "%PKG%" >nul
 
 echo [3/5] 复制服务端源码与模型资产...
 for %%d in (configs infer i18n tools worker server) do xcopy /e /i /q "%%d" "%SRC%\%%d" >nul
+for /f "delims=" %%d in ('dir /s /b /ad "%SRC%\__pycache__" 2^>nul') do rd /s /q "%%d" 2>nul
 mkdir "%SRC%\assets"
 xcopy /e /i /q "assets\hubert_base" "%SRC%\assets\hubert_base" >nul
 xcopy /e /i /q "assets\rmvpe" "%SRC%\assets\rmvpe" >nul

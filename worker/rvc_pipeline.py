@@ -397,8 +397,10 @@ class RVCPipeline:
         view = block_1d.reshape(-1, 1).expand(-1, self.channels).contiguous()
         pin.copy_(view, non_blocking=True)
         if block_1d.is_cuda:
+            # 只等本次小拷贝（~60ms 音频）完成即可，开销可忽略；
+            # .copy() 让返回数组独立于 pin 槽，杜绝槽位回绕时的别名脏读。
             torch.cuda.current_stream(block_1d.device).synchronize()
-        return pin.numpy()
+        return pin.numpy().copy()
 
     def _apply_sola(self, infer_wav):
         sbf = self._sola_buffer_frame

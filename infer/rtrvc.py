@@ -349,6 +349,12 @@ class RVC:
         if new_feats.shape[1] >= need:
             tail_feats = new_feats[:, -need:, :]
         else:
+            # 兜底：正常不触发（HuBERT 对 win 样本的输出帧数总 ≥ need）。
+            # 真发生说明 CNN 下采样取整异常，留日志便于定位，前端补零只是占位。
+            print(
+                "[rtrvc] HuBERT 输出帧数 %d < need=%d，出现占位补齐"
+                % (new_feats.shape[1], need)
+            )
             tail_feats = F.pad(new_feats, (0, 0, need - new_feats.shape[1], 0))
         self._feat_cache = torch.cat([shifted, tail_feats], dim=1).contiguous()
         return torch.cat((self._feat_cache, self._feat_cache[:, -1:, :]), 1)
