@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""保守裁剪 torch：删除运行时用不到的静态库与惰性加载的 CUDA 组件。
+"""保守裁剪 torch：仅删除运行时用不到的静态库与调试符号（*.lib, *.a, *.pdb）。
 
-删除范围（保守，零风险）：
-- 所有 *.lib / *.a / *.pdb（链接器/调试用，运行时从不加载）
-- cusolverMg64_11.dll（多卡求解器，单卡推理不用）
-- cusparse64_11.dll（稀疏矩阵，本项目不用）
-- nvrtc*（JIT 编译，本项目用 CUDA Graph，不用 JIT）
-
-保留 cusolver64_11.dll（谨慎起见），cuDNN/cuBLAS/cuFFT/curand 全保留。
+注意：
+- 严禁删除任何 DLL（如 nvrtc*.dll、cusolver*.dll、cusparse*.dll 等），
+  PyTorch 在 Windows 下初始化阶段 (_load_dll_libraries) 会强校验并动态链接这些库，
+  误删会导致 [WinError 126] 找不到指定的模块错误。
 
 用法: python tools/trim_torch.py --torch-dir <torch目录> [--dry-run]
 """
@@ -15,8 +12,9 @@ import argparse
 import os
 import sys
 
+# 仅删除纯静态编译/调试文件（不影响任何运行时运行）
 DELETE_EXTS = {".lib", ".a", ".pdb"}
-DELETE_NAME_PREFIXES = ("cusolvermg", "cusparse", "nvrtc")
+DELETE_NAME_PREFIXES = ()
 
 
 def main():
@@ -34,9 +32,13 @@ def main():
         for fn in filenames:
             full = os.path.join(dirpath, fn)
             low = fn.lower()
-            if os.path.splitext(low)[1] not in DELETE_EXTS and not low.startswith(
-                DELETE_NAME_PREFIXES
-            ):
+            ext = os.path.splitext(low)[1]
+            
+            # 判断是否需要删除（仅匹配指定后缀）
+            should_delete = (ext in DELETE_EXTS) or (
+                bool(DELETE_NAME_PREFIXES) and low.startswith(DELETE_NAME_PREFIXES)
+            )
+            if not should_delete:
                 continue
             try:
                 size = os.path.getsize(full)
