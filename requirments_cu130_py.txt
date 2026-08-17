@@ -34,6 +34,7 @@ numpy>=1.26.4,<2
 # ONNX Runtime 1.19.x uses the CUDA 12 / cuDNN 9 provider ABI. Later current
 # releases have moved to CUDA 13, so this compatibility window is intentional.
 onnxruntime-gpu>=1.20.0,<1.21
+onnx>=1.16.0,<2
 coloredlogs>=15.0,<16
 
 opencv-python-headless>=4.10.0,<5

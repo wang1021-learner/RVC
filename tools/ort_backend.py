@@ -21,6 +21,12 @@ def onnx_available():
         return False
 
 
+def onnx_enabled_for_realtime():
+    """实时路径是否用 ONNX：默认关（numpy IO 每块 CPU↔GPU 往返，实时反而加延迟），
+    显式 RVC_ONNX=1 才开，留给后续 IO Binding 方案。"""
+    return os.environ.get("RVC_ONNX") == "1" and onnx_available()
+
+
 def _providers(prefer_trt=True):
     try:
         import onnxruntime as ort
@@ -65,16 +71,86 @@ def create_session(onnx_path, prefer_trt=True):
     try:
         sess = ort.InferenceSession(str(onnx_path), opts, providers=providers)
         logger.info("ONNX loaded %s via %s", onnx_path, sess.get_providers())
+        print("[ORT] ONNX 已加载: %s via %s" % (os.path.basename(str(onnx_path)), sess.get_providers()))
         return sess
-    except Exception:
+    except Exception as e:
         logger.exception("ONNX session failed: %s", onnx_path)
+        print("[ORT] ONNX 加载失败: %s" % e)
         return None
 
 
+_OUT_SHAPE_CACHE = {}
+_IOB_HIT_LOGGED = False
+_IOB_FALLBACK_LOGGED = False
+
+
+def _log_iob_hit():
+    global _IOB_HIT_LOGGED
+    if not _IOB_HIT_LOGGED:
+        _IOB_HIT_LOGGED = True
+        msg = "ONNX IO Binding 生效（零拷贝，全程 GPU）"
+        print("[ORT] " + msg)
+        logger.info(msg)
+
+
+def _log_iob_fallback(reason=""):
+    global _IOB_FALLBACK_LOGGED
+    if not _IOB_FALLBACK_LOGGED:
+        _IOB_FALLBACK_LOGGED = True
+        msg = "ONNX IO Binding 回退 numpy：%s" % (reason or "未知原因")
+        print("[ORT] " + msg)
+        logger.warning(msg)
+
+
 def session_run(sess, feed_numpy):
+    """numpy 路径；顺带缓存输出形状，供 IO Binding 复用。"""
     inp = sess.get_inputs()[0].name
     out = sess.run(None, {inp: feed_numpy})[0]
+    try:
+        _OUT_SHAPE_CACHE[(id(sess), tuple(feed_numpy.shape))] = tuple(out.shape)
+    except Exception:
+        pass
     return out
+
+
+def run_iobinding(sess, torch_tensor):
+    """零拷贝 GPU 推理：输入/输出经 DLPack 绑定，全程不落 CPU。
+
+    返回 torch CUDA tensor；形状未知或任一步失败返回 None（调用方回退 numpy）。
+    """
+    try:
+        import onnxruntime as ort
+        import torch.utils.dlpack as tdl
+        import numpy as np
+    except Exception:
+        return None
+
+    x = torch_tensor.detach().float().contiguous()
+    if not getattr(x, "is_cuda", False):
+        return None
+    device_id = x.get_device()
+
+    out_shape = _OUT_SHAPE_CACHE.get((id(sess), tuple(x.shape)))
+    if out_shape is None:
+        return None  # 首次先走 numpy 学习形状
+
+    try:
+        inp_name = sess.get_inputs()[0].name
+        out_name = sess.get_outputs()[0].name
+        binding = sess.io_binding()
+        ort_in = ort.OrtValue.from_dlpack(tdl.to_dlpack(x))
+        binding.bind_ortvalue_input(inp_name, ort_in)
+        out_ort = ort.OrtValue.ortvalue_from_shape_and_type(
+            list(out_shape), np.float32, "cuda", device_id
+        )
+        binding.bind_ortvalue_output(out_name, out_ort)
+        sess.run_with_iobinding(binding)
+        out_t = tdl.from_dlpack(out_ort.to_dlpack())
+        _log_iob_hit()
+        return out_t.clone()
+    except Exception as e:
+        _log_iob_fallback(str(e))
+        return None
 
 
 def provider_label(sess):

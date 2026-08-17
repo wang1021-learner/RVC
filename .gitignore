@@ -23,3 +23,4 @@ assets/rmvpe/
 assets/hubert_base/*.safetensors
 assets/pretrained_v2/
 *.index
+*.onnx

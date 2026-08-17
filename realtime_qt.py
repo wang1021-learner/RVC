@@ -1609,8 +1609,11 @@ class VCEngine(QObject):
             else:
                 self.agc = None
 
+            # 不能把 self(VCEngine, 主线程对象) 当 parent 传给跨线程创建的 QThread，
+            # 否则 Qt 报「Cannot create children for a parent in a different thread」。
+            # 线程生命周期已由 _hard_stop 的 wait/deleteLater 手动管理，无需 parent。
             self.worker_thread = InferenceWorkerThread(
-                self.pipeline, self.input_queue, self.output_queue, self)
+                self.pipeline, self.input_queue, self.output_queue)
             self.worker_thread.infer_done.connect(self._on_worker_infer_done)
             self.worker_thread.stage_stats.connect(self.stage_stats)
             self.worker_thread.spectrum.connect(self.spectrum)

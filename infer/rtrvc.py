@@ -482,12 +482,13 @@ class RVC:
                         self._f0_pending = None
                 if self._f0_pending is None:
                     pitch, pitchf = self.get_f0(f0_tail, f0_key, f0method)
-            if os.environ.get("RVC_FULL_HUBERT") == "1":
+            # 默认全窗 HuBERT（质量稳、连贯）；RVC_INCREMENTAL_HUBERT=1 才走增量（实验）
+            if os.environ.get("RVC_INCREMENTAL_HUBERT") == "1":
+                feats = self._extract_feats_incremental(input_wav, block_frame_16k)
+            else:
                 src = input_wav.half() if self.config.is_half else input_wav.float()
                 feats = extract_hubert_features(self.model, src.view(1, -1), self.version)
                 feats = torch.cat((feats, feats[:, -1:, :]), 1)
-            else:
-                feats = self._extract_feats_incremental(input_wav, block_frame_16k)
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:

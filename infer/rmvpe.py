@@ -383,29 +383,35 @@ class RMVPE:
             is_half, 128, 16000, 1024, 160, None, 30, 8000
         ).to(device)
         self._ort_sess = None
-        onnx_path = os.path.splitext(model_path)[0] + ".onnx"
-        if not os.path.isfile(onnx_path):
-            try:
-                from infer.export_onnx import export_rmvpe
-                from tools.ort_backend import onnx_available
+        # NVIDIA 默认不走 ONNX（numpy IO 每块 CPU↔GPU 往返，实时反而加延迟）；
+        # DirectML(私有设备) 只能走 ONNX，必须保留导出。RVC_ONNX=1 可强制 NVIDIA 用。
+        need_onnx = "privateuseone" in str(device)
+        if not need_onnx:
+            from tools.ort_backend import onnx_enabled_for_realtime
 
-                if onnx_available():
+            need_onnx = onnx_enabled_for_realtime()
+        if need_onnx:
+            onnx_path = os.path.splitext(model_path)[0] + ".onnx"
+            if not os.path.isfile(onnx_path):
+                try:
+                    from infer.export_onnx import export_rmvpe
+
                     exported = export_rmvpe(model_path)
                     if exported is not None:
                         onnx_path = str(exported)
-            except Exception:
-                logger.exception("RMVPE ONNX export skipped")
-        if os.path.isfile(onnx_path):
-            try:
-                from tools.ort_backend import create_session
+                except Exception:
+                    logger.exception("RMVPE ONNX export skipped")
+            if os.path.isfile(onnx_path):
+                try:
+                    from tools.ort_backend import create_session
 
-                sess = create_session(onnx_path)
-                if sess is not None:
-                    self._ort_sess = sess
-                    self.model = sess
-                    logger.info("RMVPE via ONNX %s", onnx_path)
-            except Exception:
-                logger.exception("RMVPE ONNX load failed")
+                    sess = create_session(onnx_path)
+                    if sess is not None:
+                        self._ort_sess = sess
+                        self.model = sess
+                        logger.info("RMVPE via ONNX %s", onnx_path)
+                except Exception:
+                    logger.exception("RMVPE ONNX load failed")
         if self._ort_sess is None and "privateuseone" in str(device):
             import onnxruntime as ort
 
@@ -446,10 +452,14 @@ class RMVPE:
             if self._ort_sess is not None or "privateuseone" in str(self.device):
                 import numpy as np
 
-                mel_np = mel.detach().float().cpu().numpy() if torch.is_tensor(mel) else mel
-                onnx_input_name = self.model.get_inputs()[0].name
-                hidden = self.model.run(None, {onnx_input_name: mel_np})[0]
-                hidden = torch.from_numpy(np.ascontiguousarray(hidden)).to(self.device)
+                from tools.ort_backend import run_iobinding
+
+                hidden = run_iobinding(self.model, mel) if torch.is_tensor(mel) else None
+                if hidden is None:
+                    mel_np = mel.detach().float().cpu().numpy() if torch.is_tensor(mel) else mel
+                    onnx_input_name = self.model.get_inputs()[0].name
+                    hidden = self.model.run(None, {onnx_input_name: mel_np})[0]
+                    hidden = torch.from_numpy(np.ascontiguousarray(hidden)).to(self.device)
             else:
                 mel = mel.half() if self.is_half else mel.float()
                 hidden = run_cuda_graph(

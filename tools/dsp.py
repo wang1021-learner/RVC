@@ -39,7 +39,7 @@ class DelayLine:
         if k <= 0:
             return
         if self.w + k > self.buf.shape[0]:
-            self.buf[: self.n].copy_(self.buf[self.w - self.n : self.w])
+            self.buf[: self.n].copy_(self.buf[self.w - self.n : self.w].clone())
             self.w = self.n
         self.buf[self.w : self.w + k] = x[:k]
         self.w += k

@@ -8,7 +8,7 @@ from torch import nn
 from transformers import AutoFeatureExtractor, HubertModel
 
 from tools.cuda_graph import run_cuda_graph
-from tools.ort_backend import create_session, onnx_available, onnx_disabled, provider_label, session_run
+from tools.ort_backend import create_session, onnx_enabled_for_realtime, provider_label, run_iobinding, session_run
 
 
 logger = logging.getLogger(__name__)
@@ -45,16 +45,20 @@ class HubertOnnx:
         sess = self.sess_v2 if version == "v2" else self.sess_v1
         if sess is None:
             raise RuntimeError("HuBERT ONNX session missing for %s" % version)
-        arr = source.detach().float().contiguous().cpu().numpy()
-        out = session_run(sess, arr)
-        t = torch.from_numpy(np.ascontiguousarray(out)).to(
-            device=source.device, dtype=source.dtype, non_blocking=False
-        )
-        return t
+        out = run_iobinding(sess, source)
+        if out is None:
+            arr = source.detach().float().contiguous().cpu().numpy()
+            out_np = session_run(sess, arr)
+            out = torch.from_numpy(np.ascontiguousarray(out_np)).to(
+                device=source.device, dtype=source.dtype, non_blocking=False
+            )
+        else:
+            out = out.to(device=source.device, dtype=source.dtype)
+        return out
 
 
 def _try_hubert_onnx(device, is_half):
-    if onnx_disabled():
+    if not onnx_enabled_for_realtime():
         return None
     from infer.export_onnx import HUBERT_ONNX_V1, HUBERT_ONNX_V2, export_hubert
 
@@ -76,6 +80,7 @@ def load_hubert_model(device, is_half=False):
     onnx_model = _try_hubert_onnx(device, is_half)
     if onnx_model is not None and onnx_model.sess_v2 is not None:
         logger.info("HuBERT via %s", onnx_model.backend_label)
+        print("[ORT] HuBERT 走 ONNX (%s)" % onnx_model.backend_label)
         return onnx_model
 
     dtype = torch.float16 if is_half else torch.float32
@@ -96,7 +101,7 @@ def load_hubert_model(device, is_half=False):
         str(HUBERT_MODEL_PATH), **load_options
     )
     model = model.to(device).eval()
-    if onnx_available():
+    if onnx_enabled_for_realtime():
         try:
             from infer.export_onnx import export_hubert
 
@@ -119,6 +124,7 @@ def load_hubert_model(device, is_half=False):
                     model = model.half()
             except Exception:
                 pass
+    print("[ORT] HuBERT 使用 PyTorch（ONNX 未启用或加载失败）")
     return model
 
 
