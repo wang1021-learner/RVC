@@ -5,7 +5,6 @@ RVC 实时变声客户端 (服务器推理模式) 打包配置
 
 体积优化说明（199MB -> ~135MB，配合 UPX 可到 ~85MB）：
 - 移除 opengl32sw.dll（软件 OpenGL 渲染器，桌面 D3D/硬件 GL 已足够）
-- 移除 numpy 附带的 OpenBLAS（本项目只用基础数组运算，不用 linalg）
 - 移除未使用的 Qt 模块（Quick/Qml/Pdf/Network/Svg/OpenGL 等）
 - 未安装 UPX 时 upx=True 自动跳过；安装 UPX 后 DLL 可再压 30~40%
 """
@@ -19,8 +18,6 @@ _DROP_DLLS = {
     "opengl32sw.dll",
     "libegl.dll",
     "libglesv2.dll",
-    # numpy 附带的 BLAS（本项目不做矩阵运算）
-    "libscipy_openblas64_-4bb64bb73b19ae7523581172b5c4a821.dll",
     # 未使用的 Qt 模块
     "qt6quick.dll", "qt6qml.dll", "qt6pdf.dll", "qt6pdfwidgets.dll",
     "qt6quickwidgets.dll", "qt6quickcontrols2.dll", "qt6quicktemplates2.dll",
@@ -36,7 +33,8 @@ _DROP_DLLS = {
 }
 
 # basename 包含这些子串的一律去掉
-_DROP_PATTERNS = ("openblas", "libblas", "liblapack", "libiomp", "libgomp")
+# 注意：不再过滤 openblas —— numpy 2.x 启动时强依赖 OpenBLAS，剔掉会导致 exe 启动崩溃
+_DROP_PATTERNS = ("libblas", "liblapack", "libiomp", "libgomp")
 
 
 def _filter_binaries(binaries):
