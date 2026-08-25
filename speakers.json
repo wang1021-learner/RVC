@@ -181,6 +181,20 @@
       "O_noise_reduce": false,
       "rms_mix_rate": 0.3,
       "threhold": -50
+    },
+    {
+      "name": "shanxi",
+      "model_path": "shanxi.pth",
+      "index_path": "added_IVF1746_Flat_nprobe_1_shanxi_v2.index",
+      "speaker_id": 0,
+      "pitch": 0,
+      "index_rate": 0.4,
+      "formant": 0.0,
+      "f0method": "rmvpe",
+      "I_noise_reduce": false,
+      "O_noise_reduce": false,
+      "rms_mix_rate": 0.3,
+      "threhold": -50
     }
   ]
 }
