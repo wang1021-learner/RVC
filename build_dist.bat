@@ -28,8 +28,10 @@ mkdir "%SRC%\assets\weights"
 copy /y "assets\weights\thchs_female_200e.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\thchs_female_300e.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\thchs_v2_e200_s13200.pth" "%SRC%\assets\weights\" >nul
+copy /y "assets\weights\myvoice.pth" "%SRC%\assets\weights\" >nul
 mkdir "%SRC%\logs\thchs_v2"
 copy /y "logs\thchs_v2\added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index" "%SRC%\logs\thchs_v2\" >nul
+copy /y "logs\thchs_v2\added_IVF314_Flat_nprobe_1_myvoice_v2.index" "%SRC%\logs\thchs_v2\" >nul
 copy /y "requirements_local_cu118.txt" "%SRC%\requirements_local_cu118.txt" >nul
 
 echo [4/5] 复制安装脚本与使用说明...

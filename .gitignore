@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 venv/
+runtime/
 .numba_cache/
 
 # 构建产物 / PyInstaller 打包输出
