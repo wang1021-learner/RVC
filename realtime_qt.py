@@ -471,9 +471,15 @@ class CableWizard(QDialog):
         return box
 
     def refresh(self):
+        parent = self.parent()
+        cache_devs = getattr(parent, "_devs_cache", None) if parent is not None else None
+        cache_apis = getattr(parent, "_apis_cache", None) if parent is not None else None
         try:
-            devs = sd.query_devices()
-            apis = sd.query_hostapis()
+            if cache_devs:
+                devs, apis = cache_devs, cache_apis or []
+            else:
+                devs = sd.query_devices()
+                apis = sd.query_hostapis()
         except Exception as e:
             self.hint.setText("无法读取音频设备: " + str(e))
             self._found = []
@@ -827,13 +833,21 @@ def _friendly_error(e):
     return "未知错误"
 
 
-def _device_fingerprint():
+def _fp_from_devs(devs):
     try:
-        devs = sd.query_devices()
         return tuple(
-            (d["name"], d.get("hostapi", 0), d["max_input_channels"], d["max_output_channels"])
-            for d in devs
+            (d.get("name"), d.get("hostapi", 0),
+             d.get("max_input_channels", 0), d.get("max_output_channels", 0))
+            for d in (devs or [])
         )
+    except Exception:
+        return ()
+
+
+def _device_fingerprint():
+    """仅后台线程调用：UI 线程禁止 query_devices / _terminate。"""
+    try:
+        return _fp_from_devs(sd.query_devices())
     except Exception:
         return ()
 
@@ -1563,6 +1577,12 @@ class EngineStartThread(QThread):
                 self.engine._hard_stop()
             elif self.action == "recover":
                 self.engine._recover_blocking()
+            elif self.action == "monitor":
+                ok, msg = self.engine._open_monitor()
+                if not ok:
+                    self.engine.status_msg.emit("监听开启失败: " + msg)
+                elif msg:
+                    self.engine.status_msg.emit(msg)
         except Exception as e:
             logging.exception("引擎线程失败: %s", self.action)
             if self.action == "start":
@@ -1606,6 +1626,26 @@ class ServerConnectThread(QThread):
             self.done.emit(ok, extra)
         except Exception as e:
             self.done.emit(False, str(e)[:160])
+
+
+class DeviceQueryThread(QThread):
+    """PortAudio 枚举/重启放到后台。sd._terminate 在 UI 上会把窗口卡死。"""
+    got = Signal(object, object, str)  # devs, apis, err
+
+    def __init__(self, reinit=False, parent=None):
+        super().__init__(parent)
+        self.reinit = bool(reinit)
+
+    def run(self):
+        try:
+            # 禁止 _terminate：和正在跑的声卡流抢 PortAudio 会把进程卡死
+            raw_devs = sd.query_devices()
+            raw_apis = sd.query_hostapis()
+            devs = [dict(d) for d in (raw_devs or [])]
+            apis = [dict(a) for a in (raw_apis or [])]
+            self.got.emit(devs, apis, "")
+        except Exception as e:
+            self.got.emit([], [], str(e))
 
 
 # ==============================================================================
@@ -1679,6 +1719,17 @@ class VCEngine(QObject):
         self._stats_timer.setInterval(50)
         self._stats_timer.timeout.connect(self._flush_callback_stats)
         self._stats_timer.start()
+        # 滑条/参数只投递最新值，由后台线程发到管线，UI 绝不占 websocket/Faiss 锁
+        self._live_lock = threading.Lock()
+        self._live_event = threading.Event()
+        self._live_stop = False
+        self._live_pitch = None
+        self._live_index = None
+        self._live_formant = None
+        self._live_cfg = {}
+        self._live_thread = threading.Thread(
+            target=self._live_pump, name="rvc-live-params", daemon=True)
+        self._live_thread.start()
 
     def merged_params(self, speaker=None):
         """全局高级参数 + 指定角色的角色级覆盖（默认当前角色）。"""
@@ -1719,13 +1770,12 @@ class VCEngine(QObject):
                 if s.running:
                     s.status_msg.emit("该参数将在下次启动后生效")
                 return
-            pipe = getattr(s, "pipeline", None)
-            if pipe is None:
-                return
-            if s.mode == "server" and not pipe.is_connected():
-                return
+            if s.mode == "server":
+                pipe = getattr(s, "pipeline", None)
+                if pipe is None or not pipe.is_connected():
+                    return
             try:
-                pipe.configure(**{name: v})
+                s._queue_configure({name: v})
             except Exception:
                 pass
         return property(lambda s: s._params[name], setter)
@@ -1741,18 +1791,93 @@ class VCEngine(QObject):
     vad_enable = _prop("vad_enable")
     vad_threshold = _prop("vad_threshold")
 
+    def _queue_configure(self, kwargs):
+        with self._live_lock:
+            self._live_cfg.update(kwargs)
+        self._live_event.set()
+
     def change_pitch(self, val):
-        if self.pipeline is not None:
-            self.pipeline.change_pitch(val)
+        with self._live_lock:
+            self._live_pitch = int(val)
+        self._live_event.set()
 
     def change_index_rate(self, val):
-        if self.pipeline is not None:
-            self.pipeline.change_index_rate(val)
+        with self._live_lock:
+            self._live_index = float(val)
+        self._live_event.set()
 
     def change_formant(self, val):
         self._formant = float(val)
-        if self.pipeline is not None:
-            self.pipeline.change_formant(val)
+        with self._live_lock:
+            self._live_formant = float(val)
+        self._live_event.set()
+
+    def _live_pump(self):
+        while not self._live_stop:
+            self._live_event.wait(timeout=0.5)
+            if self._live_stop:
+                break
+            if not self._live_event.is_set():
+                continue
+            time.sleep(0.04)
+            with self._live_lock:
+                pitch = self._live_pitch
+                index = self._live_index
+                formant = self._live_formant
+                cfg = dict(self._live_cfg) if self._live_cfg else None
+                self._live_pitch = None
+                self._live_index = None
+                self._live_formant = None
+                self._live_cfg.clear()
+                self._live_event.clear()
+            pipe = getattr(self, "pipeline", None)
+            if pipe is None:
+                continue
+            failed_cfg, failed_pitch, failed_index, failed_formant = None, None, None, None
+            try:
+                if cfg and pipe.configure(**cfg) is False:
+                    failed_cfg = cfg
+                if pitch is not None:
+                    try:
+                        r = pipe.change_pitch(pitch)
+                        if r is False:
+                            failed_pitch = pitch
+                    except Exception:
+                        failed_pitch = pitch
+                if index is not None:
+                    try:
+                        r = pipe.change_index_rate(index)
+                        if r is False:
+                            failed_index = index
+                    except Exception:
+                        failed_index = index
+                if formant is not None:
+                    try:
+                        r = pipe.change_formant(formant)
+                        if r is False:
+                            failed_formant = formant
+                    except Exception:
+                        failed_formant = formant
+            except Exception:
+                pass
+            if failed_cfg or failed_pitch is not None or failed_index is not None or failed_formant is not None:
+                connected = True
+                try:
+                    connected = bool(pipe.is_connected())
+                except Exception:
+                    connected = False
+                if connected:
+                    time.sleep(0.12)
+                    with self._live_lock:
+                        if failed_cfg and not self._live_cfg:
+                            self._live_cfg.update(failed_cfg)
+                        if failed_pitch is not None and self._live_pitch is None:
+                            self._live_pitch = failed_pitch
+                        if failed_index is not None and self._live_index is None:
+                            self._live_index = failed_index
+                        if failed_formant is not None and self._live_formant is None:
+                            self._live_formant = failed_formant
+                        self._live_event.set()
 
     def set_dry_mix(self, val):
         self.dry_mix = float(val)
@@ -1773,9 +1898,11 @@ class VCEngine(QObject):
         self.monitor_device = device
         self.monitor_volume = float(volume)
         if self.running and need_rebuild:
-            ok, msg = self._open_monitor()
-            if not ok:
-                self.status_msg.emit("监听开启失败: " + msg)
+            if self._engine_busy():
+                self.status_msg.emit("正在处理，请稍候...")
+                return
+            self._start_thread = EngineStartThread(self, "monitor", parent=self)
+            self._start_thread.start()
 
     def set_server_url(self, url):
         self.server_url = (url or "").strip() or DEFAULT_SERVER_URL
@@ -1787,31 +1914,30 @@ class VCEngine(QObject):
         self.pipeline = None
         if pipe is None:
             return
-        try:
-            pipe.stop()
-        except Exception:
-            pass
-        if getattr(pipe, "is_remote", False):
+        def _bg(p=pipe):
             try:
-                pipe.disconnect()
+                p.stop()
             except Exception:
                 pass
-        else:
-            try:
-                pipe.unload()
-            except Exception:
-                pass
+            if getattr(p, "is_remote", False):
+                try:
+                    p.disconnect()
+                except Exception:
+                    pass
+            else:
+                try:
+                    p.unload()
+                except Exception:
+                    pass
+        threading.Thread(target=_bg, daemon=True, name="rvc-dispose-pipe").start()
 
     def set_mode(self, mode):
         mode = "local" if mode == "local" else "server"
         if mode == self.mode:
             return
-        if self.running or self.stream is not None:
-            self._emit_stopped = False
-            try:
-                self._hard_stop()
-            finally:
-                self._emit_stopped = True
+        if self.running or self.stream is not None or self._engine_busy():
+            self.request_hard_stop()
+            return
         self._dispose_pipeline()
         self.mode = mode
         self.current_speaker = None
@@ -1890,16 +2016,26 @@ class VCEngine(QObject):
             finally:
                 self._emit_stopped = True
         if self._stop_requested:
+            self._hard_stop()
             return
         if not self._ensure_connected() or not self._ensure_model():
+            if self._stop_requested:
+                self._hard_stop()
+                return
             self.status_msg.emit("无法启动：请先加载角色模型")
             self.load_failed.emit("模型未加载")
             return
         try:
+            if self._stop_requested:
+                self._hard_stop()
+                return
             params = self.merged_params()
             self.pipeline.configure(**params)
             started = self.pipeline.start(**params)
             if started is False:
+                if self._stop_requested:
+                    self._hard_stop()
+                    return
                 raise RuntimeError("推理未能启动")
             if self._stop_requested:
                 self._hard_stop()
@@ -1939,6 +2075,9 @@ class VCEngine(QObject):
             ok, msg = self._open_stream()
             if not ok:
                 self._hard_stop()
+                if self._stop_requested or msg == "已取消":
+                    self.status_msg.emit("已取消启动")
+                    return
                 self.status_msg.emit("启动失败: " + msg)
                 self.load_failed.emit(msg)
                 return
@@ -1955,6 +2094,13 @@ class VCEngine(QObject):
             self.started_ok.emit()
             self.status_msg.emit("实时转换已启动 · " + msg)
         except Exception as e:
+            if self._stop_requested:
+                try:
+                    self._hard_stop()
+                except Exception:
+                    pass
+                self.status_msg.emit("已取消启动")
+                return
             self.status_msg.emit("启动失败: " + str(e))
             self.load_failed.emit(str(e))
 
@@ -1981,6 +2127,8 @@ class VCEngine(QObject):
             latency="low",
         )
         errors = []
+        if self._stop_requested:
+            return False, "已取消"
 
         # 1. 优先探测是否为 ASIO 硬件设备（极低硬件延迟，不使用 WasapiSettings）
         is_asio = False
@@ -2002,6 +2150,9 @@ class VCEngine(QObject):
             except Exception as e:
                 errors.append(e)
 
+        if self._stop_requested:
+            return False, "已取消"
+
         # 2. WASAPI 独占（次低延迟）
         try:
             self.stream = sd.Stream(
@@ -2009,6 +2160,9 @@ class VCEngine(QObject):
             return True, "系统低延迟独占"
         except Exception as e:
             errors.append(e)
+
+        if self._stop_requested:
+            return False, "已取消"
 
         # 3. WASAPI 共享模式
         try:
@@ -2175,7 +2329,13 @@ class VCEngine(QObject):
             action = getattr(self._start_thread, "action", "")
             if action == "stop":
                 return
-            # start/reopen 线程会在关键点看到 _stop_requested
+            # 启动/重连正堵在 websocket recv（最长 60s），必须掐断才能取消
+            if self.mode == "server" and action in ("start", "recover"):
+                try:
+                    if self.pipeline is not None:
+                        self.pipeline.abort()
+                except Exception:
+                    pass
             return
         if not self.running and self.stream is None and self.worker_thread is None:
             return
@@ -2186,8 +2346,6 @@ class VCEngine(QObject):
         t = getattr(self, "_start_thread", None)
         if t is not None and t.isRunning():
             t.wait(timeout_ms)
-        if self.running or self.stream is not None or self.worker_thread is not None:
-            self._hard_stop()
 
     def stop(self):
         if self.running and self.stream is not None and self._fade_out_left <= 0:
@@ -2268,14 +2426,15 @@ class VCEngine(QObject):
         self._close_monitor()
         if self.worker_thread:
             self.worker_thread.running = False
+        # 先停 worker 再掐 socket，避免 abort 触发 need_recover
+        if self.mode == "server" and self.pipeline is not None:
+            try:
+                self.pipeline.abort()
+            except Exception:
+                pass
+        if self.worker_thread:
             if self.worker_thread.isRunning():
-                self.worker_thread.wait(1800)
-            if self.worker_thread.isRunning() and self.mode == "server":
-                try:
-                    self.pipeline.abort()
-                except Exception:
-                    pass
-                self.worker_thread.wait(400)
+                self.worker_thread.wait(500 if self.mode == "server" else 1800)
             if self.pipeline is not None:
                 try:
                     self.pipeline.stop()
@@ -2289,6 +2448,11 @@ class VCEngine(QObject):
             else:
                 self.worker_thread.deleteLater()
             self.worker_thread = None
+        elif self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
         if self._emit_stopped:
             self.stopped_ok.emit()
             self.status_msg.emit("已停止")
@@ -2543,11 +2707,15 @@ class MainWindow(QMainWindow):
         self.engine.stage_stats.connect(self._on_stage_stats)
         self.engine.spectrum.connect(self._on_spectrum)
         self._dark = False
+        self._devs_cache = []
+        self._apis_cache = []
+        self._dev_query_busy = False
+        self._dev_query_restore = False
+        self._dev_query_user = False
         self._build_ui()
         self._apply_theme()
         self._apply_saved_params()
-        self._rd(restore=False)
-        self._restore_devices()
+        self._rd(restore=False, reinit=False)
         self._rl()
         self._set_light(LIGHT_GRAY, "未加载模型")
         self._dev_timer = QTimer(self)
@@ -2642,7 +2810,6 @@ class MainWindow(QMainWindow):
 
     def _cable_wizard(self):
         self.status_bar.showMessage("正在检测虚拟声卡…", 3000)
-        QApplication.processEvents()
         dlg = CableWizard(self, self.ic, self.oc)
         if dlg.exec():
             self._on_device_changed("output")
@@ -3363,17 +3530,11 @@ class MainWindow(QMainWindow):
             self._device_guard = False
 
     def _resolve_selected(self, reinit=False):
-        if reinit:
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
-        try:
-            devs = sd.query_devices()
-            apis = sd.query_hostapis()
-        except Exception as e:
-            return None, None, "无法读取音频设备: " + str(e)
+        # reinit 只走刷新线程，UI 上绝不 sd._terminate
+        devs = getattr(self, "_devs_cache", None) or []
+        apis = getattr(self, "_apis_cache", None) or []
+        if not devs:
+            return None, None, "正在读取音频设备，请稍候再启动"
 
         def find(name, api, ch):
             if not name:
@@ -3407,20 +3568,44 @@ class MainWindow(QMainWindow):
             btn.setEnabled(False)
             btn.setText("刷新中…")
         self.status_bar.showMessage("正在刷新音频设备…", 0)
-        QApplication.processEvents()
-        self._rd()
-        self.status_bar.showMessage("设备列表已更新", 4000)
-        if btn is not None:
-            btn.setEnabled(True)
-            btn.setText("已刷新")
-            QTimer.singleShot(
-                900,
-                lambda: btn.setText("刷新设备") if btn.text() == "已刷新" else None,
-            )
+        self._rd(restore=True, reinit=not getattr(self.engine, "running", False), user=True)
 
-    def _rd(self, restore=True, reinit=True):
-        if getattr(self.engine, "running", False):
+    def _rd(self, restore=True, reinit=True, user=False):
+        if getattr(self, "_dev_query_busy", False):
+            if user:
+                self.status_bar.showMessage("正在刷新音频设备…", 3000)
+            return
+        if getattr(self.engine, "running", False) or self.engine._engine_busy():
             reinit = False
+        self._dev_query_busy = True
+        self._dev_query_restore = restore
+        self._dev_query_user = user
+        t = DeviceQueryThread(reinit=reinit, parent=self)
+        t.got.connect(self._on_devices_queried, Qt.QueuedConnection)
+        t.finished.connect(t.deleteLater)
+        self._dev_query_thread = t
+        t.start()
+
+    def _on_devices_queried(self, devs, apis, err):
+        self._dev_query_busy = False
+        btn = getattr(self, "dev_refresh_btn", None)
+        user = getattr(self, "_dev_query_user", False)
+        self._dev_query_user = False
+        if err:
+            self.status_bar.showMessage("刷新设备失败: " + err, 6000)
+            if btn is not None:
+                btn.setEnabled(True)
+                btn.setText("刷新设备")
+            return
+        fp = _fp_from_devs(devs)
+        same = bool(fp) and fp == getattr(self, "_dev_fp", ())
+        self._devs_cache = devs
+        self._apis_cache = apis
+        if same and not user and self.ic.count() > 1:
+            if btn is not None and not btn.isEnabled():
+                btn.setEnabled(True)
+                btn.setText("刷新设备")
+            return
         in_name, in_api = self.ic.currentDeviceName(), self.ic.currentDeviceApi()
         out_name, out_api = self.oc.currentDeviceName(), self.oc.currentDeviceApi()
         mon_name, mon_api = self.mc.currentDeviceName(), self.mc.currentDeviceApi()
@@ -3428,19 +3613,16 @@ class MainWindow(QMainWindow):
         self.oc.blockSignals(True)
         self.mc.blockSignals(True)
         try:
-            if reinit:
-                sd._terminate()
-                sd._initialize()
-            devs = sd.query_devices()
-            apis = sd.query_hostapis()
             self.ic.populate(devs, apis, "max_input_channels")
             self.oc.populate(devs, apis, "max_output_channels")
             self.mc.populate(devs, apis, "max_output_channels")
-            if restore:
+            if getattr(self, "_dev_query_restore", True):
                 self.ic.selectByNameApi(in_name, in_api)
                 self.oc.selectByNameApi(out_name, out_api)
                 self.mc.selectByNameApi(mon_name, mon_api)
-            self._dev_fp = _device_fingerprint()
+            else:
+                self._restore_devices()
+            self._dev_fp = fp
         except Exception as e:
             print("Refresh devices error:", e)
             self.status_bar.showMessage("刷新设备失败: " + str(e), 6000)
@@ -3448,21 +3630,34 @@ class MainWindow(QMainWindow):
             self.ic.blockSignals(False)
             self.oc.blockSignals(False)
             self.mc.blockSignals(False)
-        if restore:
+        if getattr(self, "_dev_query_restore", True):
             self._apply_monitor()
+        if user:
+            self.status_bar.showMessage("设备列表已更新", 4000)
+            if btn is not None:
+                btn.setEnabled(True)
+                btn.setText("已刷新")
+                QTimer.singleShot(
+                    900,
+                    lambda: btn.setText("刷新设备") if btn.text() == "已刷新" else None,
+                )
+        elif btn is not None and not btn.isEnabled():
+            btn.setEnabled(True)
+            btn.setText("刷新设备")
+        if self.engine.running:
+            _in, _out, lost = self._resolve_selected(reinit=False)
+            if lost and "正在读取" not in lost:
+                self.engine.request_hard_stop()
+                self._show_dev_hint("音频设备已断开: " + lost)
+                self.status_bar.showMessage("音频设备已断开: " + lost, 8000)
 
     def _poll_devices(self):
-        fp = _device_fingerprint()
-        if not fp or fp == self._dev_fp:
+        if getattr(self, "_dev_query_busy", False):
             return
-        self._rd(restore=True, reinit=False)
-        if not self.engine.running:
+        # 变声时不要从另一线程碰 PortAudio，Windows 上会把声卡回调卡死
+        if getattr(self.engine, "running", False) or self.engine._engine_busy():
             return
-        _in, _out, err = self._resolve_selected(reinit=False)
-        if err:
-            self.engine.request_hard_stop()
-            self._show_dev_hint("音频设备已断开: " + err)
-            self.status_bar.showMessage("音频设备已断开: " + err, 8000)
+        self._rd(restore=True, reinit=False, user=False)
 
     def _preferred_speaker_index(self):
         saved = self._settings.get("speaker") or ""
@@ -3515,7 +3710,7 @@ class MainWindow(QMainWindow):
             self.sb.setEnabled(True)
             self._show_loaded_paths(s)
             return
-        if self.engine.running:
+        if self.engine.running or self.engine._engine_busy():
             self._pending_speaker = s
             self._pending_after_stop = "load"
             self._set_light(LIGHT_YELLOW, "正在停止以便换角色...")
@@ -3546,6 +3741,12 @@ class MainWindow(QMainWindow):
             self._loaders.append(self._loader)   # 防 GC，不删
             if len(self._loaders) > 3:
                 self._loaders.pop(0)
+            # 旧加载正占用 websocket 最长 60s，不掐断则新加载会报「服务器正忙」
+            if self.engine.mode == "server":
+                try:
+                    self.engine.pipeline.abort()
+                except Exception:
+                    pass
         self._load_gen += 1
         self._load_started = time.time()
         self._load_log_offset = self._server_log_size()
@@ -3838,7 +4039,10 @@ class MainWindow(QMainWindow):
             self.engine.stop()
             return
         if self.engine._engine_busy():
-            self.status_bar.showMessage("正在处理，请稍候...", 3000)
+            self.engine.request_hard_stop()
+            self.sb.setEnabled(True)
+            self.sb.setText("正在取消…")
+            self.status_bar.showMessage("正在取消…", 3000)
             return
         if not self._guard_local_infer():
             return
@@ -3852,9 +4056,9 @@ class MainWindow(QMainWindow):
             return
         self.engine.input_device = in_id
         self.engine.output_device = out_id
-        # 启动全程异步：按钮立即反馈"启动中"，后台完成后由信号切回
-        self.sb.setEnabled(False)
-        self.sb.setText("启动中…")
+        # 启动全程异步；按钮保持可点，用来取消
+        self.sb.setEnabled(True)
+        self.sb.setText("取消启动")
         self._set_light(LIGHT_YELLOW, "启动中…")
         self.engine.start()
         self._persist_settings()
@@ -3887,24 +4091,29 @@ class MainWindow(QMainWindow):
             self._rl()
 
     def closeEvent(self, e):
-        self._persist_settings()
+        self._persist_settings(immediate=True)
+        self.engine._live_stop = True
+        self.engine._live_event.set()
         if hasattr(self, "_loader") and self._loader is not None and self._loader.isRunning():
             try:
                 self._loader.quit()
-                if not self._loader.wait(1500):
-                    t = self._loader
-                    t.finished.connect(lambda: t.deleteLater())
-                    if not hasattr(self, "_zombie_loaders"):
-                        self._zombie_loaders = []
-                    self._zombie_loaders.append(t)
             except Exception:
                 pass
         self.engine._stop_requested = True
-        if self.engine.running or self.engine._engine_busy():
-            self.engine.request_hard_stop()
-            self.engine.wait_idle(2000)
-        # 冻结版：退出时回收本机子进程推理服务
         pipe = getattr(self.engine, "pipeline", None)
+        try:
+            if pipe is not None and getattr(pipe, "abort", None) is not None:
+                pipe.abort()
+        except Exception:
+            pass
+        self.hide()
+        if getattr(self, "tray", None) is not None:
+            try:
+                self.tray.hide()
+            except Exception:
+                pass
+        self.engine.request_hard_stop()
+        self.engine.wait_idle(400)
         if pipe is not None and getattr(pipe, "stop_server", None) is not None:
             try:
                 pipe.stop_server()
@@ -3944,9 +4153,8 @@ class MainWindow(QMainWindow):
         s = self.engine.current_speaker
         if s is not None:
             s.pitch = int(val)
-            self.speaker_mgr.save()
             self.cur_info.setText(f"音高 {s.pitch:+d}  检索 {s.index_rate:.1f}")
-        self._persist_settings()
+        self._persist_settings(save_speakers=s is not None)
 
     def _on_live_index(self, val):
         if self._live_guard:
@@ -3955,9 +4163,8 @@ class MainWindow(QMainWindow):
         s = self.engine.current_speaker
         if s is not None:
             s.index_rate = float(val)
-            self.speaker_mgr.save()
             self.cur_info.setText(f"音高 {s.pitch:+d}  检索 {s.index_rate:.1f}")
-        self._persist_settings()
+        self._persist_settings(save_speakers=s is not None)
 
     def _on_live_formant(self, val):
         if self._live_guard:
@@ -3983,7 +4190,6 @@ class MainWindow(QMainWindow):
         self.calib_noise_btn.setEnabled(False)
         self.calib_noise_btn.setText("测定中…")
         self.status_bar.showMessage("请保持安静 1 秒，正在测定麦克风环境底噪…", 0)
-        QApplication.processEvents()
 
         class CalibNoiseThread(QThread):
             calib_done = Signal(object, str)
@@ -4114,7 +4320,9 @@ class MainWindow(QMainWindow):
         if not name:
             return None
         try:
-            devs = sd.query_devices()
+            devs = getattr(self, "_devs_cache", None) or []
+            if not devs:
+                return None
         except Exception:
             return None
         for i, d in enumerate(devs):
@@ -4261,7 +4469,7 @@ class MainWindow(QMainWindow):
         if self.engine.mode == mode:
             self._sync_mode_ui()
             return
-        if self.engine.running:
+        if self.engine.running or self.engine._engine_busy():
             self._pending_mode = mode
             self._pending_after_stop = "mode"
             self.engine.request_hard_stop()
@@ -4417,7 +4625,6 @@ class MainWindow(QMainWindow):
             return
         self.local_install_btn.setEnabled(False)
         self.local_install_btn.setText("正在打开…")
-        QApplication.processEvents()
         try:
             subprocess.Popen(
                 ["cmd", "/c", "start", "RVC 本地推理安装", str(bat)],
@@ -4507,7 +4714,25 @@ class MainWindow(QMainWindow):
         self.mc.blockSignals(False)
         self._apply_monitor()
 
-    def _persist_settings(self):
+    def _persist_settings(self, immediate=False, save_speakers=False):
+        if save_speakers:
+            self._persist_speakers_needed = True
+        if not immediate:
+            t = getattr(self, "_persist_timer", None)
+            if t is None:
+                t = QTimer(self)
+                t.setSingleShot(True)
+                t.setInterval(400)
+                t.timeout.connect(lambda: self._persist_settings(immediate=True))
+                self._persist_timer = t
+            t.start()
+            return
+        if getattr(self, "_persist_speakers_needed", False):
+            self._persist_speakers_needed = False
+            try:
+                self.speaker_mgr.save()
+            except Exception:
+                pass
         data = dict(self._settings)
         if hasattr(self, "server_edit"):
             data["server_url"] = self.server_edit.text().strip() or DEFAULT_SERVER_URL

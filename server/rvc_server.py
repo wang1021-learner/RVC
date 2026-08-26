@@ -94,6 +94,10 @@ def _list_indices():
     return sorted(set(found))
 
 
+def _list_models_payload():
+    return _list_pth(), _list_indices()
+
+
 class RVCServer:
     """WebSocket 服务器，管理多个客户端连接和模型切换"""
 
@@ -176,6 +180,7 @@ class RVCServer:
                     self.pipeline.change_pitch(pitch)
                     self.pipeline.change_index_rate(float(index_rate))
                     self.pipeline.change_formant(formant)
+                    self._apply_infer_params(cmd)
                 else:
                     if self.pipeline.is_active:
                         self.pipeline.stop()
@@ -186,8 +191,9 @@ class RVCServer:
                     if not ok:
                         return {"error": "模型加载失败"}
                     self.pipeline.change_formant(formant)
-                self._apply_infer_params(cmd)
-                self.pipeline.start()
+                    self._apply_infer_params(cmd)
+                    # 换模型只加载权重。CUDA 预热留给客户端点「启动」，
+                    # 否则每次切角色都卡 10–20 秒。
                 files = _file_info(self.pipeline)
                 print(
                     f"[*] 模型加载完成, sr={self.pipeline.samplerate}"
@@ -199,41 +205,47 @@ class RVCServer:
                     "status": "ok",
                     "samplerate": self.pipeline.samplerate,
                     "channels": self.pipeline.channels,
-                    "block_size": self.pipeline._block_frame,
+                    "block_size": getattr(self.pipeline, "_block_frame", None),
+                    "active": bool(self.pipeline.is_active),
                     **files,
                 }
             await websocket.send(json.dumps(await self._on_infer_thread(_load)))
         elif action == "configure":
-            # 客户端 Fire-and-Forget：不回包，避免客户端等待与响应残留
-            await self._on_infer_thread(self._apply_infer_params, cmd)
-            print("[*] 参数已更新")
+            # 只改字段，绝不进推理线程：否则滑条指令会排在 CUDA 后面，
+            # 收包循环卡住，客户端 recv 超时 → 重连 → 看起来像卡死。
+            self._apply_infer_params(cmd)
         elif action == "set_live":
-            def _live():
-                if self.pipeline.rvc is None:
-                    return
+            rvc = getattr(self.pipeline, "rvc", None)
+            if rvc is not None:
                 if "pitch" in cmd:
                     self.pipeline.change_pitch(cmd["pitch"])
-                if "index_rate" in cmd:
-                    self.pipeline.change_index_rate(float(cmd["index_rate"]))
                 if "formant" in cmd:
-                    self.pipeline.change_formant(float(cmd["formant"]))
-            await self._on_infer_thread(_live)
+                    self.pipeline.change_formant(cmd["formant"])
+                if "index_rate" in cmd:
+                    rate = float(cmd["index_rate"])
+                    # 首次打开索引会读盘，丢进推理线程，别卡住收包循环
+                    if rate != 0 and not hasattr(rvc, "index"):
+                        self._pool.submit(self.pipeline.change_index_rate, rate)
+                    else:
+                        self.pipeline.change_index_rate(rate)
         elif action == "list_models":
+            loop = asyncio.get_running_loop()
+            models, indices = await loop.run_in_executor(None, _list_models_payload)
             await websocket.send(json.dumps({
                 "status": "ok",
-                "models": _list_pth(),
-                "indices": _list_indices(),
+                "models": models,
+                "indices": indices,
             }))
         elif action == "list_indices":
+            loop = asyncio.get_running_loop()
+            _, indices = await loop.run_in_executor(None, _list_models_payload)
             await websocket.send(json.dumps({
                 "status": "ok",
-                "indices": _list_indices(),
+                "indices": indices,
             }))
         elif action == "stop":
-            def _stop():
-                if self.pipeline.is_active:
-                    self.pipeline.stop()
-            await self._on_infer_thread(_stop)
+            # 只清 active 标志，当前这块推理跑完即停；不要排队等 GPU
+            self.pipeline.stop()
             await websocket.send(json.dumps({"status": "stopped"}))
             print("[*] 推理已停止")
         elif action == "ping":

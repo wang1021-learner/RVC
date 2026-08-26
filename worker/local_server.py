@@ -164,9 +164,12 @@ class LocalServerPipeline(RVCClient):
             except Exception:
                 pass
             try:
-                self._proc.wait(timeout=3)
+                self._proc.wait(timeout=0.4)
             except Exception:
-                pass
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
         self._proc = None
         self._owns_process = False
         if self._log_fh is not None:

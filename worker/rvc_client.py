@@ -209,9 +209,10 @@ class RVCClient:
                 return False
             self.samplerate = resp.get("samplerate", 48000)
             self.channels = resp.get("channels", 1)
-            self._block_frame = resp.get("block_size", 256)
+            if resp.get("block_size"):
+                self._block_frame = resp.get("block_size", 256)
             self._model_loaded = True
-            self._active = True   # 服务器 load 完成后会自动 start
+            self._active = bool(resp.get("active", False))
             self._apply_loaded_files(resp)
             self.last_error = ""
             self._on_status(self._loaded_status_text(self.samplerate))
@@ -258,14 +259,40 @@ class RVCClient:
             return False
 
     def abort(self):
-        """强制中断阻塞中的 recv/send（停止时调用，避免 UI 卡死）
-        模型状态保留（服务器上模型还在），重连时由 connect() 状态同步确认"""
+        """立刻掐断连接。不要走 ws.close()：默认还要等 3 秒握手，界面会卡死。
+        模型仍留在服务器，下次 connect() 用 status 同步。"""
         ws = self._ws
         self._ws = None
-        if ws:
-            try: ws.close()
-            except Exception: pass
         self._connected = False
+        self._active = False
+        if ws is None:
+            return
+        sock = getattr(ws, "sock", None)
+        try:
+            if sock is not None:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    sock.settimeout(0.05)
+                except Exception:
+                    pass
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            else:
+                try:
+                    ws.close(timeout=0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            ws.connected = False
+        except Exception:
+            pass
 
     def stop(self):
         """停止推理（模型保留在服务器，is_loaded 不变）
@@ -371,15 +398,18 @@ class RVCClient:
 
         服务端对 configure 不再回包（与 set_live 一致），
         因此不存在残留响应污染后续请求的问题。
+        不改 socket timeout：settimeout 会打断正在 recv 的音频线程。
         """
+        return self._send_json({"action": "configure", **kwargs}, wait=0.5)
+
+    def _send_json(self, cmd, wait=0.05):
         if not self._ws or not self._connected:
             return False
-        if not self._send_lock.acquire(timeout=0.2):
+        if not self._send_lock.acquire(timeout=wait):
             return False
         try:
-            cmd = {"action": "configure"}
-            cmd.update(kwargs)
-            self._ws.settimeout(0.4)
+            if not self._ws or not self._connected:
+                return False
             self._ws.send(json.dumps(cmd))
             return True
         except Exception:
@@ -440,29 +470,18 @@ class RVCClient:
                 pass
 
     def _send_live(self, **fields):
-        if not self._ws or not self._connected:
-            return False
-        if not self._send_lock.acquire(timeout=0.2):
-            return False
-        try:
-            cmd = {"action": "set_live"}
-            cmd.update(fields)
-            self._ws.settimeout(0.4)
-            self._ws.send(json.dumps(cmd))
-            return True
-        except Exception:
-            return False
-        finally:
-            self._send_lock.release()
+        cmd = {"action": "set_live"}
+        cmd.update(fields)
+        return self._send_json(cmd, wait=0.05)
 
     def change_pitch(self, val):
-        self._send_live(pitch=int(val))
+        return self._send_live(pitch=int(val))
 
     def change_index_rate(self, val):
-        self._send_live(index_rate=float(val))
+        return self._send_live(index_rate=float(val))
 
     def change_formant(self, val):
-        self._send_live(formant=float(val))
+        return self._send_live(formant=float(val))
 
     def set_server_url(self, url):
         url = (url or "").strip()
