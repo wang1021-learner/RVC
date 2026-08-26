@@ -48,6 +48,35 @@ def runtime_installed():
     return runtime_python().is_file()
 
 
+def pack_mode():
+    """打包类型：source / server（瘦客户端）/ standalone（单机版）。"""
+    if not is_frozen():
+        return "source"
+    marker = package_root() / "pack_mode.txt"
+    try:
+        if marker.is_file():
+            text = marker.read_text(encoding="utf-8", errors="ignore").strip().lower()
+            if text in ("server", "standalone"):
+                return text
+            if text == "local":
+                return "standalone"
+    except Exception:
+        pass
+    bat = package_root() / "install_local.bat"
+    script = source_dir() / "server" / "rvc_server.py"
+    if bat.is_file() or script.is_file():
+        return "standalone"
+    return "server"
+
+
+def local_infer_ready():
+    """冻结版必须同时具备 runtime Python 和 source 里的推理服务。"""
+    if not is_frozen():
+        return True
+    script = source_dir() / "server" / "rvc_server.py"
+    return runtime_installed() and script.is_file()
+
+
 def port_in_use(port, host="127.0.0.1"):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -83,8 +112,11 @@ class LocalServerPipeline(RVCClient):
         """
         if self._connected or port_in_use(DEFAULT_LOCAL_PORT):
             return True
-        if not runtime_installed():
-            self._on_status("本地推理未安装：请先点击「安装本地推理」")
+        if not local_infer_ready():
+            if pack_mode() == "server":
+                self._on_status("本包为服务器客户端，不能本地推理，请连接远程服务器")
+            else:
+                self._on_status("本地推理未安装：请先点击「安装本地推理」")
             return False
         py = runtime_python()
         src = source_dir()

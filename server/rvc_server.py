@@ -1,18 +1,26 @@
 """
 RVC 推理服务器 — 通过 WebSocket 接收音频帧，调用 RVCPipeline 推理，返回结果
 
-启动: python server/rvc_server.py --port 8765
+启动:
+  python server/rvc_server.py --host 0.0.0.0 --port 8765
+  Windows: start_server.bat
 依赖: websockets, numpy, torch (GPU 推理用)
 """
 
-import asyncio, json, struct, time, argparse, traceback, sys
+import asyncio, json, struct, argparse, traceback, sys, socket, os
 import concurrent.futures
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# --cpu 必须在 import pipeline / Config 之前生效
+if "--cpu" in sys.argv:
+    os.environ["RVC_FORCE_CPU"] = "1"
+
 import numpy as np
 import websockets
 
 from worker.rvc_pipeline import RVCPipeline
+
+ROOT = Path(__file__).resolve().parent.parent
 
 INFER_KEYS = (
     "block_time", "crossfade_time", "extra_time", "f0method",
@@ -25,6 +33,65 @@ INFER_KEYS = (
 
 def _basename(path):
     return Path(str(path or "")).name
+
+
+def _file_info(pipeline):
+    info = pipeline.loaded_file_info() if hasattr(pipeline, "loaded_file_info") else {}
+    pth = info.get("model_path") or ""
+    idx = info.get("index_path") or ""
+    return {
+        "model": _basename(pth),
+        "model_path": pth,
+        "index_path": idx,
+        "index_loaded": bool(info.get("index_loaded")),
+    }
+
+
+def _gpu_name():
+    if os.environ.get("RVC_FORCE_CPU") == "1":
+        return "CPU"
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return "CPU"
+
+
+def _lan_urls(port):
+    urls = [f"ws://127.0.0.1:{port}"]
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith("127."):
+                u = f"ws://{ip}:{port}"
+                if u not in urls:
+                    urls.append(u)
+    except Exception:
+        pass
+    return urls
+
+
+def _list_pth():
+    weights = ROOT / "assets" / "weights"
+    if not weights.is_dir():
+        return []
+    return sorted(f.name for f in weights.iterdir() if f.is_file() and f.suffix.lower() == ".pth")
+
+
+def _list_indices():
+    found = []
+    logs = ROOT / "logs"
+    if logs.is_dir():
+        for p in logs.rglob("*.index"):
+            found.append(p.name)
+    extra = ROOT / "assets" / "indices"
+    if extra.is_dir():
+        for p in extra.glob("*.index"):
+            found.append(p.name)
+    return sorted(set(found))
 
 
 class RVCServer:
@@ -121,12 +188,19 @@ class RVCServer:
                     self.pipeline.change_formant(formant)
                 self._apply_infer_params(cmd)
                 self.pipeline.start()
-                print(f"[*] 模型加载完成, sr={self.pipeline.samplerate}")
+                files = _file_info(self.pipeline)
+                print(
+                    f"[*] 模型加载完成, sr={self.pipeline.samplerate}"
+                    f" pth={files.get('model_path') or '-'}"
+                    f" index={files.get('index_path') or '无'}"
+                    f" index_loaded={files.get('index_loaded')}"
+                )
                 return {
                     "status": "ok",
                     "samplerate": self.pipeline.samplerate,
                     "channels": self.pipeline.channels,
                     "block_size": self.pipeline._block_frame,
+                    **files,
                 }
             await websocket.send(json.dumps(await self._on_infer_thread(_load)))
         elif action == "configure":
@@ -145,16 +219,16 @@ class RVCServer:
                     self.pipeline.change_formant(float(cmd["formant"]))
             await self._on_infer_thread(_live)
         elif action == "list_models":
-            # 列出服务器模型目录下的 .pth 文件（客户端添加角色时选择用）
-            weights_dir = Path(__file__).resolve().parent.parent / "assets" / "weights"
-            try:
-                models = sorted(
-                    f.name for f in weights_dir.iterdir()
-                    if f.is_file() and f.name.lower().endswith(".pth")
-                ) if weights_dir.is_dir() else []
-            except Exception:
-                models = []
-            await websocket.send(json.dumps({"status": "ok", "models": models}))
+            await websocket.send(json.dumps({
+                "status": "ok",
+                "models": _list_pth(),
+                "indices": _list_indices(),
+            }))
+        elif action == "list_indices":
+            await websocket.send(json.dumps({
+                "status": "ok",
+                "indices": _list_indices(),
+            }))
         elif action == "stop":
             def _stop():
                 if self.pipeline.is_active:
@@ -165,10 +239,14 @@ class RVCServer:
         elif action == "ping":
             await websocket.send(json.dumps({"status": "pong"}))
         elif action == "status":
+            files = _file_info(self.pipeline)
             await websocket.send(json.dumps({
                 "loaded": self.pipeline.is_loaded,
                 "active": self.pipeline.is_active,
                 "samplerate": self.pipeline.tgt_sr,
+                "block_size": getattr(self.pipeline, "_block_frame", None),
+                "gpu": _gpu_name(),
+                **files,
             }))
 
     def _parse_audio(self, data: bytes):
@@ -224,16 +302,38 @@ class RVCServer:
 
     async def start(self):
         print(f"RVC Server 启动: ws://{self.host}:{self.port}")
-        async with websockets.serve(self.handle, self.host, self.port,
-                                     max_size=2**24,  # 16MB 消息上限
-                                     ping_interval=30,
-                                     ping_timeout=10):
-            await asyncio.Future()  # 永久运行
+        print("GPU:", _gpu_name())
+        print("客户端可填:")
+        for u in _lan_urls(self.port):
+            print("  ", u)
+        print("模型:", ", ".join(_list_pth()[:8]) or "(assets/weights 为空)")
+
+        async def _handler(websocket, path=None):
+            await self.handle(websocket)
+
+        async with websockets.serve(
+            _handler,
+            self.host,
+            self.port,
+            max_size=2 ** 24,
+            ping_interval=20,
+            ping_timeout=20,
+        ):
+            await asyncio.Future()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RVC 推理服务器")
-    parser.add_argument("--host", default="127.0.0.1", help="监听地址 (默认 127.0.0.1 本地回环，局域网共享请输入 0.0.0.0)")
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="监听地址。局域网请用 0.0.0.0（默认）；仅本机用 127.0.0.1",
+    )
     parser.add_argument("--port", type=int, default=8765, help="监听端口")
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="强制 CPU 推理（无独显的服务器请加这个）",
+    )
     args = parser.parse_args()
     asyncio.run(RVCServer(args.host, args.port).start())

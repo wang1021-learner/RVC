@@ -20,6 +20,7 @@ datas = [
     (p('assets', 'hubert_base'), 'assets/hubert_base'),
     (p('assets', 'rmvpe'), 'assets/rmvpe'),
     (p('assets', 'weights'), 'assets/weights'),
+    (p('assets', 'icons'), 'assets/icons'),
 ]
 index_file = p('logs', 'thchs_v2', 'added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index')
 if os.path.isfile(index_file):
@@ -73,6 +74,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,
+    icon=p('assets', 'icons', 'app.ico'),
 )
 
 coll = COLLECT(

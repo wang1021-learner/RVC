@@ -37,6 +37,11 @@ class RVCClient:
         self.samplerate = 48000
         self.channels = 1
         self._block_frame = 256    # 默认，连接后更新
+        self.loaded_model_path = ""
+        self.loaded_index_path = ""
+        self.index_loaded = False
+        self.gpu_name = ""
+        self.last_error = ""
 
     @property
     def is_loaded(self) -> bool:
@@ -54,8 +59,37 @@ class RVCClient:
         return True
 
     @property
+    def is_network(self):
+        return True
+
+    @property
+    def last_stage_ms(self):
+        return {}
+
+    @property
     def tgt_sr(self) -> int:
         return self.samplerate
+
+    def _acquire_io(self, timeout):
+        """带超时抢发送/接收锁，避免界面线程和音频线程互相死等。"""
+        t0 = time.time()
+        if not self._send_lock.acquire(timeout=timeout):
+            return False
+        remain = timeout - (time.time() - t0)
+        if remain <= 0 or not self._recv_lock.acquire(timeout=max(0.05, remain)):
+            self._send_lock.release()
+            return False
+        return True
+
+    def _release_io(self):
+        try:
+            self._recv_lock.release()
+        except Exception:
+            pass
+        try:
+            self._send_lock.release()
+        except Exception:
+            pass
 
     def connect(self, timeout=5):
         """建立 WebSocket 连接（已连接则直接返回）"""
@@ -67,36 +101,72 @@ class RVCClient:
             self._on_status(f"已连接服务器: {self.server_url}")
             # 查询服务器模型状态，同步本地标志（防服务器重启后状态错乱）
             try:
-                with self._send_lock, self._recv_lock:
-                    self._ws.settimeout(5.0)
+                if not self._acquire_io(min(3.0, float(timeout))):
+                    return True
+                try:
+                    self._ws.settimeout(min(5.0, float(timeout)))
                     self._ws.send(json.dumps({"action": "status"}))
                     resp = json.loads(self._ws.recv())
-                    self._model_loaded = bool(resp.get("loaded", False))
-                    self._active = bool(resp.get("active", False))
-                    if resp.get("samplerate"):
-                        self.samplerate = resp["samplerate"]
-                    self._on_status("服务器模型就绪" if self._model_loaded else "服务器无模型")
+                finally:
+                    self._release_io()
+                self._model_loaded = bool(resp.get("loaded", False))
+                self._active = bool(resp.get("active", False))
+                if resp.get("samplerate"):
+                    self.samplerate = resp["samplerate"]
+                if resp.get("gpu"):
+                    self.gpu_name = resp.get("gpu") or ""
+                self._apply_loaded_files(resp)
+                if self._model_loaded:
+                    self._on_status(self._loaded_status_text(self.samplerate))
+                else:
+                    self._on_status("服务器无模型")
             except Exception:
                 self._model_loaded = False
                 self._drain()
             return True
         except Exception as e:
+            self._connected = False
+            self._ws = None
+            self.last_error = str(e)
             self._on_status(f"连接失败: {e}")
             return False
 
+    def _apply_loaded_files(self, resp):
+        if not isinstance(resp, dict):
+            return
+        if "model_path" in resp:
+            self.loaded_model_path = resp.get("model_path") or ""
+        if "index_path" in resp:
+            self.loaded_index_path = resp.get("index_path") or ""
+        if "index_loaded" in resp:
+            self.index_loaded = bool(resp.get("index_loaded"))
+        elif self.loaded_index_path:
+            self.index_loaded = True
+
+    def loaded_file_info(self):
+        return {
+            "model_path": self.loaded_model_path,
+            "index_path": self.loaded_index_path,
+            "index_loaded": bool(self.index_loaded),
+        }
+
+    def _loaded_status_text(self, sr=None):
+        pth = self.loaded_model_path or ""
+        idx = self.loaded_index_path or ""
+        bits = []
+        if sr:
+            bits.append(f"sr={sr}")
+        bits.append(pth or "模型路径未知")
+        if idx:
+            bits.append("索引 " + idx + ("" if self.index_loaded else "（未启用）"))
+        else:
+            bits.append("无索引")
+        return "模型已加载 " + " | ".join(bits)
+
     def disconnect(self):
-        """断开连接"""
-        if self._ws:
-            try:
-                with self._send_lock:
-                    self._ws.send(json.dumps({"action": "stop"}))
-            except Exception:
-                pass
-            with self._send_lock, self._recv_lock:
-                try: self._ws.close()
-                except Exception: pass
-                self._ws = None
-        self._connected = False
+        """断开连接。不阻塞等锁，避免界面卡死。"""
+        self._active = False
+        self.abort()
 
     def load_speaker(self, model_path: str, index_path: str = "",
                      pitch: int = 0, index_rate: float = 0.0,
@@ -123,11 +193,18 @@ class RVCClient:
         }
         self._on_status("正在加载模型...")
         try:
-            with self._send_lock, self._recv_lock:
+            if not self._acquire_io(8.0):
+                self.last_error = "服务器正忙"
+                self._on_status("加载失败: 服务器正忙")
+                return False
+            try:
                 self._ws.settimeout(60.0)   # 模型加载可能 30s+
                 self._ws.send(json.dumps(cmd))
                 resp = json.loads(self._ws.recv())
+            finally:
+                self._release_io()
             if "error" in resp:
+                self.last_error = str(resp["error"])
                 self._on_status(f"加载失败: {resp['error']}")
                 return False
             self.samplerate = resp.get("samplerate", 48000)
@@ -135,9 +212,12 @@ class RVCClient:
             self._block_frame = resp.get("block_size", 256)
             self._model_loaded = True
             self._active = True   # 服务器 load 完成后会自动 start
-            self._on_status(f"模型已加载 (sr={self.samplerate})")
+            self._apply_loaded_files(resp)
+            self.last_error = ""
+            self._on_status(self._loaded_status_text(self.samplerate))
             return True
         except Exception as e:
+            self.last_error = str(e)
             self._on_status(f"加载失败: {e}")
             self._drain()   # 清掉可能残留的响应，防止污染下一个请求
             return False
@@ -151,12 +231,16 @@ class RVCClient:
         try:
             cmd = {"action": "start"}
             cmd.update(params)
-            with self._send_lock, self._recv_lock:
+            if not self._acquire_io(8.0):
+                return False
+            try:
                 # 改过参数时服务端要重新预热 CUDA Graph（10~20s），
                 # 此调用在后台线程执行，耐心等 60s 不误报失败
                 self._ws.settimeout(60.0)
                 self._ws.send(json.dumps(cmd))
                 resp = json.loads(self._ws.recv())
+            finally:
+                self._release_io()
             if isinstance(resp, dict) and "error" in resp:
                 self._on_status(resp["error"])
                 return False
@@ -295,6 +379,7 @@ class RVCClient:
         try:
             cmd = {"action": "configure"}
             cmd.update(kwargs)
+            self._ws.settimeout(0.4)
             self._ws.send(json.dumps(cmd))
             return True
         except Exception:
@@ -304,33 +389,55 @@ class RVCClient:
 
     def list_models(self):
         """从服务器获取模型文件列表（添加角色时选择用）"""
+        data = self._rpc({"action": "list_models"})
+        if isinstance(data, dict) and data.get("status") == "ok":
+            return data.get("models", [])
+        return []
+
+    def list_indices(self):
+        data = self._rpc({"action": "list_models"})
+        if isinstance(data, dict) and data.get("status") == "ok":
+            return data.get("indices", [])
+        return []
+
+    def _rpc(self, cmd, timeout=5.0):
         if not self._ws:
-            if not self.connect(timeout=5):
-                return []
+            if not self.connect(timeout=timeout):
+                return None
         try:
-            with self._send_lock, self._recv_lock:
-                self._ws.settimeout(5.0)
-                self._ws.send(json.dumps({"action": "list_models"}))
-                resp = json.loads(self._ws.recv())
-            if isinstance(resp, dict) and resp.get("status") == "ok":
-                return resp.get("models", [])
-            return []
+            if not self._acquire_io(min(3.0, float(timeout))):
+                return None
+            try:
+                self._ws.settimeout(timeout)
+                self._ws.send(json.dumps(cmd))
+                resp = self._ws.recv()
+            finally:
+                self._release_io()
+            if isinstance(resp, (bytes, bytearray)):
+                return None
+            return json.loads(resp)
         except Exception:
             self._drain()
-            return []
+            return None
 
     def _drain(self):
         """清空 socket 里残留的消息（超时/失败后调用，防止响应错位到下一个请求）"""
         ws = self._ws
         if ws is None:
             return
+        if not self._recv_lock.acquire(timeout=0.15):
+            return
         try:
-            with self._recv_lock:
-                ws.settimeout(0.01)
-                while True:
-                    ws.recv()
+            ws.settimeout(0.01)
+            while True:
+                ws.recv()
         except Exception:
             pass
+        finally:
+            try:
+                self._recv_lock.release()
+            except Exception:
+                pass
 
     def _send_live(self, **fields):
         if not self._ws or not self._connected:
@@ -340,6 +447,7 @@ class RVCClient:
         try:
             cmd = {"action": "set_live"}
             cmd.update(fields)
+            self._ws.settimeout(0.4)
             self._ws.send(json.dumps(cmd))
             return True
         except Exception:
@@ -362,6 +470,6 @@ class RVCClient:
             return
         if url == self.server_url and self._connected:
             return
-        self.disconnect()
+        if self._connected:
+            self.abort()
         self.server_url = url
-        self.connect(timeout=5)

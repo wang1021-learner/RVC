@@ -1,7 +1,7 @@
 {
   "speakers": [
     {
-      "name": "v2 200e",
+      "name": "v2 200轮",
       "model_path": "thchs_v2_e200_s13200.pth",
       "index_path": "added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
       "speaker_id": 0,
@@ -15,7 +15,7 @@
       "threhold": -50
     },
     {
-      "name": "v2 250e",
+      "name": "v2 250轮",
       "model_path": "thchs_v2_e250_s16500.pth",
       "index_path": "added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
       "speaker_id": 0,
@@ -29,7 +29,7 @@
       "threhold": -50
     },
     {
-      "name": "v2 300e",
+      "name": "v2 300轮",
       "model_path": "thchs_v2_e300_s19800.pth",
       "index_path": "added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
       "speaker_id": 0,
@@ -43,7 +43,7 @@
       "threhold": -50
     },
     {
-      "name": "v2 150e",
+      "name": "v2 150轮",
       "model_path": "thchs_v2_e150_s9900.pth",
       "index_path": "added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
       "speaker_id": 0,
@@ -57,7 +57,7 @@
       "threhold": -50
     },
     {
-      "name": "v2 100e",
+      "name": "v2 100轮",
       "model_path": "thchs_v2_e100_s6600.pth",
       "index_path": "added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
       "speaker_id": 0,
@@ -71,7 +71,7 @@
       "threhold": -50
     },
     {
-      "name": "v2 50e",
+      "name": "v2 50轮",
       "model_path": "thchs_v2_e50_s3300.pth",
       "index_path": "added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
       "speaker_id": 0,
@@ -99,11 +99,11 @@
       "threhold": -50
     },
     {
-      "name": "女声 200e",
+      "name": "女声 200轮",
       "model_path": "thchs_female_200e.pth",
       "index_path": "",
       "speaker_id": 0,
-      "pitch": 12,
+      "pitch": 0,
       "index_rate": 0.3,
       "formant": 0.0,
       "f0method": "rmvpe",
@@ -113,7 +113,7 @@
       "threhold": -50
     },
     {
-      "name": "女声 250e",
+      "name": "女声 250轮",
       "model_path": "thchs_female_250e.pth",
       "index_path": "",
       "speaker_id": 0,
@@ -127,7 +127,7 @@
       "threhold": -50
     },
     {
-      "name": "女声 300e",
+      "name": "女声 300轮",
       "model_path": "thchs_female_300e.pth",
       "index_path": "",
       "speaker_id": 0,
@@ -141,7 +141,7 @@
       "threhold": -50
     },
     {
-      "name": "女声 100e",
+      "name": "女声 100轮",
       "model_path": "thchs_female_100e.pth",
       "index_path": "",
       "speaker_id": 0,
@@ -155,7 +155,7 @@
       "threhold": -50
     },
     {
-      "name": "女声 预训练50e",
+      "name": "女声 预训练50轮",
       "model_path": "thchs_female_pretrained_50e.pth",
       "index_path": "",
       "speaker_id": 0,
@@ -169,7 +169,7 @@
       "threhold": -50
     },
     {
-      "name": "myvoice 200e",
+      "name": "myvoice 200轮",
       "model_path": "myvoice.pth",
       "index_path": "added_IVF314_Flat_nprobe_1_myvoice_v2.index",
       "speaker_id": 0,
@@ -184,11 +184,11 @@
     },
     {
       "name": "shanxi",
-      "model_path": "shanxi.pth",
-      "index_path": "added_IVF1746_Flat_nprobe_1_shanxi_v2.index",
+      "model_path": "shanxi_e200_s11800.pth",
+      "index_path": "shanxi.index",
       "speaker_id": 0,
-      "pitch": 0,
-      "index_rate": 0.4,
+      "pitch": 6,
+      "index_rate": 0.1,
       "formant": 0.0,
       "f0method": "rmvpe",
       "I_noise_reduce": false,

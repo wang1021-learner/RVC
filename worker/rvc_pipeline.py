@@ -1,5 +1,5 @@
 """RVC inference pipeline - no UI dependency"""
-import os, time, traceback
+import os, time, traceback, logging
 import numpy as np, torch, torch.nn.functional as F, torchaudio.transforms as tat
 from configs.config import Config
 from infer import rtrvc as rvc_for_realtime
@@ -14,6 +14,7 @@ class RVCPipeline:
     def __init__(self, on_status=None):
         self.config = Config()
         self.rvc = None
+        self.last_error = ""
         self._on_status = on_status or (lambda _: None)
         self.block_time = 0.06
         self.crossfade_time = 0.02
@@ -107,10 +108,24 @@ class RVCPipeline:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         candidates = [os.path.join(root, path), os.path.join(root, "assets", "weights", name)]
         if is_index or name.lower().endswith(".index"):
+            logs = os.path.join(root, "logs")
+            extra = []
+            if os.path.isdir(logs):
+                try:
+                    extra = [
+                        os.path.join(logs, d, name)
+                        for d in os.listdir(logs)
+                        if os.path.isdir(os.path.join(logs, d))
+                    ]
+                except Exception:
+                    extra = []
             candidates = [
                 os.path.join(root, path),
+                os.path.join(logs, name),
                 os.path.join(root, "logs", "thchs_v2", name),
+                *extra,
                 os.path.join(root, "deploy", "logs", "thchs_v2", name),
+                os.path.join(root, "assets", "indices", name),
                 os.path.join(root, "assets", name),
                 os.path.join(root, "assets", "weights", name),
             ]
@@ -132,12 +147,36 @@ class RVCPipeline:
             self.rvc = rvc_for_realtime.RVC(
                 pitch, formant, model_path, index_path, index_rate, self.config, reuse)
             self._buf_sig = None
-            self._on_status(f"Loaded (sr={self.rvc.tgt_sr})")
+            info = self.loaded_file_info()
+            idx = info.get("index_path") or "无索引"
+            flag = "" if info.get("index_loaded") else ("（未启用）" if info.get("index_path") else "")
+            self._on_status(
+                f"Loaded (sr={self.rvc.tgt_sr}) {info.get('model_path') or model_path}"
+                f" | {idx}{flag}"
+            )
+            self.last_error = ""
             return True
-        except Exception:
-            self._on_status(f"Load failed:\n{traceback.format_exc()}")
+        except Exception as e:
+            logging.exception("加载模型失败")
+            self.last_error = str(e)
+            self._on_status("加载失败: " + str(e))
             self.rvc = old
             return False
+
+    def loaded_file_info(self):
+        """实际打开的模型/索引路径（解析后的绝对路径）。"""
+        rvc = self.rvc
+        if rvc is None:
+            return {"model_path": "", "index_path": "", "index_loaded": False}
+        pth = getattr(rvc, "pth_path", "") or ""
+        idx = getattr(rvc, "index_path", "") or ""
+        exists = bool(idx) and os.path.isfile(idx)
+        loaded = exists and getattr(rvc, "index", None) is not None
+        return {
+            "model_path": pth,
+            "index_path": idx if exists else (idx or ""),
+            "index_loaded": bool(loaded),
+        }
 
     def unload(self):
         self.rvc = None

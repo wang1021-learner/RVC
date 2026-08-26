@@ -71,6 +71,7 @@ a = Analysis(
     datas=[
         (os.path.join(project_root, 'speakers.json'), '.'),
         (os.path.join(project_root, 'presets.json'), '.'),
+        (os.path.join(project_root, 'assets', 'icons'), 'assets/icons'),
     ],
     hiddenimports=[
         'worker.rvc_client',
@@ -130,6 +131,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    icon=os.path.join(project_root, 'assets', 'icons', 'app.ico'),
 )
 
 coll = COLLECT(

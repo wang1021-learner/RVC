@@ -14,6 +14,9 @@ from tools.cuda_graph import configure_cuda_graph
 
 logger = logging.getLogger(__name__)
 
+# 纯 CPU 服务器：启动前设置环境变量 RVC_FORCE_CPU=1，或 rvc_server.py --cpu
+_FORCE_CPU = os.environ.get("RVC_FORCE_CPU") == "1"
+
 
 # Keep device/precision eligibility in one place.  This follows the GPU rules
 # used by GPT-SoVITS: GPUs below 4 GiB or SM 5.3 are not selected, Pascal
@@ -66,7 +69,7 @@ def get_training_dtype() :
     return torch.float32
 
 
-CUDA_AVAILABLE = torch.cuda.is_available()
+CUDA_AVAILABLE = (not _FORCE_CPU) and torch.cuda.is_available()
 GPU_COUNT = torch.cuda.device_count() if CUDA_AVAILABLE else 0
 GPU_PROFILES = [get_device_dtype_sm(i) for i in range(GPU_COUNT)]
 GPU_INFOS = [
@@ -112,8 +115,16 @@ else:
         0.0,
     )
 
+if _FORCE_CPU:
+    infer_device, infer_dtype, infer_gpu_mem = (
+        torch.device("cpu"),
+        torch.float32,
+        0.0,
+    )
+    logger.info("RVC_FORCE_CPU=1, inference on CPU")
+
 # Do not expose an unsupported CUDA device as the inference default.
-if infer_device.type != "cuda":
+if infer_device.type != "cuda" and not _FORCE_CPU:
     if DML_AVAILABLE:
         infer_device, infer_dtype, infer_gpu_mem = (
             DML_DEVICE,

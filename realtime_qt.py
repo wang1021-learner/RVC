@@ -5,7 +5,7 @@ RVC 实时变声 - 桌面客户端
 架构: MainWindow(UI) -> VCEngine(音频+信号) -> 本地 RVCPipeline / 远程 RVCClient
 源码本地默认进程内推理；打包 exe 才走本机子进程。
 """
-import os, sys, json, queue, time, subprocess, logging, traceback
+import os, sys, json, queue, time, subprocess, logging, traceback, threading
 from pathlib import Path
 import numpy as np
 import wave as wave_mod
@@ -19,10 +19,12 @@ from PySide6.QtWidgets import (
     QCheckBox, QRadioButton, QFileDialog, QGroupBox, QMessageBox,
     QLineEdit, QStatusBar, QSplitter, QSlider,
     QDialog, QDialogButtonBox, QFormLayout, QFrame, QListView,
-    QInputDialog, QScrollArea, QTabWidget,
+    QInputDialog, QScrollArea, QTabWidget, QSystemTrayIcon, QMenu,
 )
-from PySide6.QtGui import (QDragEnterEvent, QDropEvent, QColor,
-    QStandardItemModel, QStandardItem)
+from PySide6.QtGui import (
+    QDragEnterEvent, QDropEvent, QColor, QPainter, QFontMetrics,
+    QStandardItemModel, QStandardItem, QIcon, QAction, QPixmap,
+)
 
 
 # ==============================================================================
@@ -141,7 +143,7 @@ class DeviceCombo(QComboBox):
             a,
         )):
             api_name = apis[api_idx]["name"] if api_idx < len(apis) else "其他"
-            head = QStandardItem(api_name)
+            head = QStandardItem(_hostapi_zh(api_name))
             head.setData("group", Qt.UserRole + 1)
             head.setFlags(Qt.ItemIsEnabled)
             self._model.appendRow(head)
@@ -151,7 +153,9 @@ class DeviceCombo(QComboBox):
                 show = name if len(name) <= 36 else name[:34] + "..."
                 sr = int(d.get("default_samplerate", 0))
                 chs = d[ch]
-                detail = f"{sr // 1000}kHz · {chs}ch" if sr > 0 else f"{chs}ch"
+                detail = (
+                    f"{sr // 1000} kHz · {chs} 声道" if sr > 0 else f"{chs} 声道"
+                )
                 item = QStandardItem(show)
                 item.setData("device", Qt.UserRole + 1)
                 item.setData(detail, Qt.UserRole + 2)
@@ -209,12 +213,111 @@ class DeviceCombo(QComboBox):
         if parent is not None and parent is not self:
             parent.setFixedHeight(h + 4)
 
+class ComboItemDelegate(QStyledItemDelegate):
+    """下拉项：圆角行、选中青绿条；有副标题时两行（模型 / 索引）。"""
+    ROW_H = 36
+    ROW_H_SUB = 50
+
+    def paint(self, painter, option, index):
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        rect = option.rect.adjusted(5, 2, -6, -2)
+        selected = bool(option.state & QStyle.State_Selected)
+        hover = bool(option.state & QStyle.State_MouseOver)
+        sub = str(index.data(Qt.UserRole + 2) or "")
+        if selected:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#ecfdf5"))
+            painter.drawRoundedRect(rect, 8, 8)
+            bar = rect.adjusted(0, 8, 0, -8)
+            bar.setWidth(3)
+            painter.setBrush(QColor("#0f766e"))
+            painter.drawRoundedRect(bar, 2, 2)
+            title_color = QColor("#0f766e")
+            sub_color = QColor("#0f766e")
+            pad = 12
+        elif hover:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#f1f5f9"))
+            painter.drawRoundedRect(rect, 8, 8)
+            title_color = QColor("#0f172a")
+            sub_color = QColor("#64748b")
+            pad = 10
+        else:
+            title_color = QColor("#334155")
+            sub_color = QColor("#94a3b8")
+            pad = 10
+        text = str(index.data(Qt.DisplayRole) or "")
+        text_rect = rect.adjusted(pad, 0, -8, 0)
+        fm = QFontMetrics(painter.font())
+        if sub:
+            title_rect = text_rect.adjusted(0, 3, 0, -16)
+            sub_rect = text_rect.adjusted(0, 20, 0, -2)
+            font = painter.font()
+            font.setBold(selected)
+            painter.setFont(font)
+            painter.setPen(title_color)
+            painter.drawText(
+                title_rect, int(Qt.AlignVCenter | Qt.AlignLeft),
+                fm.elidedText(text, Qt.ElideRight, max(0, title_rect.width())))
+            font.setBold(False)
+            font.setPointSize(max(8, font.pointSize() - 1))
+            painter.setFont(font)
+            painter.setPen(sub_color)
+            sfm = QFontMetrics(font)
+            painter.drawText(
+                sub_rect, int(Qt.AlignVCenter | Qt.AlignLeft),
+                sfm.elidedText(sub, Qt.ElideMiddle, max(0, sub_rect.width())))
+        else:
+            font = painter.font()
+            font.setBold(selected)
+            painter.setFont(font)
+            painter.setPen(title_color)
+            painter.drawText(
+                text_rect, int(Qt.AlignVCenter | Qt.AlignLeft),
+                fm.elidedText(text, Qt.ElideRight, max(0, text_rect.width())))
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        w = option.rect.width() if option.rect.width() > 0 else 180
+        if index.data(Qt.UserRole + 2):
+            return QSize(w, self.ROW_H_SUB)
+        return QSize(w, self.ROW_H)
+
+
+class StyledCombo(QComboBox):
+    """Fusion 下强制自绘弹出列表，不走 Windows 原生菜单。"""
+
+    def __init__(self, min_width=0, max_visible=8, parent=None):
+        super().__init__(parent)
+        if min_width > 0:
+            self.setMinimumWidth(min_width)
+        self.setMaxVisibleItems(max_visible)
+        view = QListView(self)
+        view.setMouseTracking(True)
+        view.setSpacing(0)
+        view.setFrameShape(QFrame.NoFrame)
+        view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        view.setItemDelegate(ComboItemDelegate(view))
+        self.setView(view)
+        self.setInsertPolicy(QComboBox.NoInsert)
+
+    def showPopup(self):
+        super().showPopup()
+        view = self.view()
+        n = self.count()
+        row_h = view.sizeHintForRow(0) if n else ComboItemDelegate.ROW_H
+        vis = min(n, max(1, self.maxVisibleItems()))
+        h = vis * row_h + 10
+        view.setFixedHeight(h)
+        box = view.parentWidget()
+        if box is not None and box is not self:
+            box.setFixedHeight(h + 8)
+            box.setMinimumWidth(max(self.width(), 240))
+
+
 def create_styled_combo(min_width=0, max_visible=8):
-    cb = QComboBox()
-    if min_width > 0:
-        cb.setMinimumWidth(min_width)
-    cb.setMaxVisibleItems(max_visible)
-    return cb
+    return StyledCombo(min_width=min_width, max_visible=max_visible)
 
 
 class SpeakerCardList(QWidget):
@@ -430,7 +533,9 @@ sys.path.insert(0, str(PROJECT_ROOT))
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 
 from worker.rvc_client import RVCClient
-from worker.local_server import is_frozen, package_root, runtime_installed
+from worker.local_server import (
+    is_frozen, package_root, runtime_installed, pack_mode, local_infer_ready)
+
 from tools.audio_meter import VUMeterWidget, SpectrumWidget, calc_rms_db, spec_bins
 from tools.virtual_cable import find_virtual_devices, is_virtual_name, INSTALL_URLS, open_install_page, route_self_check
 from tools.audio_process import AutoGain
@@ -452,8 +557,13 @@ def setup_logging():
         pass
 
 
+_last_crash_popup = 0.0
+
+
 def _excepthook(exc_type, exc, tb):
-    """未捕获异常：写入 crash.log 并弹窗提示（日志路径随包定位）。"""
+    """未捕获异常：写入 crash.log，并在界面线程弹一次提示。"""
+    if exc_type in (KeyboardInterrupt, SystemExit):
+        return
     logging.getLogger("crash").critical("未捕获异常", exc_info=(exc_type, exc, tb))
     try:
         log_dir = package_root() / "logs"
@@ -465,14 +575,29 @@ def _excepthook(exc_type, exc, tb):
         pass
     try:
         from PySide6.QtWidgets import QApplication, QMessageBox
-        if QApplication.instance() is not None:
+        app = QApplication.instance()
+        if app is None:
+            return
+        def _popup():
+            global _last_crash_popup
+            now = time.time()
+            if now - _last_crash_popup < 4.0:
+                return
+            _last_crash_popup = now
             QMessageBox.critical(
                 None, "程序错误",
-                "发生未处理的错误，日志已保存到 logs 目录（app.log / crash.log）\n\n"
-                + str(exc)[:300])
+                "发生未处理的错误，变声可能已中断。" + NL + NL
+                + "详细日志：logs/crash.log" + NL + NL
+                + _friendly_error(exc))
+        QTimer.singleShot(0, _popup)
     except Exception:
         pass
-    sys.__excepthook__(exc_type, exc, tb)
+
+
+def _thread_excepthook(args):
+    if getattr(args, "exc_type", None) in (KeyboardInterrupt, SystemExit):
+        return
+    _excepthook(args.exc_type, args.exc_value, args.exc_traceback)
 
 
 class LazyLocalPipeline:
@@ -557,12 +682,23 @@ def make_pipeline(mode, server_url, on_status):
     return RVCClient(server_url=server_url, on_status=on_status)
 
 NL = chr(10)
+MSG_SERVER_PACK_NO_LOCAL = (
+    "当前安装包是「服务器客户端」，只有界面和声卡，不含本机模型和 GPU 推理。"
+    + NL + NL
+    + "请勾选「远程服务器」，填写 ws://服务器IP:8765 后点「连接」。"
+    + NL + NL
+    + "若要在这台电脑上变声，请使用「RVC单机版」。"
+)
+MSG_NEED_INSTALL_LOCAL = (
+    "本地推理尚未安装。"
+    + NL + NL
+    + "需要英伟达显卡，首次安装约 3.5GB（需联网）。"
+    + NL
+    + "请先点击「安装本地推理」，完成后再启动变声。"
+)
 SETTINGS_FILE = PROJECT_ROOT / "user_settings.json"
 PRESETS_FILE = PROJECT_ROOT / "presets.json"
-DEFAULT_SERVER_URL = "ws://192.168.1.28:8765"
-SERVER_ROOT = "/home/songwang/Retrieval-based-Voice-Conversion-WebUI"
-SERVER_MODEL_DIR = SERVER_ROOT + "/assets/weights"
-SERVER_INDEX_DIR = SERVER_ROOT + "/logs/thchs_v2"
+DEFAULT_SERVER_URL = "ws://127.0.0.1:8765"
 RESTART_KEYS = ("block_time", "crossfade_time", "extra_time", "I_noise_reduce", "O_noise_reduce")
 DEFAULT_PARAMS = {
     "block_time": 0.06,
@@ -632,7 +768,7 @@ BUILTIN_PRESETS = [
 def _wasapi_fail_reason(exc):
     s = str(exc or "").lower()
     if "illegal combination" in s:
-        return "输入输出不是同一组 API（请选择同组设备，或点「刷新设备」重试）"
+        return "输入输出不是同一类接口（请选同一类设备，或点「刷新设备」重试）"
     if "sample" in s or "rate" in s:
         return "采样率需为 48k（设备不支持当前采样率）"
     if "channel" in s:
@@ -650,19 +786,45 @@ def _wasapi_fail_reason(exc):
 
 
 def _friendly_net_error(e):
-    """把底层网络异常翻译成用户可行动的提示。"""
+    """把底层网络异常翻译成用户可行动的提示。对不上则返回 None。"""
     s = str(e or "").lower()
     if "refused" in s or "10061" in s:
-        return "服务器拒绝连接（未启动或端口不对）"
+        return "服务器拒绝连接（推理服务没开，或端口不是 8765）"
     if "timed out" in s or "timeout" in s or "10060" in s:
-        return "连接超时（检查 IP 地址与防火墙）"
+        return "连接超时（检查地址、网络和云安全组是否放行 8765）"
     if "getaddrinfo" in s or "nodename" in s or "name or service" in s:
-        return "地址无法解析（请检查服务器地址写法）"
+        return "地址无法解析（请检查 ws://IP:8765 写法）"
     if "unreachable" in s or "10065" in s:
-        return "网络不可达（请检查网络连接）"
-    if "handshake" in s or "10054" in s or "reset" in s:
-        return "连接被重置（服务器可能异常退出）"
-    return (str(e) or "未知错误")[:120]
+        return "网络不可达（请检查本机网络）"
+    if "handshake" in s or "10054" in s or "reset" in s or "closed" in s:
+        return "连接被断开（服务器可能崩溃或重启了）"
+    if "服务器正忙" in str(e or ""):
+        return "服务器正忙，请稍后再点连接或加载"
+    return None
+
+
+def _friendly_error(e):
+    """统一错误文案：能翻译就翻译，并告诉用户下一步。"""
+    raw = str(e or "").strip()
+    net = _friendly_net_error(e)
+    if net:
+        return net
+    low = raw.lower()
+    if "cuda" in low and ("out of memory" in low or "oom" in low):
+        return "显存不足。请关掉其它占显卡的程序后重试。"
+    if "no such file" in low or "not found" in low or "找不到" in raw:
+        return "找不到模型或索引文件。本地请核对路径；服务器模式只认文件名，远端要有同名文件。"
+    if "模型加载失败" in raw or "load failed" in low:
+        return "模型加载失败。请确认文件完整；服务器模式下先点「连接」，并确认远端有这个模型。"
+    if "未连接" in raw or "not connected" in low:
+        return "尚未连上服务器。请先点「连接」。"
+    if "推理未能启动" in raw or "未能启动" in raw:
+        return "推理未能启动。请先加载角色，并确认设备可用。"
+    if "模型未加载" in raw:
+        return "请先选择角色并等待加载完成，再启动变声。"
+    if raw:
+        return raw[:220]
+    return "未知错误"
 
 
 def _device_fingerprint():
@@ -714,12 +876,70 @@ def save_presets(presets):
         pass
 
 
+def _normalize_ws_url(url):
+    url = (url or "").strip()
+    if not url:
+        return DEFAULT_SERVER_URL
+    if "://" not in url:
+        url = "ws://" + url
+    return url
+
+
+F0_CHOICES = (
+    ("rmvpe", "准确（RMVPE）"),
+    ("fcpe", "较快（FCPE）"),
+    ("pm", "最快（PM）"),
+)
+
+
+def fill_f0_combo(cb, current="rmvpe"):
+    cb.blockSignals(True)
+    cb.clear()
+    for key, label in F0_CHOICES:
+        cb.addItem(label, key)
+    i = cb.findData(current or "rmvpe")
+    cb.setCurrentIndex(i if i >= 0 else 0)
+    cb.blockSignals(False)
+
+
+def f0_from_combo(cb):
+    v = cb.currentData()
+    return v if v else "rmvpe"
+
+
+def set_f0_combo(cb, key):
+    i = cb.findData(key or "rmvpe")
+    if i >= 0:
+        cb.setCurrentIndex(i)
+
+
+def _hostapi_zh(name):
+    n = (name or "").upper()
+    if "ASIO" in n:
+        return "专业声卡"
+    if "WASAPI" in n:
+        return "系统低延迟"
+    if "WDM" in n or "KS" in n:
+        return "内核音频"
+    if "DIRECTSOUND" in n:
+        return "经典音频"
+    if "MME" in n:
+        return "兼容模式"
+    return name or "其他"
+
+
 def to_server_path(local_path: str) -> str:
-    """模型进 weights/，索引进 logs/thchs_v2/（服务器端还会再搜一遍）。"""
-    name = Path(str(local_path)).name
-    if name.lower().endswith(".index"):
-        return SERVER_INDEX_DIR + "/" + name
-    return SERVER_MODEL_DIR + "/" + name
+    """只传文件名，由服务器在自己的 assets/weights、logs 下解析。"""
+    return Path(str(local_path or "")).name
+
+
+def _speaker_file_sub(speaker):
+    """下拉副行：模型文件 · 索引文件。"""
+    pth = Path(str(getattr(speaker, "model_path", "") or "")).name or "无模型"
+    idx = Path(str(getattr(speaker, "index_path", "") or "")).name
+    if not idx:
+        idx = "无索引"
+    return pth + "  ·  " + idx
 
 SPEAKERS_FILE = PROJECT_ROOT / "speakers.json"
 WEIGHTS_DIR   = PROJECT_ROOT / "assets" / "weights"
@@ -778,39 +998,52 @@ QLabel#fieldLabel {
 QComboBox {
     combobox-popup: 0;
     background-color: #ffffff;
-    border: 1px solid #d1d5db;
-    border-radius: 6px;
-    padding: 4px 8px;
-    min-height: 24px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 6px 28px 6px 10px;
+    min-height: 28px;
     font-size: 13px;
-    color: #111827;
+    font-weight: 600;
+    color: #0f172a;
 }
 QComboBox:hover {
-    border-color: #9ca3af;
+    border-color: #94a3b8;
+    background-color: #f8fafc;
 }
-QComboBox:focus {
+QComboBox:focus, QComboBox:on {
     border-color: #0f766e;
 }
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
-    width: 20px;
+    width: 24px;
     border: none;
+}
+QComboBox::down-arrow {
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #64748b;
+    margin-right: 8px;
 }
 QComboBox QAbstractItemView {
     background-color: #ffffff;
-    border: 1px solid #e5e7eb;
-    border-radius: 6px;
-    padding: 4px;
+    border: none;
     outline: none;
-    max-height: 280px;
-    selection-background-color: #f3f4f6;
-    selection-color: #111827;
+    padding: 4px 0;
+    selection-background-color: transparent;
+    selection-color: #0f766e;
 }
-QComboBox QAbstractItemView::item {
-    min-height: 24px;
-    padding: 3px 6px;
-    border-radius: 4px;
+QComboBoxPrivateContainer {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 4px;
+}
+QComboBox#speakerCombo {
+    min-height: 32px;
+    font-size: 13px;
 }
 
 /* 滚动区域与滚动条 */
@@ -928,6 +1161,11 @@ QPushButton:hover {
 QPushButton:pressed {
     background-color: #f3f4f6;
 }
+QPushButton:disabled {
+    color: #9ca3af;
+    background-color: #f3f4f6;
+    border-color: #e5e7eb;
+}
 QPushButton#btnGhost {
     background-color: #f9fafb;
     border: 1px solid #e5e7eb;
@@ -938,6 +1176,14 @@ QPushButton#btnGhost:hover {
     background-color: #f3f4f6;
     border-color: #d1d5db;
     color: #111827;
+}
+QPushButton#btnGhost:pressed {
+    background-color: #e5e7eb;
+}
+QPushButton#btnGhost:disabled {
+    color: #94a3b8;
+    background-color: #f1f5f9;
+    border-color: #e2e8f0;
 }
 QPushButton#btnConnect {
     background-color: #0f766e;
@@ -950,6 +1196,14 @@ QPushButton#btnConnect {
 }
 QPushButton#btnConnect:hover {
     background-color: #115e59;
+}
+QPushButton#btnConnect:pressed {
+    background-color: #134e4a;
+}
+QPushButton#btnConnect:disabled {
+    background-color: #5eead4;
+    color: #115e59;
+    border: none;
 }
 
 /* 启动/停止主操作按钮 */
@@ -1133,7 +1387,8 @@ class ModelLoader(QThread):
             if ok:
                 self.finished_ok.emit(self.speaker, self.gen)
             else:
-                self.failed.emit("模型加载失败", self.gen)
+                err = getattr(self.pipeline, "last_error", "") or "模型加载失败"
+                self.failed.emit(err, self.gen)
         except Exception as e:
             self.failed.emit(str(e), self.gen)
 
@@ -1146,6 +1401,7 @@ class InferenceWorkerThread(QThread):
     spectrum = Signal(object)
     xrun_occurred = Signal()
     need_recover = Signal()
+    crashed = Signal(str)
 
     def __init__(self, pipeline, input_queue, output_queue, parent=None):
         super().__init__(parent)
@@ -1178,30 +1434,35 @@ class InferenceWorkerThread(QThread):
         self.running = True
         inflight = deque()
         depth = 2 if getattr(self.pipeline, "is_remote", False) else 1
-        while self.running:
-            while self.running and len(inflight) < depth:
-                try:
-                    indata = self.input_queue.get(timeout=0.01 if inflight else 0.05)
-                except queue.Empty:
+        try:
+            while self.running:
+                while self.running and len(inflight) < depth:
+                    try:
+                        indata = self.input_queue.get(timeout=0.01 if inflight else 0.05)
+                    except queue.Empty:
+                        break
+                    token = self.pipeline.send_audio(indata)
+                    if token is None:
+                        if not self.pipeline.is_connected():
+                            self.need_recover.emit()
+                        break
+                    inflight.append((token, calc_rms_db(indata)))
+                if not inflight:
+                    continue
+                token, in_rms = inflight.popleft()
+                out_block, elapsed_ms = self.pipeline.recv_audio(*token)
+                if not self.pipeline.is_connected():
+                    self.need_recover.emit()
+                if not self.running:
                     break
-                token = self.pipeline.send_audio(indata)
-                if token is None:
-                    if not self.pipeline.is_connected():
-                        self.need_recover.emit()
-                    break
-                inflight.append((token, calc_rms_db(indata)))
-            if not inflight:
-                continue
-            token, in_rms = inflight.popleft()
-            out_block, elapsed_ms = self.pipeline.recv_audio(*token)
-            if not self.pipeline.is_connected():
-                self.need_recover.emit()
-            if not self.running:
-                break
-            stage = getattr(self.pipeline, "last_stage_ms", None)
-            if stage:
-                self.stage_stats.emit(dict(stage))
-            self._emit_out(out_block, elapsed_ms, in_rms)
+                stage = getattr(self.pipeline, "last_stage_ms", None)
+                if stage:
+                    self.stage_stats.emit(dict(stage))
+                self._emit_out(out_block, elapsed_ms, in_rms)
+        except Exception as e:
+            logging.exception("推理线程异常")
+            if self.running:
+                self.crashed.emit(str(e)[:200])
 
     def stop(self):
         self.running = False
@@ -1210,74 +1471,75 @@ class InferenceWorkerThread(QThread):
             self.wait(1800)
 
 
-class RecThread(QThread):
-    """录音测试线程：录 N 秒 → 用当前角色变声 → 保存 wav"""
-    done = Signal(str, str)   # 保存路径, 错误信息
-
-    def __init__(self, engine, seconds=10, device=None, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.seconds = seconds
-        self.device = device
-
-    def run(self):
-        import sounddevice as sd
-        import numpy as np
-        import time, os
-        try:
-            c = self.engine.pipeline
-            if c is None:
-                self.done.emit("", "推理引擎未就绪")
-                return
-            if not c.is_connected():
-                if not c.connect(timeout=5):
-                    self.done.emit("", "无法连接服务器")
-                    return
-            try:
-                started = c.start(**self.engine.merged_params())
-                if started is False:
-                    self.done.emit("", "无法启动推理")
-                    return
-            except Exception as e:
-                self.done.emit("", "无法启动推理: " + str(e))
-                return
-            SR = c.samplerate
-            BLOCK = getattr(c, "_block_frame", None)
-            if not BLOCK:
-                self.done.emit("", "推理块大小未知，请先成功加载角色")
-                return
-            frames = []
-            rec_log = []
-            def cb(indata, frames_, times, status):
-                frames.append(indata[:, 0].copy())
-            kwargs = dict(samplerate=SR, channels=1, dtype='float32',
-                          blocksize=BLOCK, callback=cb)
-            if self.device is not None:
-                kwargs['device'] = self.device
-            with sd.InputStream(**kwargs):
-                time.sleep(self.seconds)
-            if not frames:
-                self.done.emit("", "没有录到音频")
-                return
-            raw = np.concatenate(frames)
-            outs = []
-            for i in range(0, len(raw) - BLOCK + 1, BLOCK):
-                out, _ = c.process_chunk(raw[i:i + BLOCK])
-                outs.append(np.asarray(out).reshape(-1))
-            if not outs:
-                self.done.emit("", "录音太短")
-                return
-            os.makedirs('record_out', exist_ok=True)
-            out = np.concatenate(outs)
-            spk = self.engine.current_speaker
-            fname = os.path.join('record_out', f'rec_{spk.name}_{int(time.time())}.wav')
-            pcm = np.clip(out * 32767, -32768, 32767).astype(np.int16)
-            with wave_mod.open(fname, 'wb') as wf:
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SR)
-                wf.writeframes(pcm.tobytes())
-            self.done.emit(fname, "")
-        except Exception as e:
-            self.done.emit("", str(e))
+# 录音测试暂时关闭
+# class RecThread(QThread):
+#     """录音测试线程：录 N 秒 → 用当前角色变声 → 保存 wav"""
+#     done = Signal(str, str)   # 保存路径, 错误信息
+#
+#     def __init__(self, engine, seconds=10, device=None, parent=None):
+#         super().__init__(parent)
+#         self.engine = engine
+#         self.seconds = seconds
+#         self.device = device
+#
+#     def run(self):
+#         import sounddevice as sd
+#         import numpy as np
+#         import time, os
+#         try:
+#             c = self.engine.pipeline
+#             if c is None:
+#                 self.done.emit("", "推理引擎未就绪")
+#                 return
+#             if not c.is_connected():
+#                 if not c.connect(timeout=5):
+#                     self.done.emit("", "无法连接服务器")
+#                     return
+#             try:
+#                 started = c.start(**self.engine.merged_params())
+#                 if started is False:
+#                     self.done.emit("", "无法启动推理")
+#                     return
+#             except Exception as e:
+#                 self.done.emit("", "无法启动推理: " + str(e))
+#                 return
+#             SR = c.samplerate
+#             BLOCK = getattr(c, "_block_frame", None)
+#             if not BLOCK:
+#                 self.done.emit("", "推理块大小未知，请先成功加载角色")
+#                 return
+#             frames = []
+#             rec_log = []
+#             def cb(indata, frames_, times, status):
+#                 frames.append(indata[:, 0].copy())
+#             kwargs = dict(samplerate=SR, channels=1, dtype='float32',
+#                           blocksize=BLOCK, callback=cb)
+#             if self.device is not None:
+#                 kwargs['device'] = self.device
+#             with sd.InputStream(**kwargs):
+#                 time.sleep(self.seconds)
+#             if not frames:
+#                 self.done.emit("", "没有录到音频")
+#                 return
+#             raw = np.concatenate(frames)
+#             outs = []
+#             for i in range(0, len(raw) - BLOCK + 1, BLOCK):
+#                 out, _ = c.process_chunk(raw[i:i + BLOCK])
+#                 outs.append(np.asarray(out).reshape(-1))
+#             if not outs:
+#                 self.done.emit("", "录音太短")
+#                 return
+#             os.makedirs('record_out', exist_ok=True)
+#             out = np.concatenate(outs)
+#             spk = self.engine.current_speaker
+#             fname = os.path.join('record_out', f'rec_{spk.name}_{int(time.time())}.wav')
+#             pcm = np.clip(out * 32767, -32768, 32767).astype(np.int16)
+#             with wave_mod.open(fname, 'wb') as wf:
+#                 wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(SR)
+#                 wf.writeframes(pcm.tobytes())
+#             self.done.emit(fname, "")
+#         except Exception as e:
+#             self.done.emit("", str(e))
 
 
 class EngineStartThread(QThread):
@@ -1292,12 +1554,58 @@ class EngineStartThread(QThread):
         self.action = action
 
     def run(self):
-        if self.action == "start":
-            self.engine._start_blocking()
-        elif self.action == "reopen":
-            self.engine._reopen_blocking()
-        elif self.action == "stop":
-            self.engine._hard_stop()
+        try:
+            if self.action == "start":
+                self.engine._start_blocking()
+            elif self.action == "reopen":
+                self.engine._reopen_blocking()
+            elif self.action == "stop":
+                self.engine._hard_stop()
+            elif self.action == "recover":
+                self.engine._recover_blocking()
+        except Exception as e:
+            logging.exception("引擎线程失败: %s", self.action)
+            if self.action == "start":
+                self.engine.load_failed.emit(_friendly_error(e))
+            else:
+                self.engine.status_msg.emit("操作失败: " + _friendly_error(e))
+
+
+class ServerConnectThread(QThread):
+    """后台连接远程推理服务器，避免点「连接」卡死 UI。"""
+    done = Signal(bool, str)
+
+    def __init__(self, pipeline, url, parent=None):
+        super().__init__(parent)
+        self.pipeline = pipeline
+        self.url = url
+
+    def run(self):
+        try:
+            self.pipeline.set_server_url(self.url)
+            ok = bool(self.pipeline.connect(timeout=5))
+            extra = ""
+            if ok:
+                gpu = getattr(self.pipeline, "gpu_name", "") or ""
+                info = {}
+                try:
+                    info = self.pipeline.loaded_file_info() or {}
+                except Exception:
+                    info = {}
+                model = info.get("model_path") or ""
+                idx = info.get("index_path") or ""
+                idx_bit = ""
+                if idx:
+                    idx_bit = "索引 " + Path(str(idx)).name
+                    if not info.get("index_loaded", True):
+                        idx_bit += "（未启用）"
+                elif model:
+                    idx_bit = "无索引"
+                extra = " · ".join(
+                    x for x in (gpu, Path(str(model)).name if model else "未加载模型", idx_bit) if x)
+            self.done.emit(ok, extra)
+        except Exception as e:
+            self.done.emit(False, str(e)[:160])
 
 
 # ==============================================================================
@@ -1307,6 +1615,9 @@ class VCEngine(QObject):
     status_msg = Signal(str); infer_time = Signal(int)
     started_ok = Signal(); stopped_ok = Signal()
     load_failed = Signal(str)
+    recover_progress = Signal(int, int)  # 当前次数, 最多次数
+    recover_ok = Signal()
+    recover_failed = Signal(str)
     rms_levels = Signal(float, float)  # in_db, out_db
     spectrum = Signal(object)
     xrun_signal = Signal(int)         # total_xruns
@@ -1618,7 +1929,10 @@ class VCEngine(QObject):
             self.worker_thread.stage_stats.connect(self.stage_stats)
             self.worker_thread.spectrum.connect(self.spectrum)
             self.worker_thread.xrun_occurred.connect(self._on_worker_xrun)
-            self.worker_thread.need_recover.connect(self._try_recover)
+            self.worker_thread.need_recover.connect(
+                self._try_recover, Qt.QueuedConnection)
+            self.worker_thread.crashed.connect(
+                self._on_worker_crash, Qt.QueuedConnection)
             self.worker_thread.start()
 
             self.running = True
@@ -1684,7 +1998,7 @@ class VCEngine(QObject):
         if is_asio:
             try:
                 self.stream = sd.Stream(**kwargs)
-                return True, "ASIO 硬件直通 (极低延迟)"
+                return True, "专业声卡直通（极低延迟）"
             except Exception as e:
                 errors.append(e)
 
@@ -1692,7 +2006,7 @@ class VCEngine(QObject):
         try:
             self.stream = sd.Stream(
                 extra_settings=sd.WasapiSettings(exclusive=True), **kwargs)
-            return True, "WASAPI 独占 (最低延迟)"
+            return True, "系统低延迟独占"
         except Exception as e:
             errors.append(e)
 
@@ -1703,7 +2017,7 @@ class VCEngine(QObject):
             except TypeError:
                 extra = sd.WasapiSettings(exclusive=False)
             self.stream = sd.Stream(extra_settings=extra, **kwargs)
-            return True, "WASAPI 共享（独占失败: %s）" % _wasapi_fail_reason(errors[-1])
+            return True, "系统共享（独占失败: %s）" % _wasapi_fail_reason(errors[-1])
         except Exception as e:
             errors.append(e)
 
@@ -1717,7 +2031,7 @@ class VCEngine(QObject):
         try:
             kwargs["channels"] = 2
             self.stream = sd.Stream(**kwargs)
-            return True, "共享模式 2 声道"
+            return True, "系统共享 · 双声道"
         except Exception as e:
             return False, str(e)
 
@@ -1891,33 +2205,60 @@ class VCEngine(QObject):
             return
         self.request_hard_stop()
 
+    def _on_worker_crash(self, msg):
+        if self.mode == "server":
+            self._try_recover()
+            return
+        self.load_failed.emit("推理中断: " + _friendly_error(msg))
+        self.request_hard_stop()
+
     def _try_recover(self):
         if not self.running:
             return
-        # 纯本地直连管线（LazyLocalPipeline）不涉及网络，无需恢复；
-        # 冻结版本地子进程/远程服务器是网络管线，允许走重连逻辑
-        if self.mode == "local" and not getattr(self.pipeline, "is_network", False):
+        # 仅远程服务器模式走网络重连；本地进程内推理不碰这条路径
+        if self.mode != "server":
             return
-        # 网络管线先强制断开（清掉失效连接），再重连恢复
-        if getattr(self.pipeline, "is_network", False):
-            try:
-                self.pipeline.abort()
-            except Exception:
-                pass
-        if self.pipeline.is_connected() and self.pipeline.is_loaded:
+        if self._engine_busy():
             return
         now = time.time()
         if now - self._last_recover < 2.0:
             return
         self._last_recover = now
-        self.status_msg.emit("连接中断，正在重连...")
-        if not self._ensure_connected() or not self._ensure_model():
+        self._start_thread = EngineStartThread(self, "recover")
+        self._start_thread.start()
+
+    def _recover_blocking(self):
+        if self.mode != "server":
             return
-        try:
-            self.pipeline.start(**self.merged_params())
-            self.status_msg.emit("已重新连上服务器")
-        except Exception as e:
-            self.status_msg.emit("重连失败: " + str(e))
+        max_n = 3
+        last_err = "无法连接服务器"
+        for i in range(1, max_n + 1):
+            if self._stop_requested or not self.running:
+                if self._stop_requested:
+                    self._hard_stop()
+                return
+            self.recover_progress.emit(i, max_n)
+            self.status_msg.emit("连接中断，正在重连 %d/%d…" % (i, max_n))
+            try:
+                self.pipeline.abort()
+            except Exception:
+                pass
+            time.sleep(0.5 if i == 1 else min(4.0, float(i)))
+            if self._stop_requested or not self.running:
+                if self._stop_requested:
+                    self._hard_stop()
+                return
+            try:
+                if self._ensure_connected() and self._ensure_model():
+                    self.pipeline.start(**self.merged_params())
+                    self.recover_ok.emit()
+                    self.status_msg.emit("已重新连上服务器")
+                    return
+                last_err = getattr(self.pipeline, "last_error", "") or "无法连接服务器"
+            except Exception as e:
+                last_err = str(e)
+        self._hard_stop()
+        self.recover_failed.emit(last_err)
 
     def _hard_stop(self):
         self._fade_epoch += 1
@@ -1935,10 +2276,6 @@ class VCEngine(QObject):
                 except Exception:
                     pass
                 self.worker_thread.wait(400)
-                try:
-                    self.pipeline.connect(timeout=3)
-                except Exception:
-                    pass
             if self.pipeline is not None:
                 try:
                     self.pipeline.stop()
@@ -1982,7 +2319,7 @@ class VCEngine(QObject):
             self.change_index_rate(0.35)
             if self.current_speaker is not None:
                 self.current_speaker.index_rate = 0.35
-        self.status_msg.emit("推理偏慢：已自动关 VAD/去齿音并降低检索，稳住实时")
+        self.status_msg.emit("推理偏慢：已自动关人声识别/去齿音并降低检索，稳住实时")
 
     def _on_worker_xrun(self):
         self.xrun_count += 1
@@ -2172,6 +2509,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("RVC 实时变声")
         self.setMinimumSize(1040, 640)
         self.setAcceptDrops(True)
+        self._apply_app_icon()
         self.speaker_mgr = SpeakerManager()
         self._settings = load_user_settings()
         self._live_guard = False
@@ -2185,12 +2523,20 @@ class MainWindow(QMainWindow):
         self._pending_mode = None
         url = self._settings.get("server_url") or DEFAULT_SERVER_URL
         mode = self._settings.get("infer_mode") or "local"
+        if pack_mode() == "server":
+            mode = "server"
         self.engine = VCEngine(mode=mode, server_url=url)
+        self._ui_ready = False
+        self._last_local_prompt = 0.0
+        self._last_alert = ("", 0.0)
         self.engine.status_msg.connect(self._on_status)
         self.engine.infer_time.connect(self._on_infer_time)
         self.engine.started_ok.connect(self._on_started)
         self.engine.stopped_ok.connect(self._on_stopped)
         self.engine.load_failed.connect(self._on_start_failed)
+        self.engine.recover_progress.connect(self._on_recover_progress)
+        self.engine.recover_ok.connect(self._on_recover_ok)
+        self.engine.recover_failed.connect(self._on_recover_failed)
         self.engine.rms_levels.connect(self._on_rms_levels)
         self.engine.xrun_signal.connect(self._on_xrun)
         self.engine.loop_latency.connect(self._on_loop_latency)
@@ -2218,6 +2564,9 @@ class MainWindow(QMainWindow):
         self._progress_timer.setInterval(1000)
         self._progress_timer.timeout.connect(self._update_load_progress)
         self._progress_timer.start()
+        self._ui_ready = True
+        self._setup_tray()
+        QTimer.singleShot(400, self._maybe_prompt_local_infer)
 
     def _on_rms_levels(self, in_db, out_db):
         self.in_meter.set_level(in_db)
@@ -2226,6 +2575,57 @@ class MainWindow(QMainWindow):
     def _on_spectrum(self, bins):
         if hasattr(self, "spectrum"):
             self.spectrum.set_bins(bins)
+
+    def _icon_path(self, *names):
+        roots = (
+            package_root() / "assets" / "icons",
+            PROJECT_ROOT / "assets" / "icons",
+        )
+        for root in roots:
+            for name in names:
+                p = root / name
+                if p.is_file():
+                    return str(p)
+        return ""
+
+    def _apply_app_icon(self):
+        path = self._icon_path("app.ico", "app.png")
+        if not path:
+            return
+        icon = QIcon(path)
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        path = self._icon_path("tray.ico", "app.ico", "tray.png")
+        if not path:
+            return
+        self.tray = QSystemTrayIcon(QIcon(path), self)
+        self.tray.setToolTip("RVC 实时变声")
+        menu = QMenu(self)
+        act_show = QAction("打开窗口", self)
+        act_show.triggered.connect(self._show_from_tray)
+        act_quit = QAction("退出", self)
+        act_quit.triggered.connect(QApplication.instance().quit)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_from_tray()
 
     def _apply_theme(self):
         global UI_DARK
@@ -2241,10 +2641,13 @@ class MainWindow(QMainWindow):
             self.spectrum.set_dark(False)
 
     def _cable_wizard(self):
+        self.status_bar.showMessage("正在检测虚拟声卡…", 3000)
+        QApplication.processEvents()
         dlg = CableWizard(self, self.ic, self.oc)
         if dlg.exec():
             self._on_device_changed("output")
             self._persist_settings()
+            self.status_bar.showMessage("虚拟声卡设置已更新", 4000)
 
     def _on_xrun(self, xruns):
         self.xrun_label.setText(f"卡顿 {xruns}")
@@ -2292,6 +2695,16 @@ class MainWindow(QMainWindow):
         top.setContentsMargins(14, 8, 14, 8)
         top.setSpacing(12)
 
+        logo = QLabel()
+        logo.setFixedSize(36, 36)
+        logo.setScaledContents(False)
+        logo_path = self._icon_path("app_64.png", "app.png", "app.ico")
+        if logo_path:
+            pix = QPixmap(logo_path).scaled(
+                36, 36, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            logo.setPixmap(pix)
+            logo.setToolTip("RVC 实时变声")
+        top.addWidget(logo)
         title = QLabel("RVC 实时变声")
         title.setObjectName("appTitle")
         top.addWidget(title)
@@ -2351,7 +2764,9 @@ class MainWindow(QMainWindow):
 
         # 角色下拉选择
         self.sc = create_styled_combo(max_visible=12)
-        self.sc.setMinimumHeight(32)
+        self.sc.setObjectName("speakerCombo")
+        self.sc.setMinimumHeight(36)
+        self.sc.setToolTip("选择角色")
         self.sc.currentIndexChanged.connect(self._sel)
         l.addWidget(self.sc)
 
@@ -2375,6 +2790,8 @@ class MainWindow(QMainWindow):
         self.cur_name = QLabel("未选择角色")
         self.cur_name.setStyleSheet("font-size:14px;font-weight:700;color:#111827;")
         self.cur_model = QLabel("")
+        self.cur_model.setWordWrap(True)
+        self.cur_model.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.cur_model.setStyleSheet("font-size:11px;color:#6b7280;")
         self.cur_info = QLabel("")
         self.cur_info.setStyleSheet("font-size:11px;color:#6b7280;")
@@ -2448,6 +2865,9 @@ class MainWindow(QMainWindow):
         self.server_edit.setPlaceholderText("ws://主机:8765")
         self.conn_btn = QPushButton("连接")
         self.conn_btn.setObjectName("btnConnect")
+        self.conn_btn.setMinimumWidth(88)
+        self.conn_btn.setMinimumHeight(32)
+        self.conn_btn.setCursor(Qt.PointingHandCursor)
         self.conn_btn.setToolTip("改完地址后点这里，按新地址重连（不重新加载角色）")
         self.conn_btn.clicked.connect(self._connect_server)
         self.server_row = QWidget()
@@ -2457,6 +2877,9 @@ class MainWindow(QMainWindow):
         sl.addWidget(self._lbl("服务器"))
         sl.addWidget(self.server_edit, 1)
         sl.addWidget(self.conn_btn)
+        self.server_status = QLabel("未连接")
+        self.server_status.setWordWrap(True)
+        self._set_server_status("未连接", "idle")
 
         # 冻结版：本地推理一键安装入口（源码运行时隐藏）
         self.local_install_row = QWidget()
@@ -2468,7 +2891,7 @@ class MainWindow(QMainWindow):
         self.local_install_lbl.setStyleSheet("font-size:12px;color:#b45309;")
         self.local_install_btn = QPushButton("安装本地推理")
         self.local_install_btn.setObjectName("btnConnect")
-        self.local_install_btn.setToolTip("下载并安装本机推理环境（需 NVIDIA 显卡与网络）")
+        self.local_install_btn.setToolTip("下载并安装本机推理环境（需英伟达显卡与网络）")
         self.local_install_btn.clicked.connect(self._install_local)
         il.addWidget(self.local_install_lbl, 1)
         il.addWidget(self.local_install_btn)
@@ -2483,26 +2906,28 @@ class MainWindow(QMainWindow):
         dl.addWidget(self._lbl("输入设备"), 0, 0)
         self.ic = DeviceCombo(direction="input")
         self.ic.setMinimumHeight(30)
-        self.ic.setToolTip("WASAPI 独占要求输入输出同一组 API；选择后会自动对齐另一侧")
+        self.ic.setToolTip("输入输出需选同一类接口；选择后会自动对齐另一侧")
         self.ic.currentIndexChanged.connect(lambda: self._on_device_changed("input"))
         dl.addWidget(self.ic, 0, 1)
 
         dl.addWidget(self._lbl("输出设备"), 1, 0)
         self.oc = DeviceCombo(direction="output")
         self.oc.setMinimumHeight(30)
-        self.oc.setToolTip("WASAPI 独占要求输入输出同一组 API；选择后会自动对齐另一侧")
+        self.oc.setToolTip("输入输出需选同一类接口；选择后会自动对齐另一侧")
         self.oc.currentIndexChanged.connect(lambda: self._on_device_changed("output"))
         dl.addWidget(self.oc, 1, 1)
 
         rb = QPushButton("刷新设备")
         rb.setObjectName("btnGhost")
         rb.setMinimumHeight(28)
-        rb.clicked.connect(lambda: self._rd())
+        rb.setCursor(Qt.PointingHandCursor)
+        rb.clicked.connect(self._refresh_devices_clicked)
+        self.dev_refresh_btn = rb
 
         cable_btn = QPushButton("虚拟声卡向导")
         cable_btn.setObjectName("btnGhost")
         cable_btn.setMinimumHeight(28)
-        cable_btn.setToolTip("检测 VB-Cable / VoiceMeeter，没有则打开安装页")
+        cable_btn.setToolTip("检测虚拟声卡；没有则打开安装页")
         cable_btn.clicked.connect(self._cable_wizard)
 
         row_btns = QHBoxLayout()
@@ -2551,12 +2976,13 @@ class MainWindow(QMainWindow):
         self.sb.clicked.connect(self._tg)
         l.addWidget(self.sb)
 
-        self.rec_btn = QPushButton("录音测试 (10 秒)")
-        self.rec_btn.setObjectName("btnGhost")
-        self.rec_btn.setMinimumHeight(34)
-        self.rec_btn.setToolTip("录 10 秒，用当前角色变声后保存并播放")
-        self.rec_btn.clicked.connect(self._rec)
-        l.addWidget(self.rec_btn)
+        # 录音测试暂时关闭
+        # self.rec_btn = QPushButton("录音测试 (10 秒)")
+        # self.rec_btn.setObjectName("btnGhost")
+        # self.rec_btn.setMinimumHeight(34)
+        # self.rec_btn.setToolTip("录 10 秒，用当前角色变声后保存并播放")
+        # self.rec_btn.clicked.connect(self._rec)
+        # l.addWidget(self.rec_btn)
         return g
 
     def _build_right(self):
@@ -2576,17 +3002,18 @@ class MainWindow(QMainWindow):
         l.setVerticalSpacing(8)
 
         self.fc = create_styled_combo(max_visible=10)
-        self.fc.addItems(["rmvpe", "fcpe", "pm"])
+        fill_f0_combo(self.fc, DEFAULT_PARAMS["f0method"])
         self.fc.setMinimumHeight(28)
-        self.fc.currentTextChanged.connect(lambda v: setattr(self.engine, "f0method", v))
-        self.fc.setToolTip("基频提取: rmvpe 最准, pm 最快")
+        self.fc.currentIndexChanged.connect(
+            lambda: setattr(self.engine, "f0method", f0_from_combo(self.fc)))
+        self.fc.setToolTip("音高提取：准确最稳，最快负担最小")
 
         self.bs = QDoubleSpinBox()
         self.bs.setRange(0.03, 0.5)
         self.bs.setSingleStep(0.01)
         self.bs.setValue(DEFAULT_PARAMS["block_time"])
         self.bs.setDecimals(3)
-        self.bs.setSuffix(" s")
+        self.bs.setSuffix(" 秒")
         self.bs.setMinimumHeight(28)
         self.bs.setToolTip("音频块时长（秒）。越小嘴到耳越低，GPU 越容易卡顿。运行中修改下次启动生效")
         self.bs.valueChanged.connect(lambda v: setattr(self.engine, "block_time", v))
@@ -2596,7 +3023,7 @@ class MainWindow(QMainWindow):
         self.xs.setRange(0.01, 0.5)
         self.xs.setSingleStep(0.01)
         self.xs.setValue(DEFAULT_PARAMS["crossfade_time"])
-        self.xs.setSuffix(" s")
+        self.xs.setSuffix(" 秒")
         self.xs.setMinimumHeight(28)
         self.xs.setToolTip("运行中修改将在下次启动后生效")
         self.xs.valueChanged.connect(lambda v: setattr(self.engine, "crossfade_time", v))
@@ -2605,7 +3032,7 @@ class MainWindow(QMainWindow):
         self.es.setRange(0.4, 5.0)
         self.es.setSingleStep(0.1)
         self.es.setValue(DEFAULT_PARAMS["extra_time"])
-        self.es.setSuffix(" s")
+        self.es.setSuffix(" 秒")
         self.es.setMinimumHeight(28)
         self.es.setToolTip("上下文长度：越大音色越稳，但不增加听感延迟，只增加每块算力。运行中修改下次启动生效")
         self.es.valueChanged.connect(lambda v: setattr(self.engine, "extra_time", v))
@@ -2620,8 +3047,9 @@ class MainWindow(QMainWindow):
 
         self.calib_noise_btn = QPushButton("测底噪")
         self.calib_noise_btn.setObjectName("btnGhost")
-        self.calib_noise_btn.setFixedWidth(58)
+        self.calib_noise_btn.setMinimumWidth(72)
         self.calib_noise_btn.setMinimumHeight(28)
+        self.calib_noise_btn.setCursor(Qt.PointingHandCursor)
         self.calib_noise_btn.setToolTip("保持安静 1 秒，自动测定当前环境底噪并计算最优静音阈值")
         self.calib_noise_btn.clicked.connect(self._auto_calibrate_noise)
 
@@ -2641,7 +3069,7 @@ class MainWindow(QMainWindow):
         self.rs.valueChanged.connect(lambda v: setattr(self.engine, "rms_mix_rate", v))
 
         rows = [
-            ("F0 算法", self.fc),
+            ("音高算法", self.fc),
             ("块大小", self.bs),
             ("交叉淡入", self.xs),
             ("额外上下文", self.es),
@@ -2679,7 +3107,7 @@ class MainWindow(QMainWindow):
         l2.setContentsMargins(10, 14, 10, 10)
         l2.setSpacing(10)
 
-        g_dsp = QGroupBox("人声修饰与 DSP")
+        g_dsp = QGroupBox("人声修饰")
         dl = QGridLayout(g_dsp)
         dl.setContentsMargins(10, 16, 10, 10)
         dl.setHorizontalSpacing(10)
@@ -2740,9 +3168,9 @@ class MainWindow(QMainWindow):
         # 人声识别 (VAD)
         vr = QHBoxLayout()
         vr.setSpacing(8)
-        self.vad_cb = QCheckBox("人声识别 (VAD)")
+        self.vad_cb = QCheckBox("人声识别")
         self.vad_cb.setMinimumHeight(26)
-        self.vad_cb.setToolTip("智能区分人声与环境杂音，非人声自动静音")
+        self.vad_cb.setToolTip("区分人声与环境杂音，非人声自动静音")
         self.vad_cb.setChecked(False)
         self.vad_cb.toggled.connect(lambda v: setattr(self.engine, "vad_enable", v))
         vr.addWidget(self.vad_cb)
@@ -2778,9 +3206,9 @@ class MainWindow(QMainWindow):
         m.setHorizontalSpacing(10)
         m.setVerticalSpacing(8)
 
-        self.agc_cb = QCheckBox("输入自动增益 (AGC)")
+        self.agc_cb = QCheckBox("输入自动增益")
         self.agc_cb.setMinimumHeight(26)
-        self.agc_cb.setToolTip("输入电平归一化，说话人远近变化时音色更稳定（实时生效）")
+        self.agc_cb.setToolTip("输入音量自动拉齐，远近说话时更稳（实时生效）")
         self.agc_cb.toggled.connect(self._on_agc)
         m.addWidget(self.agc_cb, 0, 0, 1, 2)
 
@@ -2850,6 +3278,12 @@ class MainWindow(QMainWindow):
         mode_row.addStretch(1)
         sg.addLayout(mode_row)
         sg.addWidget(self.server_row)
+        if hasattr(self, "server_status"):
+            sg.addWidget(self.server_status)
+        hint = QLabel("在带显卡的电脑上启动推理服务后，这里填写 ws://那台机器IP:8765")
+        hint.setWordWrap(True)
+        hint.setObjectName("fieldLabel")
+        sg.addWidget(hint)
         self.server_box = g3
         g3.toggled.connect(self._on_server_box_toggled)
         l3.addWidget(g3)
@@ -2911,8 +3345,8 @@ class MainWindow(QMainWindow):
                 else:
                     self._show_dev_hint(
                         "输入/输出不在同一驱动组，且找不到可对齐的输出设备。"
-                        "请手动把输入输出选为同组设备（WASAPI 独占要求同组 API）。")
-                    self.status_bar.showMessage("输入输出 API 不一致且无法自动对齐", 8000)
+                        "请手动把输入输出选为同一类接口。")
+                    self.status_bar.showMessage("输入输出接口不一致，无法自动对齐", 8000)
             else:
                 name = self.ic.currentDeviceName()
                 ok = self.ic.selectByNameApi(name, out_api) or self.ic.selectFirstWithApi(out_api)
@@ -2923,8 +3357,8 @@ class MainWindow(QMainWindow):
                 else:
                     self._show_dev_hint(
                         "输入/输出不在同一驱动组，且找不到可对齐的输入设备。"
-                        "请手动把输入输出选为同组设备（WASAPI 独占要求同组 API）。")
-                    self.status_bar.showMessage("输入输出 API 不一致且无法自动对齐", 8000)
+                        "请手动把输入输出选为同一类接口。")
+                    self.status_bar.showMessage("输入输出接口不一致，无法自动对齐", 8000)
         finally:
             self._device_guard = False
 
@@ -2963,9 +3397,26 @@ class MainWindow(QMainWindow):
                 ain = apis[devs[in_id]["hostapi"]]["name"]
                 aout = apis[devs[out_id]["hostapi"]]["name"]
                 return None, None, (
-                    f"输入（{ain}）与输出（{aout}）不是同一组 API，"
-                    "WASAPI 独占要求同组；请手动选择同组设备")
+                    f"输入（{_hostapi_zh(ain)}）与输出（{_hostapi_zh(aout)}）不是同一类接口，"
+                    "请选同一类后再启动")
         return in_id, out_id, None
+
+    def _refresh_devices_clicked(self):
+        btn = getattr(self, "dev_refresh_btn", None)
+        if btn is not None:
+            btn.setEnabled(False)
+            btn.setText("刷新中…")
+        self.status_bar.showMessage("正在刷新音频设备…", 0)
+        QApplication.processEvents()
+        self._rd()
+        self.status_bar.showMessage("设备列表已更新", 4000)
+        if btn is not None:
+            btn.setEnabled(True)
+            btn.setText("已刷新")
+            QTimer.singleShot(
+                900,
+                lambda: btn.setText("刷新设备") if btn.text() == "已刷新" else None,
+            )
 
     def _rd(self, restore=True, reinit=True):
         if getattr(self.engine, "running", False):
@@ -3014,10 +3465,13 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("音频设备已断开: " + err, 8000)
 
     def _preferred_speaker_index(self):
-        saved = self._settings.get("speaker")
+        saved = self._settings.get("speaker") or ""
         names = [s.name for s in self.speaker_mgr.speakers]
         if saved in names:
             return names.index(saved)
+        alias = saved[:-1] + "轮" if saved.endswith("e") else ""
+        if alias in names:
+            return names.index(alias)
         return 0
 
     def _rl(self):
@@ -3025,6 +3479,7 @@ class MainWindow(QMainWindow):
         self.sc.clear()
         for s in self.speaker_mgr.speakers:
             self.sc.addItem(s.name)
+            self.sc.setItemData(self.sc.count() - 1, _speaker_file_sub(s), Qt.UserRole + 2)
         if self.speaker_mgr.speakers:
             if self.engine.current_speaker:
                 names = [s.name for s in self.speaker_mgr.speakers]
@@ -3045,7 +3500,11 @@ class MainWindow(QMainWindow):
         if row < 0 or row >= len(self.speaker_mgr.speakers): return
         s = self.speaker_mgr.speakers[row]
         self.cur_name.setText(s.name)
-        self.cur_model.setText("模型: " + Path(s.model_path).name)
+        self.cur_model.setText(
+            "模型: " + (Path(s.model_path).name if s.model_path else "无")
+            + NL
+            + "索引: " + (Path(s.index_path).name if s.index_path else "无")
+        )
         self.cur_info.setText(
             f"音高 {s.pitch:+d}  检索 {s.index_rate:.1f}  共振峰 {s.formant:+.1f}"
             if getattr(s, "formant", 0.0) != 0.0
@@ -3054,6 +3513,7 @@ class MainWindow(QMainWindow):
         if self.engine.current_speaker is s:
             self._set_light(LIGHT_GREEN, "就绪")
             self.sb.setEnabled(True)
+            self._show_loaded_paths(s)
             return
         if self.engine.running:
             self._pending_speaker = s
@@ -3067,6 +3527,14 @@ class MainWindow(QMainWindow):
         self._start_loading(s)
 
     def _start_loading(self, speaker):
+        if self.engine.mode == "local" and not self._guard_local_infer(
+                prompt=getattr(self, "_ui_ready", False)):
+            if pack_mode() == "server":
+                self._set_light(LIGHT_YELLOW, "请连接远程服务器")
+            else:
+                self._set_light(LIGHT_YELLOW, "请先安装本地推理")
+            self.sb.setEnabled(True)
+            return
         # 旧加载线程保留引用防 GC（PySide6 中 deleteLater 与信号竞争会崩溃）
         if not hasattr(self, "_loaders"):
             self._loaders = []
@@ -3147,8 +3615,70 @@ class MainWindow(QMainWindow):
                 extra = " · 特征 " + lab
         except Exception:
             extra = ""
-        self.status_bar.showMessage("模型已加载: " + speaker.name + extra, 6000)
+        self._show_loaded_paths(speaker)
+        info = self._pipeline_file_info()
+        pth = info.get("model_path") or Path(speaker.model_path).name
+        idx = info.get("index_path") or ""
+        idx_txt = Path(idx).name if idx else "无索引"
+        if idx and not info.get("index_loaded"):
+            idx_txt += "（未启用）"
+        self.status_bar.showMessage(
+            "已加载 " + speaker.name + " · " + Path(str(pth)).name
+            + " · " + idx_txt + extra, 8000)
         self._persist_settings()
+
+    def _pipeline_file_info(self):
+        pipe = self.engine.pipeline
+        fn = getattr(pipe, "loaded_file_info", None)
+        if callable(fn):
+            try:
+                return fn() or {}
+            except Exception:
+                return {}
+        rvc = getattr(getattr(pipe, "_real", None), "rvc", None) or getattr(pipe, "rvc", None)
+        if rvc is None:
+            return {}
+        pth = getattr(rvc, "pth_path", "") or ""
+        idx = getattr(rvc, "index_path", "") or ""
+        return {
+            "model_path": pth,
+            "index_path": idx,
+            "index_loaded": getattr(rvc, "index", None) is not None,
+        }
+
+    def _show_loaded_paths(self, speaker=None):
+        info = self._pipeline_file_info()
+        pth = (info.get("model_path") or "").strip()
+        idx = (info.get("index_path") or "").strip()
+        if not pth and speaker is not None:
+            pth = speaker.model_path or ""
+        if not pth:
+            return
+        lines = ["模型: " + pth]
+        if idx:
+            tag = "" if info.get("index_loaded", True) else "（未启用）"
+            lines.append("索引: " + idx + tag)
+        else:
+            req = ""
+            if speaker is not None:
+                req = Path(str(speaker.index_path or "")).name
+            lines.append("索引: 未找到 " + req if req else "索引: 无")
+        self.cur_model.setText(NL.join(lines))
+        self.cur_model.setToolTip(NL.join(lines))
+
+    def _alert(self, title, text, kind="warn"):
+        """避免同一错误短时间连弹。"""
+        text = (text or "").strip()
+        key = title + "|" + text[:80]
+        now = time.time()
+        last_key, last_t = getattr(self, "_last_alert", ("", 0.0))
+        if key == last_key and now - last_t < 3.0:
+            return
+        self._last_alert = (key, now)
+        if kind == "info":
+            QMessageBox.information(self, title, text)
+        else:
+            QMessageBox.warning(self, title, text)
 
     def _on_load_failed(self, err, gen=0):
         if gen != self._load_gen:
@@ -3156,17 +3686,25 @@ class MainWindow(QMainWindow):
         self._load_started = None
         self._set_light(LIGHT_RED, "加载失败")
         self.sb.setEnabled(True)
-        text = (err or "未知错误").strip()
-        if len(text) > 300:
-            text = text[:300] + "…"
+        text = _friendly_error(err)
+        hint = "请核对模型/索引文件是否存在。"
+        if self.engine.mode == "server":
+            connected = False
+            try:
+                connected = bool(self.engine.pipeline.is_connected())
+            except Exception:
+                connected = False
+            if connected:
+                hint = "服务器已连上。请确认远端有同名的模型/索引文件（只认文件名，不认本机路径）。"
+            else:
+                hint = "请先点「连接」。服务器只认文件名，远端要有同名 .pth / .index。"
         self.status_bar.showMessage("加载失败: " + text, 8000)
-        QMessageBox.warning(
-            self, "模型加载失败", text + NL + NL +
-            "请确认：模型文件完整且路径正确；服务器模式下请确认服务器已启动。")
+        self._show_dev_hint("加载失败: " + text[:160])
+        self._alert("模型加载失败", text + NL + NL + hint)
 
     def _on_start_failed(self, msg):
         """启动变声失败：常驻提示 + 弹窗。"""
-        text = (msg or "未知错误").strip()
+        text = _friendly_error(msg)
         self.sb.setEnabled(True)
         self.sb.setText("启动变声")
         self.sb.setProperty("state", "off")
@@ -3174,7 +3712,31 @@ class MainWindow(QMainWindow):
         self._set_light(LIGHT_RED, "启动失败")
         self._show_dev_hint("启动失败: " + text[:200])
         self.status_bar.showMessage("启动失败: " + text, 8000)
-        QMessageBox.warning(self, "启动失败", text[:300])
+        self._alert("启动失败", text)
+
+    def _on_recover_progress(self, n, total):
+        self._set_light(LIGHT_YELLOW, "正在重连 %d/%d" % (n, total))
+        if self.engine.mode == "server":
+            self._set_server_status("连接中断，正在重连 %d/%d…" % (n, total), "busy")
+
+    def _on_recover_ok(self):
+        self._set_light(LIGHT_GREEN, "运行中")
+        self._clear_dev_hint()
+        if self.engine.mode == "server":
+            self._set_server_status("已重新连上服务器", "ok")
+        self.status_bar.showMessage("已重新连上服务器，变声继续", 5000)
+
+    def _on_recover_failed(self, err):
+        text = _friendly_error(err)
+        self._set_light(LIGHT_RED, "连接中断")
+        self._show_dev_hint("服务器已断开，变声已停止")
+        if self.engine.mode == "server":
+            self._set_server_status("已断开", "fail")
+        self.status_bar.showMessage("重连失败，变声已停止", 8000)
+        self._alert(
+            "服务器中断",
+            text + NL + NL +
+            "变声已停止。请确认推理服务仍在运行，点「连接」成功后再启动变声。")
 
     def _set_light(self, color, text):
         self.light.setStyleSheet(f"background:{color};border-radius:4px;")
@@ -3212,49 +3774,51 @@ class MainWindow(QMainWindow):
             self._apply_mode(mode)
 
     def _on_status(self, m):
-        self.status_bar.showMessage(m, 5000)
+        hold = 8000 if any(k in str(m) for k in ("失败", "中断", "错误", "断开")) else 5000
+        self.status_bar.showMessage(m, hold)
 
-    def _rec(self):
-        """录音测试：录 10 秒 → 当前角色变声 → 保存 wav 并播放"""
-        if not self.engine.pipeline.is_loaded:
-            QMessageBox.warning(self, "提示", "请先加载角色模型")
-            return
-        if self.engine.running:
-            QMessageBox.warning(self, "提示", "请先停止实时转换")
-            return
-        if hasattr(self, "_rec_thread") and self._rec_thread is not None and self._rec_thread.isRunning():
-            QMessageBox.information(self, "提示", "录音正在进行中，请稍候...")
-            return
-        rec_dev = None
-        in_name = self.ic.currentDeviceName()
-        in_api = self.ic.currentDeviceApi()
-        if in_name:
-            try:
-                for i, d in enumerate(sd.query_devices()):
-                    if d['name'] == in_name and d['hostapi'] == in_api and d['max_input_channels'] > 0:
-                        rec_dev = i
-                        break
-            except Exception:
-                rec_dev = None
-        self.rec_btn.setEnabled(False)
-        self.rec_btn.setText("录音中…")
-        self._rec_thread = RecThread(self.engine, 10, rec_dev, self)
-        self._rec_thread.done.connect(self._rec_done)
-        self._rec_thread.start()
-
-    def _rec_done(self, path, err):
-        self.rec_btn.setEnabled(True)
-        self.rec_btn.setText("录音测试 10 秒")
-        if err:
-            QMessageBox.warning(self, "录音失败", err)
-            return
-        msg = "已保存: " + path + NL + NL + "正在用系统播放器打开，请听变声效果。"
-        QMessageBox.information(self, "录音完成", msg)
-        try:
-            import os
-            os.startfile(os.path.abspath(path))
-        except Exception:
-            pass
+    # 录音测试暂时关闭
+    # def _rec(self):
+    #     """录音测试：录 10 秒 → 当前角色变声 → 保存 wav 并播放"""
+    #     if not self.engine.pipeline.is_loaded:
+    #         QMessageBox.warning(self, "提示", "请先加载角色模型")
+    #         return
+    #     if self.engine.running:
+    #         QMessageBox.warning(self, "提示", "请先停止实时转换")
+    #         return
+    #     if hasattr(self, "_rec_thread") and self._rec_thread is not None and self._rec_thread.isRunning():
+    #         QMessageBox.information(self, "提示", "录音正在进行中，请稍候...")
+    #         return
+    #     rec_dev = None
+    #     in_name = self.ic.currentDeviceName()
+    #     in_api = self.ic.currentDeviceApi()
+    #     if in_name:
+    #         try:
+    #             for i, d in enumerate(sd.query_devices()):
+    #                 if d['name'] == in_name and d['hostapi'] == in_api and d['max_input_channels'] > 0:
+    #                     rec_dev = i
+    #                     break
+    #         except Exception:
+    #             rec_dev = None
+    #     self.rec_btn.setEnabled(False)
+    #     self.rec_btn.setText("录音中…")
+    #     self._rec_thread = RecThread(self.engine, 10, rec_dev, self)
+    #     self._rec_thread.done.connect(self._rec_done)
+    #     self._rec_thread.start()
+    #
+    # def _rec_done(self, path, err):
+    #     self.rec_btn.setEnabled(True)
+    #     self.rec_btn.setText("录音测试 10 秒")
+    #     if err:
+    #         QMessageBox.warning(self, "录音失败", err)
+    #         return
+    #     msg = "已保存: " + path + NL + NL + "正在用系统播放器打开，请听变声效果。"
+    #     QMessageBox.information(self, "录音完成", msg)
+    #     try:
+    #         import os
+    #         os.startfile(os.path.abspath(path))
+    #     except Exception:
+    #         pass
 
     def _on_infer_time(self, ms):
         budget = max(30, int(float(self.engine.block_time) * 1000))
@@ -3275,6 +3839,8 @@ class MainWindow(QMainWindow):
             return
         if self.engine._engine_busy():
             self.status_bar.showMessage("正在处理，请稍候...", 3000)
+            return
+        if not self._guard_local_infer():
             return
         if not self.engine.pipeline.is_loaded:
             QMessageBox.warning(self, "提示", "请先选择角色模型")
@@ -3415,8 +3981,9 @@ class MainWindow(QMainWindow):
         """1 秒环境底噪自动采样并校准静音阈值"""
         in_id = self.ic.currentDeviceId()
         self.calib_noise_btn.setEnabled(False)
-        self.calib_noise_btn.setText("采样中...")
-        self.status_bar.showMessage("请保持安静 1 秒，正在测定麦克风环境底噪...", 3000)
+        self.calib_noise_btn.setText("测定中…")
+        self.status_bar.showMessage("请保持安静 1 秒，正在测定麦克风环境底噪…", 0)
+        QApplication.processEvents()
 
         class CalibNoiseThread(QThread):
             calib_done = Signal(object, str)
@@ -3464,11 +4031,11 @@ class MainWindow(QMainWindow):
                 noise_db, target_thresh = res
                 self.ts.setValue(target_thresh)
                 self.status_bar.showMessage(
-                    f"✓ 底噪测定完成：当前环境底噪 {noise_db} dB，已自动设定静音阈值与 AGC 门限为 {target_thresh} dB",
+                    f"测定完成：环境底噪 {noise_db} dB，静音阈值已设为 {target_thresh} dB",
                     6000,
                 )
             else:
-                self.status_bar.showMessage(f"底噪测定失败: {err}", 4000)
+                self.status_bar.showMessage("测定失败: " + str(err), 4000)
 
         self._calib_thread.calib_done.connect(_on_calib_finish)
         self._calib_thread.start()
@@ -3587,9 +4154,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         if "f0method" in params:
-            i = self.fc.findText(str(params["f0method"]))
-            if i >= 0:
-                self.fc.setCurrentIndex(i)
+            set_f0_combo(self.fc, str(params["f0method"]))
         if "I_noise_reduce" in params:
             self.inc.setChecked(bool(params["I_noise_reduce"]))
         if "O_noise_reduce" in params:
@@ -3650,7 +4215,49 @@ class MainWindow(QMainWindow):
             "dry_mix": float(self.live_dry.value()) if hasattr(self, "live_dry") else 0.0,
         }
 
-    def _apply_mode(self, mode):
+    def _local_infer_block_reason(self):
+        """冻结包不能本机推理时的原因：server / install；可以跑则 None。"""
+        if self.engine.mode != "local":
+            return None
+        if not is_frozen():
+            return None
+        if pack_mode() == "server":
+            return "server"
+        if not local_infer_ready():
+            return "install"
+        return None
+
+    def _show_local_infer_prompt(self, why):
+        now = time.time()
+        if now - getattr(self, "_last_local_prompt", 0) < 2.5:
+            return
+        self._last_local_prompt = now
+        if why == "server":
+            QMessageBox.information(self, "不能本机推理", MSG_SERVER_PACK_NO_LOCAL)
+        elif why == "install":
+            QMessageBox.information(self, "请先安装本地推理", MSG_NEED_INSTALL_LOCAL)
+
+    def _maybe_prompt_local_infer(self):
+        why = self._local_infer_block_reason()
+        if why:
+            self._show_local_infer_prompt(why)
+
+    def _guard_local_infer(self, prompt=True):
+        why = self._local_infer_block_reason()
+        if not why:
+            return True
+        if prompt and getattr(self, "_ui_ready", False):
+            self._show_local_infer_prompt(why)
+        return False
+
+    def _apply_mode(self, mode, reload_speaker=True):
+        if mode == "local" and is_frozen() and not local_infer_ready():
+            why = "server" if pack_mode() == "server" else "install"
+            if why == "server":
+                self._sync_mode_ui()
+                self._show_local_infer_prompt(why)
+                return
+            self._show_local_infer_prompt(why)
         if self.engine.mode == mode:
             self._sync_mode_ui()
             return
@@ -3663,7 +4270,7 @@ class MainWindow(QMainWindow):
         self.engine.set_mode(mode)
         self._sync_mode_ui()
         self._persist_settings()
-        if self.speaker_mgr.speakers:
+        if reload_speaker and self.speaker_mgr.speakers:
             self.engine.current_speaker = None
             row = self.sc.currentIndex()
             if row >= 0:
@@ -3693,27 +4300,89 @@ class MainWindow(QMainWindow):
             self.mode_local.blockSignals(False)
             self.mode_server.blockSignals(False)
 
-    def _connect_server(self):
-        url = self.server_edit.text().strip() or DEFAULT_SERVER_URL
-        self.engine.set_server_url(url)
-        self._persist_settings()
-        ok = False
-        try:
-            ok = bool(self.engine.pipeline.connect(timeout=5))
-        except Exception as e:
-            ok = False
-            self.status_bar.showMessage("连接失败: " + _friendly_net_error(e), 8000)
-            QMessageBox.warning(
-                self, "连接服务器",
-                "无法连接 " + url + NL + NL + _friendly_net_error(e))
+    def _set_server_status(self, text, kind="idle"):
+        if not hasattr(self, "server_status"):
             return
+        colors = {
+            "idle": ("#6b7280", "#f8fafc", "#e5e7eb"),
+            "busy": ("#1d4ed8", "#dbeafe", "#93c5fd"),
+            "ok": ("#0f766e", "#ecfdf5", "#99f6e4"),
+            "fail": ("#b91c1c", "#fef2f2", "#fecaca"),
+        }
+        fg, bg, bd = colors.get(kind, colors["idle"])
+        self.server_status.setText(text)
+        self.server_status.setStyleSheet(
+            f"font-size:12px;font-weight:600;color:{fg};background:{bg};"
+            f"border:1px solid {bd};border-radius:6px;padding:6px 8px;")
+
+    def _tick_connect_busy(self):
+        btn = getattr(self, "conn_btn", None)
+        t = getattr(self, "_conn_thread", None)
+        if btn is None or t is None or not t.isRunning():
+            timer = getattr(self, "_conn_busy_timer", None)
+            if timer is not None:
+                timer.stop()
+            return
+        n = getattr(self, "_conn_dots", 0) + 1
+        self._conn_dots = n % 3
+        btn.setText("连接中" + "." * (self._conn_dots + 1))
+
+    def _connect_server(self):
+        url = _normalize_ws_url(self.server_edit.text())
+        self.server_edit.setText(url)
+        t = getattr(self, "_conn_thread", None)
+        if t is not None and t.isRunning():
+            self._set_server_status("正在连接，请稍候…", "busy")
+            self.status_bar.showMessage("正在连接，请稍候…", 3000)
+            return
+        self.conn_btn.setEnabled(False)
+        self.conn_btn.setText("连接中…")
+        self._set_server_status("正在连接 " + url, "busy")
+        self.status_bar.showMessage("正在连接 " + url, 0)
+        self._conn_dots = 0
+        timer = getattr(self, "_conn_busy_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(400)
+            timer.timeout.connect(self._tick_connect_busy)
+            self._conn_busy_timer = timer
+        timer.start()
+        self.engine.server_url = url
+        self._persist_settings()
+        if self.engine.mode != "server":
+            self._apply_mode("server", reload_speaker=False)
+        self._conn_thread = ServerConnectThread(self.engine.pipeline, url, self)
+        self._conn_thread.done.connect(self._on_server_connected, Qt.UniqueConnection)
+        self._conn_thread.start()
+
+    def _on_server_connected(self, ok, extra):
+        timer = getattr(self, "_conn_busy_timer", None)
+        if timer is not None:
+            timer.stop()
+        self.conn_btn.setEnabled(True)
+        url = _normalize_ws_url(self.server_edit.text())
         if ok:
-            self.status_bar.showMessage("已连接服务器: " + url, 5000)
+            self.conn_btn.setText("已连接")
+            QTimer.singleShot(1600, lambda: (
+                self.conn_btn.setText("连接")
+                if self.conn_btn.text() == "已连接" else None
+            ))
+            msg = "已连接 " + url
+            if extra:
+                msg += "  (" + extra + ")"
+            self._set_server_status(msg, "ok")
+            self.status_bar.showMessage(msg, 6000)
+            if self.speaker_mgr.speakers and self.sc.currentIndex() >= 0:
+                self.engine.current_speaker = None
+                self._sel(self.sc.currentIndex())
         else:
+            self.conn_btn.setText("连接")
+            err = extra or "请确认：那台机器已启动推理服务，地址端口正确，防火墙放行 8765。"
+            self._set_server_status("连接失败", "fail")
+            self.status_bar.showMessage("连接失败: " + err, 8000)
             QMessageBox.warning(
                 self, "连接服务器",
-                "无法连接 " + url + NL + NL +
-                "请确认：服务器已启动、地址与端口正确（默认 8765）、防火墙已放行。")
+                "无法连接 " + url + NL + NL + _friendly_error(err))
 
     # ── 冻结版：本地推理安装 ──
     def _refresh_local_install(self):
@@ -3721,28 +4390,46 @@ class MainWindow(QMainWindow):
             self.local_install_row.setVisible(False)
             return
         self.local_install_row.setVisible(True)
+        if pack_mode() == "server":
+            self.local_install_lbl.setText(
+                "本包为服务器客户端，不能本机推理。请连接远程服务器。")
+            self.local_install_btn.setVisible(False)
+            return
+        self.local_install_btn.setVisible(True)
         if runtime_installed():
             self.local_install_lbl.setText("本地推理环境已安装（约 3.5GB）")
             self.local_install_btn.setText("重新安装")
         else:
             self.local_install_lbl.setText(
-                "本地推理未安装：需要 NVIDIA 显卡，点击右侧按钮开始（需联网，约 3.5GB）")
+                "本地推理未安装：需要英伟达显卡，点击右侧按钮开始（需联网，约 3.5GB）")
             self.local_install_btn.setText("安装本地推理")
 
     def _install_local(self):
+        if pack_mode() == "server":
+            self._show_local_infer_prompt("server")
+            return
         root = package_root()
         bat = root / "install_local.bat"
         if not bat.is_file():
-            QMessageBox.warning(self, "安装本地推理",
-                                "未找到 install_local.bat（安装包不完整）")
+            QMessageBox.warning(
+                self, "安装本地推理",
+                "未找到 install_local.bat。单机版请重新解压完整安装包。")
             return
+        self.local_install_btn.setEnabled(False)
+        self.local_install_btn.setText("正在打开…")
+        QApplication.processEvents()
         try:
             subprocess.Popen(
                 ["cmd", "/c", "start", "RVC 本地推理安装", str(bat)],
                 cwd=str(root))
         except Exception as e:
+            self.local_install_btn.setEnabled(True)
+            self.local_install_btn.setText("安装本地推理")
             QMessageBox.warning(self, "安装本地推理", "无法打开安装窗口: " + str(e))
             return
+        self.local_install_btn.setEnabled(True)
+        self.local_install_btn.setText("已打开安装")
+        QTimer.singleShot(2000, lambda: self._refresh_local_install())
         self.status_bar.showMessage(
             "安装窗口已打开。完成后本程序会自动检测，若未生效请重启本程序", 12000)
 
@@ -3762,9 +4449,7 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
         if "f0method" in s:
-            i = self.fc.findText(str(s["f0method"]))
-            if i >= 0:
-                self.fc.setCurrentIndex(i)
+            set_f0_combo(self.fc, str(s["f0method"]))
         self.inc.setChecked(bool(s.get("I_noise_reduce", False)))
         self.onc.setChecked(bool(s.get("O_noise_reduce", False)))
         if hasattr(self, "live_dry"):
@@ -3910,7 +4595,7 @@ class SpeakerDialog(QDialog):
         l.addRow("索引文件:", ir)
 
         self.si = QSpinBox(); self.si.setRange(0, 200); self.si.setValue(s.speaker_id)
-        l.addRow("说话人ID:", self.si)
+        l.addRow("说话人编号:", self.si)
 
         self.preset_combo = QComboBox()
         self.preset_combo.addItems([
@@ -3939,10 +4624,9 @@ class SpeakerDialog(QDialog):
         self.fs.setToolTip("共振峰偏移（半音），0 为不偏移")
         l.addRow("共振峰:", self.fs)
 
-        self.fmc = QComboBox(); self.fmc.addItems(["rmvpe", "fcpe", "pm"])
-        i = self.fmc.findText(getattr(s, "f0method", "rmvpe") or "rmvpe")
-        self.fmc.setCurrentIndex(i if i >= 0 else 0)
-        l.addRow("F0 方法:", self.fmc)
+        self.fmc = create_styled_combo()
+        fill_f0_combo(self.fmc, getattr(s, "f0method", "rmvpe") or "rmvpe")
+        l.addRow("音高算法:", self.fmc)
 
         nr = QHBoxLayout(); nr.setSpacing(12)
         self.inc2 = QCheckBox("输入降噪"); self.inc2.setChecked(bool(getattr(s, "I_noise_reduce", False)))
@@ -3977,17 +4661,37 @@ class SpeakerDialog(QDialog):
         engine = getattr(self.parent(), "engine", None)
         if engine is None:
             return
-        try:
-            models = engine.pipeline.list_models()
-        except Exception:
-            models = []
-        if not models:
+        pipe = getattr(engine, "pipeline", None)
+        if pipe is None or not getattr(pipe, "is_connected", lambda: False)():
             QMessageBox.warning(self, "提示",
-                "无法获取服务器模型列表" + NL + "请确认已连接服务器（状态栏显示已连接）")
+                "请先点「连接」，连上服务器后再获取模型列表")
             return
-        name, ok = QInputDialog.getItem(self, "服务器模型", "选择模型文件:", models, 0, False)
-        if ok and name:
-            self.me.setText(name)
+        self.setCursor(Qt.WaitCursor)
+
+        class _ListThread(QThread):
+            got = Signal(list)
+
+            def run(self_t):
+                try:
+                    self_t.got.emit(list(pipe.list_models() or []))
+                except Exception:
+                    self_t.got.emit([])
+
+        def _got(models):
+            self.unsetCursor()
+            if not models:
+                QMessageBox.warning(self, "提示",
+                    "无法获取服务器模型列表" + NL + "请确认已连接服务器")
+                return
+            name, ok = QInputDialog.getItem(
+                self, "服务器模型", "选择模型文件:", models, 0, False)
+            if ok and name:
+                self.me.setText(name)
+
+        t = _ListThread(self)
+        t.got.connect(_got)
+        self._list_models_thread = t
+        t.start()
 
     @staticmethod
     def _br(filt, start, target):
@@ -4006,7 +4710,7 @@ class SpeakerDialog(QDialog):
         self.result = SpeakerConfig(
             n, mp, self.ie.text().strip(),
             self.si.value(), self.ps.value(), self.irs.value(),
-            formant=self.fs.value(), f0method=self.fmc.currentText(),
+            formant=self.fs.value(), f0method=f0_from_combo(self.fmc),
             I_noise_reduce=self.inc2.isChecked(),
             O_noise_reduce=self.onc2.isChecked())
         self.accept()
@@ -4017,6 +4721,8 @@ class SpeakerDialog(QDialog):
 if __name__ == "__main__":
     setup_logging()
     sys.excepthook = _excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_excepthook
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE_QSS)
