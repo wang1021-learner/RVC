@@ -77,6 +77,7 @@ a = Analysis(
         'worker.rvc_client',
         'tools.audio_meter',
         'tools.audio_process',
+        'tools.client_ns',
         'websocket',
         'websocket._abnf',
         'sounddevice',

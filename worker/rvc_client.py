@@ -9,6 +9,8 @@ import json, struct, time, threading, socket
 import numpy as np
 import websocket
 
+from tools.client_ns import CaptureDenoise
+
 # websocket-client 超时抛 WebSocketTimeoutException（不是 socket.timeout 子类），
 # 不识别会落进 except Exception 被误判为断连
 try:
@@ -42,6 +44,13 @@ class RVCClient:
         self.index_loaded = False
         self.gpu_name = ""
         self.last_error = ""
+        self._last_good = None   # 超时用 PLC 延拓，避免插零导致发涩、断续
+        self._rtt_ema = 0.04     # 秒，用成功回包估 RTT
+        self._rtt_m2 = 0.0       # RTT 抖动（平方差 EMA）
+        self._conceal_streak = 0
+        self._last_stage_ms = {}
+        self.capture_denoise = True
+        self._cap_ns = CaptureDenoise()
 
     @property
     def is_loaded(self) -> bool:
@@ -64,7 +73,20 @@ class RVCClient:
 
     @property
     def last_stage_ms(self):
-        return {}
+        return dict(self._last_stage_ms)
+
+    def inflight_depth(self):
+        """按 RTT+抖动估在途块数：局域网常为 1，弱网最多 3。本机子进程固定 1。"""
+        if not getattr(self, "is_remote", True):
+            return 1
+        sr = float(self.samplerate or 48000)
+        block = (float(self._block_frame) / sr) if self._block_frame else 0.06
+        if block <= 0:
+            block = 0.06
+        rtt = float(getattr(self, "_rtt_ema", 0.04) or 0.04)
+        std = float(np.sqrt(max(0.0, getattr(self, "_rtt_m2", 0.0))))
+        extra = int(round((rtt + 2.0 * std) / block))
+        return max(1, min(3, 1 + extra))
 
     @property
     def tgt_sr(self) -> int:
@@ -191,6 +213,14 @@ class RVCClient:
             "rms_mix_rate": params.get("rms_mix_rate", 0.3),
             "threhold": params.get("threhold", -50),
         }
+        for k in (
+            "limiter_enable", "limiter_threshold_db",
+            "hf_mix_rate", "presence", "deesser_enable",
+            "vad_enable", "vad_threshold",
+            "incremental_hubert",
+        ):
+            if k in params:
+                cmd[k] = params[k]
         self._on_status("正在加载模型...")
         try:
             if not self._acquire_io(8.0):
@@ -235,8 +265,7 @@ class RVCClient:
             if not self._acquire_io(8.0):
                 return False
             try:
-                # 改过参数时服务端要重新预热 CUDA Graph（10~20s），
-                # 此调用在后台线程执行，耐心等 60s 不误报失败
+                # start 本身很快；若碰到旧服务端仍在推理线程里预热，最多等 60s
                 self._ws.settimeout(60.0)
                 self._ws.send(json.dumps(cmd))
                 resp = json.loads(self._ws.recv())
@@ -265,6 +294,9 @@ class RVCClient:
         self._ws = None
         self._connected = False
         self._active = False
+        self._last_good = None
+        self._last_stage_ms = {}
+        self._conceal_streak = 0
         if ws is None:
             return
         sock = getattr(ws, "sock", None)
@@ -319,8 +351,36 @@ class RVCClient:
             self._send_lock.release()
 
     def _silence(self, n):
+        """超时/丢包：按上一块周期做重叠延拓，连续丢失再衰减。"""
         n = int(n) if n else (self._block_frame or 256)
-        return np.zeros(n, dtype=np.float32).reshape(-1, 1)
+        last = self._last_good
+        if last is None or last.size < 64:
+            return np.zeros(n, dtype=np.float32).reshape(-1, 1)
+        x = np.asarray(last, dtype=np.float32).reshape(-1)
+        sr = float(self.samplerate or 48000)
+        min_lag = max(32, int(sr / 400.0))
+        max_lag = min(int(x.size) - 1, int(sr / 70.0))
+        if max_lag <= min_lag:
+            period = min(int(x.size), n)
+        else:
+            tail = x[-min(int(x.size), max(max_lag * 2, int(0.04 * sr))):]
+            t = tail - float(tail.mean())
+            c = np.correlate(t, t, mode="full")
+            mid = c.size // 2
+            region = c[mid + min_lag: mid + max_lag + 1]
+            period = min_lag + int(np.argmax(region)) if region.size else min_lag
+        period = max(min_lag, min(period, int(x.size)))
+        grain = x[-period:]
+        tiled = np.tile(grain, int(np.ceil(n / float(period)) + 2))
+        out = tiled[:n].astype(np.float32, copy=True)
+        ov = min(n, period // 2, int(x.size))
+        if ov > 1:
+            w = np.linspace(0.0, 1.0, ov, dtype=np.float32)
+            out[:ov] = x[-ov:] * (1.0 - w) + out[:ov] * w
+        streak = int(getattr(self, "_conceal_streak", 0)) + 1
+        self._conceal_streak = streak
+        out *= np.float32(min(0.9, max(0.12, 0.88 ** streak)))
+        return out.reshape(-1, 1)
 
     def send_audio(self, indata: np.ndarray):
         """只发送，不接收。返回 (seq, n_in, t0) 供流水线 recv。"""
@@ -329,6 +389,11 @@ class RVCClient:
         indata = np.asarray(indata, dtype=np.float32)
         if indata.ndim > 1:
             indata = indata[:, 0]
+        if getattr(self, "capture_denoise", True) and getattr(self, "is_remote", False):
+            try:
+                indata = self._cap_ns.process(indata)
+            except Exception:
+                pass
         self._seq = (self._seq + 1) & 0xFFFFFFFF
         seq = self._seq
         payload = struct.pack(">II", seq, len(indata)) + indata.tobytes()
@@ -345,8 +410,20 @@ class RVCClient:
         finally:
             self._send_lock.release()
 
-    def recv_audio(self, seq, n_in, t0, timeout=1.5):
+    def _audio_timeout(self):
+        """2×块长 + 2×RTT，下限 120ms，上限 1.5s。"""
+        sr = float(self.samplerate or 48000)
+        block = (float(self._block_frame) / sr) if self._block_frame else 0.06
+        if block <= 0:
+            block = 0.06
+        rtt = float(getattr(self, "_rtt_ema", 0.04) or 0.04)
+        std = float(np.sqrt(max(0.0, getattr(self, "_rtt_m2", 0.0))))
+        return min(1.5, max(0.12, 2.0 * block + 2.0 * rtt + 4.0 * std))
+
+    def recv_audio(self, seq, n_in, t0, timeout=None):
         """接收与 seq 配对的音频响应。"""
+        if timeout is None:
+            timeout = self._audio_timeout()
         if not self._connected or not self._ws:
             return self._silence(n_in), 0
         deadline = time.time() + timeout
@@ -365,12 +442,30 @@ class RVCClient:
                 if resp_seq != seq:
                     continue
                 n = struct.unpack(">I", response[4:8])[0]
-                out = np.frombuffer(response[8:8 + n * 4], dtype=np.float32)
+                pcm_end = 8 + n * 4
+                if len(response) < pcm_end:
+                    continue
+                out = np.frombuffer(response[8:pcm_end], dtype=np.float32).copy()
+                extra = response[pcm_end:]
+                if len(extra) >= 8:
+                    feat, idx, pitch, model = struct.unpack(">HHHH", extra[:8])
+                    self._last_stage_ms = {
+                        "feature": feat, "index": idx, "pitch": pitch, "model": model,
+                    }
                 if self.channels > 1:
                     out = np.tile(out.reshape(-1, 1), (1, self.channels))
                 else:
                     out = out.reshape(-1, 1)
                 elapsed = int((time.perf_counter() - t0) * 1000)
+                e2e = max(0.0, time.perf_counter() - t0)
+                est_rtt = max(0.015, min(e2e * 0.5, max(0.015, e2e - 0.02)))
+                prev = float(getattr(self, "_rtt_ema", est_rtt) or est_rtt)
+                delta = est_rtt - prev
+                self._rtt_ema = 0.85 * prev + 0.15 * est_rtt
+                self._rtt_m2 = 0.85 * float(getattr(self, "_rtt_m2", 0.0)) + 0.15 * (delta * delta)
+                mono = out[:, 0] if out.ndim > 1 else out
+                self._last_good = np.asarray(mono, dtype=np.float32).reshape(-1).copy()
+                self._conceal_streak = 0
                 return out, elapsed
         except _WS_TIMEOUT_EXC:
             return self._silence(n_in), 0
@@ -400,6 +495,13 @@ class RVCClient:
         因此不存在残留响应污染后续请求的问题。
         不改 socket timeout：settimeout 会打断正在 recv 的音频线程。
         """
+        if "capture_denoise" in kwargs:
+            self.capture_denoise = bool(kwargs.get("capture_denoise"))
+            kwargs = {k: v for k, v in kwargs.items() if k != "capture_denoise"}
+            if getattr(self, "_cap_ns", None) is not None:
+                self._cap_ns.enabled = bool(self.capture_denoise)
+        if not kwargs:
+            return True
         return self._send_json({"action": "configure", **kwargs}, wait=0.5)
 
     def _send_json(self, cmd, wait=0.05):

@@ -722,6 +722,8 @@ DEFAULT_PARAMS = {
     "deesser_enable": False,
     "vad_enable": False,
     "vad_threshold": 0.50,
+    "incremental_hubert": True,
+    "capture_denoise": True,
 }
 
 # 场景预设：低延迟 / 高音质 / 游戏语音 / 唱歌
@@ -730,6 +732,7 @@ BUILTIN_PRESETS = [
         "name": "低延迟",
         "params": {
             "block_time": 0.04, "crossfade_time": 0.01, "extra_time": 0.6,
+            "incremental_hubert": True,
             "f0method": "rmvpe", "rms_mix_rate": 0.5, "threhold": -50,
             "I_noise_reduce": False, "O_noise_reduce": False,
         },
@@ -738,6 +741,7 @@ BUILTIN_PRESETS = [
         "name": "高音质",
         "params": {
             "block_time": 0.08, "crossfade_time": 0.03, "extra_time": 1.2,
+            "incremental_hubert": False,
             "f0method": "rmvpe", "rms_mix_rate": 0.3, "threhold": -55,
             "I_noise_reduce": False, "O_noise_reduce": False,
         },
@@ -1411,7 +1415,7 @@ class ModelLoader(QThread):
 # ==============================================================================
 class InferenceWorkerThread(QThread):
     infer_done = Signal(int, float, float)  # elapsed_ms, in_rms_db, out_rms_db
-    stage_stats = Signal(dict)              # 本地模式分阶段耗时 {feature,index,pitch,model}
+    stage_stats = Signal(dict)              # 分阶段耗时 {feature,index,pitch,model}
     spectrum = Signal(object)
     xrun_occurred = Signal()
     need_recover = Signal()
@@ -1425,6 +1429,14 @@ class InferenceWorkerThread(QThread):
         self.running = False
 
     def _emit_out(self, out_block, elapsed_ms, in_rms):
+        cap = 2 if getattr(self.pipeline, "is_remote", False) else 4
+        dropped = False
+        while self.output_queue.qsize() >= cap:
+            try:
+                self.output_queue.get_nowait()
+                dropped = True
+            except queue.Empty:
+                break
         try:
             self.output_queue.put_nowait(out_block)
         except queue.Full:
@@ -1436,6 +1448,8 @@ class InferenceWorkerThread(QThread):
                 self.output_queue.put_nowait(out_block)
             except queue.Full:
                 pass
+            dropped = True
+        if dropped:
             self.xrun_occurred.emit()
         self.infer_done.emit(elapsed_ms, in_rms, calc_rms_db(out_block))
         try:
@@ -1447,9 +1461,16 @@ class InferenceWorkerThread(QThread):
         from collections import deque
         self.running = True
         inflight = deque()
-        depth = 2 if getattr(self.pipeline, "is_remote", False) else 1
         try:
             while self.running:
+                try:
+                    if hasattr(self.pipeline, "inflight_depth"):
+                        depth = int(self.pipeline.inflight_depth() or 1)
+                    else:
+                        depth = 2 if getattr(self.pipeline, "is_remote", False) else 1
+                except Exception:
+                    depth = 2 if getattr(self.pipeline, "is_remote", False) else 1
+                depth = max(1, min(3, depth))
                 while self.running and len(inflight) < depth:
                     try:
                         indata = self.input_queue.get(timeout=0.01 if inflight else 0.05)
@@ -1663,7 +1684,7 @@ class VCEngine(QObject):
     xrun_signal = Signal(int)         # total_xruns
     fade_done = Signal()
     loop_latency = Signal(float)      # 端到端延迟(ms)：output DAC time - input ADC time
-    stage_stats = Signal(dict)        # 本地模式分阶段耗时
+    stage_stats = Signal(dict)        # 分阶段耗时（服务器回包也会带）
 
     def __init__(self, mode="local", server_url=DEFAULT_SERVER_URL):
         super().__init__()
@@ -1750,6 +1771,14 @@ class VCEngine(QObject):
                 break
 
     def _enqueue_input(self, chunk):
+        cap = 2 if getattr(self.pipeline, "is_remote", False) else 4
+        dropped = False
+        while self.input_queue.qsize() >= cap:
+            try:
+                self.input_queue.get_nowait()
+                dropped = True
+            except queue.Empty:
+                break
         try:
             self.input_queue.put_nowait(chunk)
         except queue.Full:
@@ -1761,6 +1790,8 @@ class VCEngine(QObject):
                 self.input_queue.put_nowait(chunk)
             except queue.Full:
                 pass
+            dropped = True
+        if dropped:
             self._on_worker_xrun()
 
     def _prop(name):
@@ -1790,6 +1821,8 @@ class VCEngine(QObject):
     deesser_enable = _prop("deesser_enable")
     vad_enable = _prop("vad_enable")
     vad_threshold = _prop("vad_threshold")
+    incremental_hubert = _prop("incremental_hubert")
+    capture_denoise = _prop("capture_denoise")
 
     def _queue_configure(self, kwargs):
         with self._live_lock:
@@ -2279,7 +2312,7 @@ class VCEngine(QObject):
             pass
 
     def _report_loop_latency(self, times, frames):
-        """嘴到耳 ≈ PortAudio(DAC−ADC) + 一块算法延迟 + 队列积压。
+        """嘴到耳 ≈ PortAudio(DAC−ADC) + 一块算法延迟 + 队列积压 + 网络。
 
         回调里只写数值，由 UI 定时器取出，避免 PortAudio 线程发 Qt 信号。
         """
@@ -2302,7 +2335,16 @@ class VCEngine(QObject):
                 queued = self.input_queue.qsize() + self.output_queue.qsize()
             except Exception:
                 pass
-            true_ms = pa_ms + block_ms + queued * block_ms
+            extra_ms = 0.0
+            pipe = self.pipeline
+            if pipe is not None and getattr(pipe, "is_remote", False):
+                extra_ms += max(0.0, float(getattr(pipe, "_rtt_ema", 0.0) or 0.0) * 1000.0)
+                try:
+                    depth = int(pipe.inflight_depth()) if hasattr(pipe, "inflight_depth") else 2
+                except Exception:
+                    depth = 2
+                extra_ms += max(0, min(3, depth) - 1) * block_ms
+            true_ms = pa_ms + block_ms + queued * block_ms + extra_ms
             if self._loop_lat_ema is None:
                 self._loop_lat_ema = true_ms
             else:
@@ -3257,6 +3299,16 @@ class MainWindow(QMainWindow):
         self.onc.setMinimumHeight(26)
         self.onc.setToolTip("运行中修改将在下次启动后生效")
         self.onc.toggled.connect(lambda v: setattr(self.engine, "O_noise_reduce", v))
+        self.cap_ns_cb = QCheckBox("采集降噪")
+        self.cap_ns_cb.setMinimumHeight(26)
+        self.cap_ns_cb.setToolTip("送出麦克风前压键盘/风扇底噪，服务器版默认开")
+        self.cap_ns_cb.setChecked(True)
+        self.cap_ns_cb.toggled.connect(lambda v: setattr(self.engine, "capture_denoise", v))
+        self.inc_hubert_cb = QCheckBox("短窗特征")
+        self.inc_hubert_cb.setMinimumHeight(26)
+        self.inc_hubert_cb.setToolTip("只算最近一小段特征，更快、更利多人。关掉更稳、更像。")
+        self.inc_hubert_cb.setChecked(True)
+        self.inc_hubert_cb.toggled.connect(lambda v: setattr(self.engine, "incremental_hubert", v))
 
         nr = QHBoxLayout()
         nr.setSpacing(12)
@@ -3264,6 +3316,12 @@ class MainWindow(QMainWindow):
         nr.addWidget(self.onc)
         nr.addStretch()
         l.addLayout(nr, len(rows), 0, 1, 2)
+        nr2 = QHBoxLayout()
+        nr2.setSpacing(12)
+        nr2.addWidget(self.cap_ns_cb)
+        nr2.addWidget(self.inc_hubert_cb)
+        nr2.addStretch()
+        l.addLayout(nr2, len(rows) + 1, 0, 1, 2)
         l.setColumnStretch(1, 1)
         l1.addWidget(g1)
         l1.addStretch(1)
@@ -4375,6 +4433,10 @@ class MainWindow(QMainWindow):
             self.pres_spin.setValue(float(params["presence"]))
         if "vad_enable" in params and hasattr(self, "vad_cb"):
             self.vad_cb.setChecked(bool(params["vad_enable"]))
+        if "incremental_hubert" in params and hasattr(self, "inc_hubert_cb"):
+            self.inc_hubert_cb.setChecked(bool(params["incremental_hubert"]))
+        if "capture_denoise" in params and hasattr(self, "cap_ns_cb"):
+            self.cap_ns_cb.setChecked(bool(params["capture_denoise"]))
         if "formant" in params and hasattr(self, "live_formant"):
             self.live_formant.setValue(float(params["formant"]))
         if "dry_mix" in params and hasattr(self, "live_dry"):
@@ -4419,6 +4481,8 @@ class MainWindow(QMainWindow):
             "presence": float(self.pres_spin.value()) if hasattr(self, "pres_spin") else 0.10,
             "deesser_enable": bool(self.deess_cb.isChecked()) if hasattr(self, "deess_cb") else False,
             "vad_enable": bool(self.vad_cb.isChecked()) if hasattr(self, "vad_cb") else False,
+            "incremental_hubert": bool(self.inc_hubert_cb.isChecked()) if hasattr(self, "inc_hubert_cb") else True,
+            "capture_denoise": bool(self.cap_ns_cb.isChecked()) if hasattr(self, "cap_ns_cb") else True,
             "formant": float(self.live_formant.value()) if hasattr(self, "live_formant") else 0.0,
             "dry_mix": float(self.live_dry.value()) if hasattr(self, "live_dry") else 0.0,
         }
@@ -4698,6 +4762,10 @@ class MainWindow(QMainWindow):
                 self.vad_th.setValue(float(s["vad_threshold"]))
             except Exception:
                 pass
+        if "incremental_hubert" in s and hasattr(self, "inc_hubert_cb"):
+            self.inc_hubert_cb.setChecked(bool(s["incremental_hubert"]))
+        if "capture_denoise" in s and hasattr(self, "cap_ns_cb"):
+            self.cap_ns_cb.setChecked(bool(s["capture_denoise"]))
         if self.deess_cb.isChecked() and self.hf_spin.value() > 0:
             self.deess_cb.setChecked(False)
         self._sync_tradeoff_slider()
@@ -4775,6 +4843,8 @@ class MainWindow(QMainWindow):
             "deesser_enable": bool(self.deess_cb.isChecked()),
             "vad_enable": bool(self.vad_cb.isChecked()),
             "vad_threshold": float(self.vad_th.value()),
+            "incremental_hubert": bool(self.inc_hubert_cb.isChecked()) if hasattr(self, "inc_hubert_cb") else True,
+            "capture_denoise": bool(self.cap_ns_cb.isChecked()) if hasattr(self, "cap_ns_cb") else True,
         })
         try:
             save_user_settings(data)

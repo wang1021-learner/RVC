@@ -36,7 +36,9 @@ class RVCPipeline:
         # 智能人声识别 (VAD)
         self.vad_enable = False
         self.vad_threshold = 0.50
+        self.incremental_hubert = os.environ.get("RVC_INCREMENTAL_HUBERT", "1") != "0"
         self._active = False
+        self._keep_active = False
         self.last_stage_ms = {}
 
     @property
@@ -147,6 +149,7 @@ class RVCPipeline:
             self.rvc = rvc_for_realtime.RVC(
                 pitch, formant, model_path, index_path, index_rate, self.config, reuse)
             self._buf_sig = None
+            self._warmed_sig = None
             info = self.loaded_file_info()
             idx = info.get("index_path") or "无索引"
             flag = "" if info.get("index_loaded") else ("（未启用）" if info.get("index_path") else "")
@@ -183,29 +186,43 @@ class RVCPipeline:
         self._active = False
         self._buf_sig = None
 
-    def start(self, samplerate=None, channels=1, **params):
+    def prepare(self, warmup=True, **params):
+        """建缓冲。warmup=False 只搭缓冲，不录加速图（启动可先出声）。
+
+        参数未变且已预热过则只清零，stop→start 不必重录 CUDA Graph。
+        """
         if self.rvc is None:
-            raise RuntimeError("No model loaded")
+            return False
         if params:
             self.configure(**params)
-        if samplerate is not None:
-            self.samplerate = samplerate
         self.samplerate = self.rvc.tgt_sr
-        self.channels = channels
-        # 模型/参数没变时跳过缓冲重建和 CUDA Graph 重录（stop→start/切设备秒起）
         sig = (self.block_time, self.crossfade_time, self.extra_time,
                self.samplerate, self.channels,
                self.I_noise_reduce, self.O_noise_reduce)
         if getattr(self, "_buf_sig", None) != sig or not hasattr(self, "_in_line"):
             self._setup_buffers()
-            self._prewarm()
             self._buf_sig = sig
-        else:
+            self._warmed_sig = None
+        if warmup and getattr(self, "_warmed_sig", None) != sig:
+            self._prewarm()
+            self._warmed_sig = sig
+        elif not self._active and not getattr(self, "_warming", False):
             self._zero_buffers()
+        return True
+
+    def start(self, samplerate=None, channels=1, warmup=True, **params):
+        if self.rvc is None:
+            raise RuntimeError("No model loaded")
+        if samplerate is not None:
+            self.samplerate = samplerate
+        self.channels = channels
+        self.prepare(warmup=warmup, **params)
+        self._keep_active = True
         self._active = True
         return True
 
     def stop(self):
+        self._keep_active = False
         self._active = False
 
     def process_chunk(self, indata):
@@ -252,7 +269,20 @@ class RVCPipeline:
                     self._resampler, "in-resample", lambda a: self._resampler(a), ri
                 )[160:]
             self._res_line.push(rs[-self._block_frame_16k:])
-            ctx = graph_hot_path() if not getattr(self, "_warming", False) else None
+            if self.rvc is not None:
+                flag = bool(getattr(self, "incremental_hubert", True))
+                if getattr(self.rvc, "incremental_hubert", None) != flag:
+                    self.rvc.incremental_hubert = flag
+                    if hasattr(self.rvc, "reset_feat_cache"):
+                        self.rvc.reset_feat_cache()
+            # 已预热则禁止实时捕获；启动抢在预热前时允许前几块录图
+            already_warm = (
+                getattr(self, "_warmed_sig", None) is not None
+                and getattr(self, "_warmed_sig", None) == getattr(self, "_buf_sig", None)
+            )
+            ctx = graph_hot_path() if (
+                not getattr(self, "_warming", False) and already_warm
+            ) else None
             if ctx is not None:
                 ctx.__enter__()
             try:
@@ -266,6 +296,12 @@ class RVCPipeline:
             finally:
                 if ctx is not None:
                     ctx.__exit__(None, None, None)
+            if (
+                not getattr(self, "_warming", False)
+                and getattr(self, "_warmed_sig", None) is None
+                and getattr(self.rvc, "infer_count", 0) >= 3
+            ):
+                self._warmed_sig = getattr(self, "_buf_sig", None)
             stage = getattr(self.rvc, "last_stage_ms", None)
             if stage:
                 self.last_stage_ms = dict(stage)
@@ -374,8 +410,9 @@ class RVCPipeline:
             self._on_status(f"预热失败:\n{traceback.format_exc()}")
         finally:
             self._warming = False
-            self._active = False
+            # 启动可能赶在预热当中：清掉正弦预热残留，但保持推理开着
             self._zero_buffers()
+            self._active = bool(getattr(self, "_keep_active", False))
 
     def _zero_buffers(self):
         """清空全部环形缓冲和 f0 缓存（start 跳过重建时也要清，防止旧数据残留）"""

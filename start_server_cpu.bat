@@ -7,7 +7,8 @@ echo CPU 推理会比显卡慢，只适合先验证连通和加载。
 echo.
 
 set PY=
-if exist ".venv\Scripts\python.exe" set PY=.venv\Scripts\python.exe
+if exist "runtime\python.exe" set PY=runtime\python.exe
+if "%PY%"=="" if exist ".venv\Scripts\python.exe" set PY=.venv\Scripts\python.exe
 if "%PY%"=="" if exist "venv\Scripts\python.exe" set PY=venv\Scripts\python.exe
 if "%PY%"=="" set PY=python
 

@@ -27,6 +27,20 @@ def printt(strr, *args):
         print(strr % args)
 
 
+def _same_weight_file(a, b):
+    """同一权重：绝对路径或文件名相同（客户端常只传 basename）。"""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        if os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b)):
+            return True
+    except Exception:
+        pass
+    return os.path.basename(str(a)).lower() == os.path.basename(str(b)).lower()
+
+
 def _fill_short_uv(f0, max_gap=3):
     """Keep unvoiced frames at 0. Only interpolate holes shorter than max_gap."""
     f0 = np.asarray(f0, dtype=np.float32).copy()
@@ -76,6 +90,56 @@ def _fill_short_uv_torch(f0, max_gap=3):
     w = left_dist / (left_dist + right_dist).clamp(min=1e-6)
     filled = left_val * (1.0 - w) + right_val * w
     return torch.where(fill, filled, out)
+
+
+def _smooth_f0_torch(f0, k=3, alpha=0.4, jump=0.3):
+    """浊音段：3 点中值 + 邻帧限幅 + 一阶平滑。清音保持 0。"""
+    x = f0.reshape(-1).float()
+    if x.numel() < k:
+        return x
+    voiced = x > 0
+    pad = k // 2
+    xp = F.pad(x.view(1, 1, -1), (pad, pad), mode="replicate")
+    med = xp.unfold(-1, k, 1).median(dim=-1).values.view(-1)
+    med = torch.where(voiced, med, x)
+    prev = torch.roll(med, 1)
+    prev[0] = med[0]
+    ratio = torch.where(
+        (prev > 0) & voiced,
+        (med - prev).abs() / prev.clamp(min=1.0),
+        torch.zeros_like(med),
+    )
+    scale = (jump / ratio.clamp(min=1e-6)).clamp(max=1.0)
+    capped = torch.where(ratio > jump, prev + (med - prev) * scale, med)
+    sm = torch.where(voiced & (prev > 0), alpha * capped + (1.0 - alpha) * prev, capped)
+    return torch.where(voiced, sm, torch.zeros_like(x))
+
+
+def _smooth_f0_np(f0, k=3, alpha=0.4, jump=0.3):
+    x = np.asarray(f0, dtype=np.float32).reshape(-1).copy()
+    if x.size < k:
+        return x
+    voiced = x > 0
+    pad = k // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    med = np.empty_like(x)
+    for i in range(x.size):
+        med[i] = np.median(xp[i:i + k])
+    med = np.where(voiced, med, x)
+    prev = np.roll(med, 1)
+    prev[0] = med[0]
+    ratio = np.zeros_like(med)
+    mask = (prev > 0) & voiced
+    ratio[mask] = np.abs(med[mask] - prev[mask]) / np.maximum(prev[mask], 1.0)
+    capped = med.copy()
+    over = ratio > jump
+    capped[over] = prev[over] + (med[over] - prev[over]) * (
+        jump / np.maximum(ratio[over], 1e-6))
+    sm = capped.copy()
+    ema = voiced & (prev > 0)
+    sm[ema] = alpha * capped[ema] + (1.0 - alpha) * prev[ema]
+    sm[~voiced] = 0.0
+    return sm
 
 
 def get_synthesizer(pth_path, device=torch.device("cpu")):
@@ -136,7 +200,28 @@ class RVC:
             self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
             self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
             self.is_half = config.is_half
-            if index_rate != 0 and index_path and os.path.exists(index_path):
+            self.index_gpu = None
+            self._index_norm = None
+            self._gpu_index_checked = False
+            self.index_temp = 0.05  # Softmax 温度：越小越接近硬选择（余弦相似度分布较窄）
+            reused_index = (
+                last_rvc is not None
+                and index_rate != 0
+                and index_path
+                and os.path.exists(index_path)
+                and getattr(last_rvc, "index", None) is not None
+                and _same_weight_file(getattr(last_rvc, "index_path", ""), index_path)
+            )
+            if reused_index:
+                self.index = last_rvc.index
+                self.big_npy = getattr(last_rvc, "big_npy", None)
+                self.index_gpu = getattr(last_rvc, "index_gpu", None)
+                self._index_norm = getattr(last_rvc, "_index_norm", None)
+                self._gpu_index_checked = bool(
+                    getattr(last_rvc, "_gpu_index_checked", False)
+                )
+                printt(i18n("已启用索引检索"))
+            elif index_rate != 0 and index_path and os.path.exists(index_path):
                 try:
                     self._load_faiss_index(index_path)
                     printt(i18n("已启用索引检索"))
@@ -166,11 +251,6 @@ class RVC:
             else:
                 self._f0_stream = None
             self._f0_pending = None
-            # 优化3：GPU 索引检索（低显存/异常自动回退 CPU 路径）
-            self.index_gpu = None
-            self._index_norm = None
-            self._gpu_index_checked = False
-            self.index_temp = 0.05  # Softmax 温度：越小越接近硬选择（余弦相似度分布较窄）
             self._feat_cache = None
             self._hubert_win = None
             self._p_len_tensor = None
@@ -196,7 +276,9 @@ class RVC:
                 else:
                     self.net_g = self.net_g.float()
 
-            if last_rvc is None or last_rvc.pth_path != self.pth_path:
+            if last_rvc is None or not _same_weight_file(
+                getattr(last_rvc, "pth_path", ""), self.pth_path
+            ):
                 set_synthesizer()
             else:
                 self.tgt_sr = last_rvc.tgt_sr
@@ -305,6 +387,7 @@ class RVC:
         if method == "rmvpe":
             f0 = self.model_rmvpe.decode_torch(hidden, thred=0.03)
             f0 = _fill_short_uv_torch(f0)
+            f0 = _smooth_f0_torch(f0)
             f0 = f0 * pow(2, f0_up_key / 12)
             return self.get_f0_post(f0)
         raise ValueError(f"F0 method does not support GPU split: {method}")
@@ -410,6 +493,7 @@ class RVC:
             f0 = np.pad(f0, (0, p_len - len(f0)))
         f0 = f0[:p_len]
         f0 = _fill_short_uv(f0)
+        f0 = _smooth_f0_np(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -425,6 +509,7 @@ class RVC:
             )
         f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
         f0 = _fill_short_uv(f0)
+        f0 = _smooth_f0_np(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -441,6 +526,7 @@ class RVC:
             threshold=0.006,
         ).squeeze().detach().cpu().numpy()
         f0 = _fill_short_uv(f0)
+        f0 = _smooth_f0_np(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -482,8 +568,11 @@ class RVC:
                         self._f0_pending = None
                 if self._f0_pending is None:
                     pitch, pitchf = self.get_f0(f0_tail, f0_key, f0method)
-            # 默认全窗 HuBERT（质量稳、连贯）；RVC_INCREMENTAL_HUBERT=1 才走增量（实验）
-            if os.environ.get("RVC_INCREMENTAL_HUBERT") == "1":
+            # 短窗增量默认开（实时）；RVC_INCREMENTAL_HUBERT=0 或 incremental_hubert=False 回全窗
+            use_inc = getattr(self, "incremental_hubert", None)
+            if use_inc is None:
+                use_inc = os.environ.get("RVC_INCREMENTAL_HUBERT", "1") != "0"
+            if use_inc:
                 feats = self._extract_feats_incremental(input_wav, block_frame_16k)
             else:
                 src = input_wav.half() if self.config.is_half else input_wav.float()

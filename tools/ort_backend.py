@@ -21,10 +21,27 @@ def onnx_available():
         return False
 
 
+def _has_accel_ep():
+    try:
+        import onnxruntime as ort
+        names = set(ort.get_available_providers())
+        return bool(names & {
+            "CUDAExecutionProvider",
+            "TensorrtExecutionProvider",
+            "DmlExecutionProvider",
+        })
+    except Exception:
+        return False
+
+
 def onnx_enabled_for_realtime():
-    """实时路径是否用 ONNX：默认关（numpy IO 每块 CPU↔GPU 往返，实时反而加延迟），
-    显式 RVC_ONNX=1 才开，留给后续 IO Binding 方案。"""
-    return os.environ.get("RVC_ONNX") == "1" and onnx_available()
+    """实时 ONNX：有 GPU EP 且未显式关闭则开。RVC_ONNX=0 强制关，=1 强制开。"""
+    flag = os.environ.get("RVC_ONNX")
+    if flag == "0" or onnx_disabled():
+        return False
+    if flag == "1":
+        return onnx_available()
+    return onnx_available() and _has_accel_ep()
 
 
 def _providers(prefer_trt=True):
@@ -40,14 +57,21 @@ def _providers(prefer_trt=True):
             cache.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-        picked.append((
-            "TensorrtExecutionProvider",
-            {
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": str(cache),
-                "trt_fp16_enable": True,
-            },
-        ))
+        has_engine = False
+        try:
+            has_engine = any(cache.glob("*"))
+        except Exception:
+            has_engine = False
+        # 实时默认走 CUDA EP；已有 engine 或 RVC_ORT_TRT=1 才上 TRT，避免首次编译卡死
+        if has_engine or os.environ.get("RVC_ORT_TRT") == "1":
+            picked.append((
+                "TensorrtExecutionProvider",
+                {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": str(cache),
+                    "trt_fp16_enable": True,
+                },
+            ))
     if "CUDAExecutionProvider" in available:
         picked.append("CUDAExecutionProvider")
     if "DmlExecutionProvider" in available:
