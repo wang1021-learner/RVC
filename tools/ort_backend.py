@@ -35,13 +35,11 @@ def _has_accel_ep():
 
 
 def onnx_enabled_for_realtime():
-    """实时 ONNX：有 GPU EP 且未显式关闭则开。RVC_ONNX=0 强制关，=1 强制开。"""
-    flag = os.environ.get("RVC_ONNX")
-    if flag == "0" or onnx_disabled():
+    """实时 ONNX 默认关：和 CUDA Graph、独立 F0 流叠在一起容易把 GPU 上下文打崩。
+    显式 RVC_ONNX=1 才开。"""
+    if onnx_disabled():
         return False
-    if flag == "1":
-        return onnx_available()
-    return onnx_available() and _has_accel_ep()
+    return os.environ.get("RVC_ONNX") == "1" and onnx_available()
 
 
 def _providers(prefer_trt=True):

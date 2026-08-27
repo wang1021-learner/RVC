@@ -1,5 +1,5 @@
 """RVC inference pipeline - no UI dependency"""
-import os, time, traceback, logging
+import os, sys, time, traceback, logging, threading
 import numpy as np, torch, torch.nn.functional as F, torchaudio.transforms as tat
 from configs.config import Config
 from infer import rtrvc as rvc_for_realtime
@@ -7,7 +7,49 @@ from tools.dsp import DeEsser, DelayLine, FirHighPass
 from tools.vad import VoiceActivityDetector
 from tools.output_protector import OutputProtector
 from tools.torchgate import TorchGate
-from tools.cuda_graph import cuda_graph_enabled, graph_hot_path, run_cuda_graph
+from tools.cuda_graph import (
+    cuda_graph_enabled, graph_hot_path, run_cuda_graph, clear_cuda_graph_cache,
+)
+
+
+def cuda_sync_or_die(timeout=5.0, device=None):
+    """在旁路线程等 CUDA；超时则退出，交给看门狗拉起。
+
+    不要在推理线程里直接 synchronize：卡住会占死唯一的 GPU 线程，
+    进程还活着，看门狗不会重启。
+    """
+    try:
+        if not torch.cuda.is_available():
+            return True
+    except Exception:
+        return True
+    done = threading.Event()
+    err = []
+
+    def _run():
+        try:
+            if device is not None:
+                torch.cuda.synchronize(device)
+            else:
+                torch.cuda.synchronize()
+        except Exception as e:
+            err.append(e)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_run, name="cuda-sync", daemon=True)
+    t.start()
+    if not done.wait(float(timeout)):
+        logging.error("CUDA synchronize hung for %.1fs, exiting for watchdog", timeout)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(1)
+    if err:
+        raise err[0]
+    return True
 
 
 class RVCPipeline:
@@ -36,9 +78,14 @@ class RVCPipeline:
         # 智能人声识别 (VAD)
         self.vad_enable = False
         self.vad_threshold = 0.50
-        self.incremental_hubert = os.environ.get("RVC_INCREMENTAL_HUBERT", "1") != "0"
+        self.incremental_hubert = os.environ.get("RVC_INCREMENTAL_HUBERT", "0") == "1"
+        # 原版 RVC protect：清辅音/气音少被音高网络改掉，0.5 关闭
+        self.protect = 0.33
         self._active = False
         self._keep_active = False
+        self._warming = False
+        self._prewarm_tick = False
+        self._gpu_lock = threading.Lock()
         self.last_stage_ms = {}
 
     @property
@@ -88,6 +135,10 @@ class RVCPipeline:
         for k, v in kwargs.items():
             if hasattr(self, k):
                 setattr(self, k, v)
+        if os.environ.get("RVC_INCREMENTAL_HUBERT", "") == "0":
+            self.incremental_hubert = False
+        if self.rvc is not None and hasattr(self, "protect"):
+            self.rvc.protect = float(self.protect)
 
     def change_pitch(self, val):
         if self.rvc:
@@ -144,6 +195,10 @@ class RVCPipeline:
         index_path = self._resolve_path(index_path, is_index=True)
         self._on_status(f"Loading: {os.path.basename(model_path)}")
         old = self.rvc
+        if not self._gpu_lock.acquire(timeout=8.0):
+            self.last_error = "GPU 正忙，加载超时"
+            self._on_status("加载失败: GPU 正忙，请稍后重试")
+            return False
         try:
             reuse = last_rvc if last_rvc is not None else old
             self.rvc = rvc_for_realtime.RVC(
@@ -158,6 +213,7 @@ class RVCPipeline:
                 f" | {idx}{flag}"
             )
             self.last_error = ""
+            self.rvc.protect = float(getattr(self, "protect", 0.33))
             return True
         except Exception as e:
             logging.exception("加载模型失败")
@@ -165,6 +221,8 @@ class RVCPipeline:
             self._on_status("加载失败: " + str(e))
             self.rvc = old
             return False
+        finally:
+            self._gpu_lock.release()
 
     def loaded_file_info(self):
         """实际打开的模型/索引路径（解析后的绝对路径）。"""
@@ -228,12 +286,20 @@ class RVCPipeline:
     def process_chunk(self, indata):
         if not self._active:
             return np.zeros_like(indata), 0
+        if getattr(self, "_warming", False) and not getattr(self, "_prewarm_tick", False):
+            n = int(getattr(self, "_block_frame", 0) or np.asarray(indata).shape[0])
+            return np.zeros(n, dtype=np.float32), 0
+        if not self._gpu_lock.acquire(timeout=8.0):
+            n = int(getattr(self, "_block_frame", 0) or np.asarray(indata).shape[0])
+            return np.zeros(n, dtype=np.float32), 0
         try:
             start_time = time.perf_counter()
             if indata.ndim > 1:
                 indata = indata.mean(axis=1)
             in_len = indata.shape[0]
-            chunk = torch.from_numpy(np.ascontiguousarray(indata, dtype=np.float32))
+            arr = np.array(indata, dtype=np.float32, copy=True, order="C")
+            peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+            chunk = torch.from_numpy(arr)
             if str(self.config.device).startswith("cuda"):
                 chunk = chunk.to(self.config.device, non_blocking=True)
             else:
@@ -270,29 +336,40 @@ class RVCPipeline:
                 )[160:]
             self._res_line.push(rs[-self._block_frame_16k:])
             if self.rvc is not None:
-                flag = bool(getattr(self, "incremental_hubert", True))
+                flag = bool(getattr(self, "incremental_hubert", False))
                 if getattr(self.rvc, "incremental_hubert", None) != flag:
                     self.rvc.incremental_hubert = flag
                     if hasattr(self.rvc, "reset_feat_cache"):
                         self.rvc.reset_feat_cache()
-            # 已预热则禁止实时捕获；启动抢在预热前时允许前几块录图
-            already_warm = (
-                getattr(self, "_warmed_sig", None) is not None
-                and getattr(self, "_warmed_sig", None) == getattr(self, "_buf_sig", None)
+                self.rvc.protect = float(getattr(self, "protect", 0.33))
+            # 真人路径禁止捕获 CUDA Graph；只在预热正弦里录图
+            ctx = None if getattr(self, "_prewarm_tick", False) else graph_hot_path()
+            skip_model = (
+                peak < 1e-4
+                and not self.I_noise_reduce
+                and not getattr(self, "_prewarm_tick", False)
             )
-            ctx = graph_hot_path() if (
-                not getattr(self, "_warming", False) and already_warm
-            ) else None
             if ctx is not None:
                 ctx.__enter__()
             try:
-                infer_wav = self.rvc.infer(
-                    self._res_line.latest(),
-                    self._block_frame_16k,
-                    self._skip_head,
-                    self._return_length,
-                    self.f0method,
-                )
+                if skip_model:
+                    need = int(
+                        self._block_frame
+                        + self._sola_buffer_frame
+                        + self._sola_search_frame
+                        + 8
+                    )
+                    infer_wav = torch.zeros(
+                        need, device=chunk.device, dtype=torch.float32
+                    )
+                else:
+                    infer_wav = self.rvc.infer(
+                        self._res_line.latest(),
+                        self._block_frame_16k,
+                        self._skip_head,
+                        self._return_length,
+                        self.f0method,
+                    )
             finally:
                 if ctx is not None:
                     ctx.__exit__(None, None, None)
@@ -319,10 +396,30 @@ class RVCPipeline:
             infer_wav, out_block = self._apply_sola(infer_wav)
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
             return out_block, elapsed_ms
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
+            msg = str(e).lower()
+            if "cuda" in msg or "illegal memory" in msg:
+                os.environ["RVC_CUDA_GRAPH"] = "0"
+                try:
+                    for owner in (
+                        getattr(self, "_resampler", None),
+                        getattr(self.rvc, "net_g", None) if self.rvc is not None else None,
+                        getattr(self.rvc, "model", None) if self.rvc is not None else None,
+                    ):
+                        if owner is not None:
+                            clear_cuda_graph_cache(owner)
+                except Exception:
+                    pass
+                try:
+                    if str(self.config.device).startswith("cuda"):
+                        cuda_sync_or_die(timeout=5.0, device=self.config.device)
+                except Exception:
+                    pass
             n = self._block_frame if self._block_frame else indata.shape[0]
             return np.zeros(n), 0
+        finally:
+            self._gpu_lock.release()
 
     def _setup_buffers(self):
         zc = self.samplerate // 100
@@ -371,6 +468,7 @@ class RVCPipeline:
         )
         self._hp_hf = FirHighPass(6000.0, self.samplerate, dev)
         self._hp_pres = FirHighPass(3000.0, self.samplerate, dev)
+        self._hp_shelf = FirHighPass(5000.0, self.samplerate, dev)
         self._deesser = DeEsser(sample_rate=self.samplerate, device=dev)
         self._vad = VoiceActivityDetector(
             sample_rate=self.samplerate,
@@ -398,6 +496,7 @@ class RVCPipeline:
             if self.rvc is not None:
                 self.rvc.reset_feat_cache()
             self._warming = True
+            self._prewarm_tick = True
             self._active = True
             for _ in range(3):
                 self.process_chunk(dummy)
@@ -409,8 +508,8 @@ class RVCPipeline:
         except Exception:
             self._on_status(f"预热失败:\n{traceback.format_exc()}")
         finally:
+            self._prewarm_tick = False
             self._warming = False
-            # 启动可能赶在预热当中：清掉正弦预热残留，但保持推理开着
             self._zero_buffers()
             self._active = bool(getattr(self, "_keep_active", False))
 
@@ -431,7 +530,7 @@ class RVCPipeline:
                 self.rvc.reset_feat_cache()
         if hasattr(self, "_protector"):
             self._protector.reset()
-        for a in ("_hp_hf", "_hp_pres", "_deesser", "_vad"):
+        for a in ("_hp_hf", "_hp_pres", "_hp_shelf", "_deesser", "_vad"):
             obj = getattr(self, a, None)
             if obj is not None:
                 obj.reset()
@@ -473,9 +572,9 @@ class RVCPipeline:
         view = block_1d.reshape(-1, 1).expand(-1, self.channels).contiguous()
         pin.copy_(view, non_blocking=True)
         if block_1d.is_cuda:
-            # 只等本次小拷贝（~60ms 音频）完成即可，开销可忽略；
-            # .copy() 让返回数组独立于 pin 槽，杜绝槽位回绕时的别名脏读。
-            torch.cuda.current_stream(block_1d.device).synchronize()
+            ev = torch.cuda.Event()
+            ev.record(torch.cuda.current_stream(block_1d.device))
+            ev.synchronize()
         return pin.numpy().copy()
 
     def _apply_sola(self, infer_wav):
@@ -502,13 +601,16 @@ class RVCPipeline:
             in_tail = self._in_line.latest(self._block_frame)
             ratio = hf_block.square().mean() / in_tail.square().mean().clamp(min=1e-8)
             gate = ((ratio - 0.005) / 0.03).clamp(0.0, 1.0)
-            mix = self.hf_mix_rate * gate * 0.5
+            mix = self.hf_mix_rate * gate * 0.7
             block = block * (1.0 - mix) + hf_block * mix
         if self.deesser_enable and hasattr(self, "_deesser") and not use_hf:
             block = self._deesser.process(block)
         if self.presence > 0 and hasattr(self, "_hp_pres"):
             k = float(self.presence) * 0.3
             block = block + k * self._hp_pres.highpass(block)
+        # 变声后轻高频架（5 kHz），不混原声，避免齿音保留把原音色带回来
+        if hasattr(self, "_hp_shelf"):
+            block = block + np.float32(0.10) * self._hp_shelf.highpass(block)
         if self.limiter_enable and hasattr(self, "_protector"):
             if abs(self._protector.threshold_db - self.limiter_threshold_db) > 0.01:
                 self._protector.set_threshold_db(self.limiter_threshold_db)

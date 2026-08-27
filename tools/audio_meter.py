@@ -33,7 +33,6 @@ class VUMeterWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
 
         w = self.width()
         h = self.height()
@@ -117,7 +116,6 @@ class SpectrumWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
         bg = QColor("#f1f5f9")
         painter.setBrush(QBrush(bg))

@@ -49,6 +49,8 @@ class RVCClient:
         self._rtt_m2 = 0.0       # RTT 抖动（平方差 EMA）
         self._conceal_streak = 0
         self._last_stage_ms = {}
+        self._ahead = {}
+        self._virtual_out = False
         self.capture_denoise = True
         self._cap_ns = CaptureDenoise()
 
@@ -78,6 +80,8 @@ class RVCClient:
     def inflight_depth(self):
         """按 RTT+抖动估在途块数：局域网常为 1，弱网最多 3。本机子进程固定 1。"""
         if not getattr(self, "is_remote", True):
+            return 1
+        if getattr(self, "_virtual_out", False):
             return 1
         sr = float(self.samplerate or 48000)
         block = (float(self._block_frame) / sr) if self._block_frame else 0.06
@@ -119,6 +123,12 @@ class RVCClient:
             return True
         try:
             self._ws = websocket.create_connection(self.server_url, timeout=timeout)
+            try:
+                sock = getattr(self._ws, "sock", None)
+                if sock is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             self._connected = True
             self._on_status(f"已连接服务器: {self.server_url}")
             # 查询服务器模型状态，同步本地标志（防服务器重启后状态错乱）
@@ -218,6 +228,7 @@ class RVCClient:
             "hf_mix_rate", "presence", "deesser_enable",
             "vad_enable", "vad_threshold",
             "incremental_hubert",
+            "protect",
         ):
             if k in params:
                 cmd[k] = params[k]
@@ -297,6 +308,7 @@ class RVCClient:
         self._last_good = None
         self._last_stage_ms = {}
         self._conceal_streak = 0
+        self._ahead = {}
         if ws is None:
             return
         sock = getattr(ws, "sock", None)
@@ -351,8 +363,18 @@ class RVCClient:
             self._send_lock.release()
 
     def _silence(self, n):
-        """超时/丢包：按上一块周期做重叠延拓，连续丢失再衰减。"""
+        """超时/丢包：自听用周期延拓；喂给虚拟声卡时补静音，避免双重 PLC 卡顿。"""
         n = int(n) if n else (self._block_frame or 256)
+        if getattr(self, "_virtual_out", False):
+            out = np.zeros(n, dtype=np.float32)
+            last = self._last_good
+            streak = int(getattr(self, "_conceal_streak", 0)) + 1
+            self._conceal_streak = streak
+            if streak == 1 and last is not None and last.size:
+                fade_n = min(n, int(last.size), max(1, int(0.008 * (self.samplerate or 48000))))
+                w = np.linspace(1.0, 0.0, fade_n, dtype=np.float32) * np.float32(0.7)
+                out[:fade_n] = np.asarray(last[-fade_n:], dtype=np.float32) * w
+            return out.reshape(-1, 1)
         last = self._last_good
         if last is None or last.size < 64:
             return np.zeros(n, dtype=np.float32).reshape(-1, 1)
@@ -430,18 +452,33 @@ class RVCClient:
         if not self._recv_lock.acquire(timeout=timeout):
             return self._silence(n_in), 0
         try:
+            cached = self._ahead.pop(seq, None)
+            if cached is not None:
+                response = cached
+            else:
+                response = None
             while True:
-                remain = deadline - time.time()
-                if remain <= 0:
-                    raise socket.timeout("audio response timeout")
-                self._ws.settimeout(min(remain, 0.5))
-                response = self._ws.recv()
+                if response is None:
+                    remain = deadline - time.time()
+                    if remain <= 0:
+                        raise socket.timeout("audio response timeout")
+                    self._ws.settimeout(min(remain, 0.5))
+                    response = self._ws.recv()
                 if isinstance(response, str) or len(response) < 8:
+                    response = None
                     continue
                 resp_seq = struct.unpack(">I", response[:4])[0]
                 if resp_seq != seq:
+                    delta = ((resp_seq - seq + 0x80000000) & 0xFFFFFFFF) - 0x80000000
+                    if 0 < delta < 8:
+                        self._ahead[resp_seq] = response
+                        if len(self._ahead) > 8:
+                            self._ahead.pop(next(iter(self._ahead)))
+                    response = None
                     continue
                 n = struct.unpack(">I", response[4:8])[0]
+                if n == 0:
+                    return self._silence(n_in), 0
                 pcm_end = 8 + n * 4
                 if len(response) < pcm_end:
                     continue

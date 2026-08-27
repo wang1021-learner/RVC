@@ -22,8 +22,8 @@ class AutoGain:
     def __init__(
         self,
         sample_rate=48000,
-        target_db=-16.0,
-        max_gain_db=6.0,
+        target_db=-18.0,
+        max_gain_db=4.0,
         min_gain_db=-12.0,
         gate_db=-32.0,
         attack_time=0.03,

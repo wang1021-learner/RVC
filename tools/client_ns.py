@@ -25,7 +25,8 @@ class CaptureDenoise:
             target = 1.0
         else:
             target = max(0.0, (rms / (thresh + 1e-8) - 0.2) / 0.8)
-        self.gain = 0.65 * self.gain + 0.35 * target
+        # 慢一点开关，避免把字头切掉、听起来像卡顿
+        self.gain = 0.82 * self.gain + 0.18 * target
         if self.gain >= 0.98:
             return x
         return x * np.float32(self.gain)

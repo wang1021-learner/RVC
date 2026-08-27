@@ -255,6 +255,7 @@ class RVC:
             self._hubert_win = None
             self._p_len_tensor = None
             self._sid_tensor = None
+            self.protect = 0.33
 
             self.resample_kernel = {}
 
@@ -568,16 +569,19 @@ class RVC:
                         self._f0_pending = None
                 if self._f0_pending is None:
                     pitch, pitchf = self.get_f0(f0_tail, f0_key, f0method)
-            # 短窗增量默认开（实时）；RVC_INCREMENTAL_HUBERT=0 或 incremental_hubert=False 回全窗
+            # 短窗增量默认关（稳）；RVC_INCREMENTAL_HUBERT=1 或 incremental_hubert=True 才开
             use_inc = getattr(self, "incremental_hubert", None)
             if use_inc is None:
-                use_inc = os.environ.get("RVC_INCREMENTAL_HUBERT", "1") != "0"
+                use_inc = os.environ.get("RVC_INCREMENTAL_HUBERT", "0") == "1"
             if use_inc:
                 feats = self._extract_feats_incremental(input_wav, block_frame_16k)
             else:
                 src = input_wav.half() if self.config.is_half else input_wav.float()
                 feats = extract_hubert_features(self.model, src.view(1, -1), self.version)
                 feats = torch.cat((feats, feats[:, -1:, :]), 1)
+            protect = float(getattr(self, "protect", 0.33) or 0.33)
+            use_protect = bool(self.if_f0 == 1 and protect < 0.5)
+            feats0 = feats.clone() if use_protect else None
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
@@ -665,6 +669,21 @@ class RVC:
         t4 = ttime()
         feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
         feats = feats[:, :p_len, :].contiguous()
+        if use_protect and feats0 is not None and self.if_f0 == 1:
+            feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+            feats0 = feats0[:, :p_len, :].contiguous()
+            pf = cache_pitchf.reshape(-1)
+            n = min(int(feats.shape[1]), int(feats0.shape[1]), int(pf.shape[0]))
+            if n > 0:
+                one = torch.ones((), device=feats.device, dtype=feats.dtype)
+                prot = torch.tensor(protect, device=feats.device, dtype=feats.dtype)
+                w = torch.where(pf[:n] > 0, one, prot).view(1, n, 1)
+                mixed = feats[:, :n, :] * w + feats0[:, :n, :] * (1.0 - w)
+                if n == feats.shape[1]:
+                    feats = mixed.contiguous()
+                else:
+                    feats = feats.clone()
+                    feats[:, :n, :] = mixed
         if getattr(self, "_p_len_value", None) != p_len:
             self._p_len_value = p_len
             self._p_len_tensor = torch.tensor([p_len], device=self.device, dtype=torch.long)

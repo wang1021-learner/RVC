@@ -543,7 +543,10 @@ from worker.local_server import (
     is_frozen, package_root, runtime_installed, pack_mode, local_infer_ready)
 
 from tools.audio_meter import VUMeterWidget, SpectrumWidget, calc_rms_db, spec_bins
-from tools.virtual_cable import find_virtual_devices, is_virtual_name, INSTALL_URLS, open_install_page, route_self_check
+from tools.virtual_cable import (
+    find_virtual_devices, is_virtual_name, is_bluetooth_name,
+    INSTALL_URLS, open_install_page, route_self_check,
+)
 from tools.audio_process import AutoGain
 
 
@@ -717,14 +720,18 @@ DEFAULT_PARAMS = {
     "threhold": -50,
     "limiter_enable": True,
     "limiter_threshold_db": -1.0,
-    "hf_mix_rate": 0.2,
-    "presence": 0.10,
+    "hf_mix_rate": 0.25,
+    "presence": 0.15,
     "deesser_enable": False,
     "vad_enable": False,
     "vad_threshold": 0.50,
-    "incremental_hubert": True,
+    "incremental_hubert": False,
     "capture_denoise": True,
+    "protect": 0.33,
 }
+
+# 输出到虚拟声卡给别人听时，块太短会欠载；欠载再复读上一块就是卡+炸麦
+VIRTUAL_OUT_MIN_BLOCK = 0.08
 
 # 场景预设：低延迟 / 高音质 / 游戏语音 / 唱歌
 BUILTIN_PRESETS = [
@@ -732,7 +739,7 @@ BUILTIN_PRESETS = [
         "name": "低延迟",
         "params": {
             "block_time": 0.04, "crossfade_time": 0.01, "extra_time": 0.6,
-            "incremental_hubert": True,
+            "incremental_hubert": False,
             "f0method": "rmvpe", "rms_mix_rate": 0.5, "threhold": -50,
             "I_noise_reduce": False, "O_noise_reduce": False,
         },
@@ -744,6 +751,9 @@ BUILTIN_PRESETS = [
             "incremental_hubert": False,
             "f0method": "rmvpe", "rms_mix_rate": 0.3, "threhold": -55,
             "I_noise_reduce": False, "O_noise_reduce": False,
+            "hf_mix_rate": 0.3, "presence": 0.15,
+            "deesser_enable": False, "vad_enable": False,
+            "protect": 0.33,
         },
     },
     {
@@ -757,11 +767,13 @@ BUILTIN_PRESETS = [
     {
         "name": "通话",
         "params": {
-            "block_time": 0.06, "crossfade_time": 0.02, "extra_time": 0.8,
+            "block_time": 0.08, "crossfade_time": 0.02, "extra_time": 0.8,
             "f0method": "rmvpe", "rms_mix_rate": 0.5, "threhold": -50,
             "I_noise_reduce": False, "O_noise_reduce": False,
             "hf_mix_rate": 0.2, "presence": 0.10,
             "deesser_enable": False, "vad_enable": False,
+            "capture_denoise": False,
+            "protect": 0.33,
         },
     },
     {
@@ -839,11 +851,16 @@ def _friendly_error(e):
 
 def _fp_from_devs(devs):
     try:
-        return tuple(
-            (d.get("name"), d.get("hostapi", 0),
-             d.get("max_input_channels", 0), d.get("max_output_channels", 0))
-            for d in (devs or [])
-        )
+        items = []
+        for d in (devs or []):
+            name = d.get("name") or ""
+            if is_bluetooth_name(name):
+                continue
+            items.append((
+                name, d.get("hostapi", 0),
+                d.get("max_input_channels", 0), d.get("max_output_channels", 0),
+            ))
+        return tuple(items)
     except Exception:
         return ()
 
@@ -1451,11 +1468,20 @@ class InferenceWorkerThread(QThread):
             dropped = True
         if dropped:
             self.xrun_occurred.emit()
-        self.infer_done.emit(elapsed_ms, in_rms, calc_rms_db(out_block))
-        try:
-            self.spectrum.emit(spec_bins(out_block))
-        except Exception:
-            pass
+        now = time.perf_counter()
+        # 电平/频谱跟手一点；文字和样式仍少刷，避免窗口发黏
+        if now - getattr(self, "_meter_last", 0.0) >= 0.04:
+            self._meter_last = now
+            self.infer_done.emit(elapsed_ms, in_rms, calc_rms_db(out_block))
+            try:
+                self.spectrum.emit(spec_bins(out_block))
+            except Exception:
+                pass
+        if now - getattr(self, "_ui_last", 0.0) >= 0.12:
+            self._ui_last = now
+            stage = getattr(self.pipeline, "last_stage_ms", None)
+            if stage:
+                self.stage_stats.emit(dict(stage))
 
     def run(self):
         from collections import deque
@@ -1490,9 +1516,6 @@ class InferenceWorkerThread(QThread):
                     self.need_recover.emit()
                 if not self.running:
                     break
-                stage = getattr(self.pipeline, "last_stage_ms", None)
-                if stage:
-                    self.stage_stats.emit(dict(stage))
                 self._emit_out(out_block, elapsed_ms, in_rms)
         except Exception as e:
             logging.exception("推理线程异常")
@@ -1692,7 +1715,10 @@ class VCEngine(QObject):
         self.server_url = server_url or DEFAULT_SERVER_URL
         self.pipeline = make_pipeline(
             self.mode, self.server_url, lambda m: self.status_msg.emit(m))
-        self.stream = None; self.running = False
+        self.stream = None
+        self._out_stream = None
+        self._last_cap = np.zeros(0, dtype=np.float32)
+        self.running = False
         self.current_speaker = None
         self.input_device = None; self.output_device = None
         self.input_queue = queue.Queue(maxsize=4)
@@ -1705,7 +1731,16 @@ class VCEngine(QObject):
         self._pool_i = 0
         self._last_out = np.zeros(0, dtype=np.float32)
         self._last_out_n = 0
+        self._hold_count = 0
+        self._xrun_fade = np.zeros(0, dtype=np.float32)
         self._mon_scratch = np.zeros(0, dtype=np.float32)
+        self._virtual_out = False
+        self._bt_in = False
+        self._agc_held_off = False
+        self._ns_held_off = False
+        self._deess_held_off = False
+        self._vad_held_off = False
+        self._index_bumped = False
         self.worker_thread = None
         self._zombie_threads = []   # 超时未退出的线程，等 finished 再删，避免销毁运行中的线程
         self.xrun_count = 0
@@ -1823,6 +1858,7 @@ class VCEngine(QObject):
     vad_threshold = _prop("vad_threshold")
     incremental_hubert = _prop("incremental_hubert")
     capture_denoise = _prop("capture_denoise")
+    protect = _prop("protect")
 
     def _queue_configure(self, kwargs):
         with self._live_lock:
@@ -2039,6 +2075,10 @@ class VCEngine(QObject):
         self._pool_i = 0
         self._last_out = np.zeros(max(block, 1), dtype=np.float32)
         self._last_out_n = 0
+        self._hold_count = 0
+        sr = int(getattr(self.pipeline, "samplerate", 0) or 48000)
+        fade_n = max(8, int(0.008 * sr))
+        self._xrun_fade = np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
         self._mon_scratch = np.zeros(max(block, 1), dtype=np.float32)
 
     def _start_blocking(self):
@@ -2062,7 +2102,7 @@ class VCEngine(QObject):
             if self._stop_requested:
                 self._hard_stop()
                 return
-            params = self.merged_params()
+            params = self._prepare_call_path(self.merged_params())
             self.pipeline.configure(**params)
             started = self.pipeline.start(**params)
             if started is False:
@@ -2084,7 +2124,7 @@ class VCEngine(QObject):
             self._drain_queue(self.output_queue)
 
             # 输入 AGC（按当前采样率重建，静音/增益状态清零，动态绑定当前静音门限）
-            if self.input_agc:
+            if self.input_agc and not getattr(self, "_agc_held_off", False):
                 self.agc = AutoGain(sample_rate=self.pipeline.samplerate, gate_db=float(self.threhold))
             else:
                 self.agc = None
@@ -2120,6 +2160,8 @@ class VCEngine(QObject):
                 self._hard_stop()
                 return
             self.stream.start()
+            if self._out_stream is not None:
+                self._out_stream.start()
             self._open_monitor()
             if self._stop_requested:
                 self._hard_stop()
@@ -2138,18 +2180,122 @@ class VCEngine(QObject):
             self.load_failed.emit(str(e))
 
     def _close_stream_only(self):
-        if self.stream:
+        for name in ("stream", "_out_stream"):
+            st = getattr(self, name, None)
+            if st is None:
+                continue
             try:
-                self.stream.abort()
-                self.stream.close()
+                st.abort()
+                st.close()
             except Exception:
                 pass
-            self.stream = None
+            setattr(self, name, None)
+
+    def _dev_name(self, idx):
+        try:
+            if idx is None:
+                return ""
+            return str(sd.query_devices(idx).get("name") or "")
+        except Exception:
+            return ""
+
+    def _out_is_virtual(self):
+        return is_virtual_name(self._dev_name(self.output_device))
+
+    def _in_is_bluetooth(self):
+        return is_bluetooth_name(self._dev_name(self.input_device))
+
+    def _prepare_call_path(self, params):
+        """给别人听时稳住块长；同时关掉会把声音做糊的处理。"""
+        params = dict(params)
+        virtual_out = self._out_is_virtual()
+        bt_in = self._in_is_bluetooth()
+        self._virtual_out = bool(virtual_out)
+        self._bt_in = bool(bt_in)
+        if hasattr(self.pipeline, "_virtual_out"):
+            self.pipeline._virtual_out = bool(virtual_out)
+        notes = []
+        bt = float(params.get("block_time") or 0.06)
+        if virtual_out and bt < VIRTUAL_OUT_MIN_BLOCK:
+            params["block_time"] = VIRTUAL_OUT_MIN_BLOCK
+            self._params["block_time"] = VIRTUAL_OUT_MIN_BLOCK
+            notes.append("块长提到 80ms")
+        self._agc_held_off = bool((virtual_out or bt_in) and self.input_agc)
+        if self._agc_held_off:
+            notes.append("已关输入自动增益")
+        self._ns_held_off = False
+        if virtual_out or bt_in:
+            params["capture_denoise"] = False
+            if hasattr(self.pipeline, "capture_denoise"):
+                self.pipeline.capture_denoise = False
+            cap_ns = getattr(self.pipeline, "_cap_ns", None)
+            if cap_ns is not None:
+                cap_ns.enabled = False
+            if bool(self._params.get("capture_denoise", False)):
+                self._ns_held_off = True
+                notes.append("已关采集降噪")
+
+        # 发糊：去齿音会砍高频，人声识别会切字头，短窗特征更糊
+        self._deess_held_off = bool(params.get("deesser_enable"))
+        if self._deess_held_off:
+            params["deesser_enable"] = False
+            self._params["deesser_enable"] = False
+            notes.append("已关去齿音")
+        self._vad_held_off = bool(params.get("vad_enable"))
+        if self._vad_held_off:
+            params["vad_enable"] = False
+            self._params["vad_enable"] = False
+            notes.append("已关人声识别")
+        if bool(params.get("incremental_hubert", False)):
+            notes.append("已关短窗特征")
+        params["incremental_hubert"] = False
+        self._params["incremental_hubert"] = False
+        if float(params.get("hf_mix_rate") or 0) <= 0:
+            params["hf_mix_rate"] = 0.25
+            self._params["hf_mix_rate"] = 0.25
+            notes.append("已开齿音保留")
+        if float(params.get("presence") or 0) <= 0:
+            params["presence"] = 0.15
+            self._params["presence"] = 0.15
+            notes.append("已开临场感")
+        self._index_bumped = False
+        spk = self.current_speaker
+        if (spk is not None and str(getattr(spk, "index_path", "") or "").strip()
+                and float(getattr(spk, "index_rate", 0) or 0) <= 0.05):
+            spk.index_rate = 0.5
+            try:
+                self.change_index_rate(0.5)
+            except Exception:
+                pass
+            self._index_bumped = True
+            notes.append("检索提到 0.5")
+
+        if bt_in:
+            notes.append("蓝牙麦延迟大，建议换电脑麦或有线耳机麦")
+        if notes:
+            prefix = "给别人听：" if virtual_out else "音质："
+            self.status_msg.emit(prefix + "，".join(notes))
+        return params
+
+    def _wasapi_shared(self):
+        try:
+            return sd.WasapiSettings(exclusive=False, auto_convert=True)
+        except TypeError:
+            return sd.WasapiSettings(exclusive=False)
 
     def _open_stream(self):
         block = getattr(self.pipeline, "_block_frame", None)
         if not block:
             raise RuntimeError("推理块大小未知，请先加载角色再启动")
+        virtual_out = self._out_is_virtual()
+        bt_in = self._in_is_bluetooth()
+        self._virtual_out = bool(virtual_out)
+        self._bt_in = bool(bt_in)
+        if hasattr(self.pipeline, "_virtual_out"):
+            self.pipeline._virtual_out = bool(virtual_out)
+        split = self.input_device != self.output_device
+        if split:
+            return self._open_split_streams(int(block), virtual_out)
         kwargs = dict(
             callback=self._on_audio,
             blocksize=block,
@@ -2157,13 +2303,12 @@ class VCEngine(QObject):
             channels=self.pipeline.channels,
             dtype="float32",
             device=(self.input_device, self.output_device),
-            latency="low",
+            latency="high" if (virtual_out or bt_in) else "low",
         )
         errors = []
         if self._stop_requested:
             return False, "已取消"
 
-        # 1. 优先探测是否为 ASIO 硬件设备（极低硬件延迟，不使用 WasapiSettings）
         is_asio = False
         try:
             in_info = sd.query_devices(self.input_device) if self.input_device is not None else None
@@ -2186,29 +2331,27 @@ class VCEngine(QObject):
         if self._stop_requested:
             return False, "已取消"
 
-        # 2. WASAPI 独占（次低延迟）
-        try:
-            self.stream = sd.Stream(
-                extra_settings=sd.WasapiSettings(exclusive=True), **kwargs)
-            return True, "系统低延迟独占"
-        except Exception as e:
-            errors.append(e)
+        if not virtual_out:
+            try:
+                self.stream = sd.Stream(
+                    extra_settings=sd.WasapiSettings(exclusive=True), **kwargs)
+                return True, "系统低延迟独占"
+            except Exception as e:
+                errors.append(e)
 
         if self._stop_requested:
             return False, "已取消"
 
-        # 3. WASAPI 共享模式
         try:
-            try:
-                extra = sd.WasapiSettings(exclusive=False, auto_convert=True)
-            except TypeError:
-                extra = sd.WasapiSettings(exclusive=False)
+            extra = self._wasapi_shared()
             self.stream = sd.Stream(extra_settings=extra, **kwargs)
-            return True, "系统共享（独占失败: %s）" % _wasapi_fail_reason(errors[-1])
+            why = "虚拟声卡共享" if virtual_out else (
+                "系统共享（独占失败: %s）" % _wasapi_fail_reason(errors[-1]) if errors else "系统共享"
+            )
+            return True, why
         except Exception as e:
             errors.append(e)
 
-        # 4. 系统默认共享回退
         try:
             self.stream = sd.Stream(**kwargs)
             return True, "系统共享（%s）" % _wasapi_fail_reason(errors[-1])
@@ -2219,6 +2362,69 @@ class VCEngine(QObject):
             kwargs["channels"] = 2
             self.stream = sd.Stream(**kwargs)
             return True, "系统共享 · 双声道"
+        except Exception as e:
+            return False, str(e)
+
+    def _open_split_streams(self, block, virtual_out):
+        """麦和输出不是同一设备：拆开采集/播放，避免两套时钟绑死（给别人听走 CABLE）。"""
+        sr = self.pipeline.samplerate
+        ch = self.pipeline.channels
+        bt_in = bool(getattr(self, "_bt_in", False))
+        in_lat = "high" if bt_in else "low"
+        out_lat = "high" if virtual_out else "low"
+        in_kw = dict(
+            blocksize=block, samplerate=sr, channels=ch, dtype="float32",
+            latency=in_lat, callback=self._on_capture, device=self.input_device,
+        )
+        out_kw = dict(
+            blocksize=block, samplerate=sr, channels=ch, dtype="float32",
+            latency=out_lat, callback=self._on_playback, device=self.output_device,
+        )
+        errors = []
+
+        def try_pair(in_extra, out_extra, label):
+            ik, okw = dict(in_kw), dict(out_kw)
+            if in_extra is not None:
+                ik["extra_settings"] = in_extra
+            if out_extra is not None:
+                okw["extra_settings"] = out_extra
+            ins = sd.InputStream(**ik)
+            try:
+                outs = sd.OutputStream(**okw)
+            except Exception:
+                try:
+                    ins.close()
+                except Exception:
+                    pass
+                raise
+            self.stream = ins
+            self._out_stream = outs
+            return True, label
+
+        if not virtual_out and not bt_in:
+            try:
+                return try_pair(
+                    sd.WasapiSettings(exclusive=True),
+                    sd.WasapiSettings(exclusive=True),
+                    "分路独占（麦/输出分开）",
+                )
+            except Exception as e:
+                errors.append(e)
+        if not bt_in:
+            try:
+                return try_pair(
+                    sd.WasapiSettings(exclusive=True),
+                    self._wasapi_shared(),
+                    "麦独占 · 输出共享（适合虚拟声卡给其它软件听）",
+                )
+            except Exception as e:
+                errors.append(e)
+        try:
+            return try_pair(self._wasapi_shared(), self._wasapi_shared(), "分路共享")
+        except Exception as e:
+            errors.append(e)
+        try:
+            return try_pair(None, None, "分路默认")
         except Exception as e:
             return False, str(e)
 
@@ -2237,6 +2443,13 @@ class VCEngine(QObject):
         return True, ""
 
     def _reopen_blocking(self):
+        virtual_out = self._out_is_virtual()
+        self._virtual_out = bool(virtual_out)
+        self._bt_in = self._in_is_bluetooth()
+        if hasattr(self.pipeline, "_virtual_out"):
+            self.pipeline._virtual_out = bool(virtual_out)
+        if virtual_out and float(getattr(self, "block_time", 0.06) or 0.06) < VIRTUAL_OUT_MIN_BLOCK:
+            self.status_msg.emit("给别人听建议停再开，块长会自动提到 80ms")
         self._close_stream_only()
         ok, msg = self._open_stream()
         if not ok:
@@ -2247,6 +2460,8 @@ class VCEngine(QObject):
         self._fade_out_left = 0
         try:
             self.stream.start()
+            if self._out_stream is not None:
+                self._out_stream.start()
         except Exception as e:
             self.status_msg.emit("切换设备失败: " + str(e))
             self._hard_stop()
@@ -2596,12 +2811,21 @@ class VCEngine(QObject):
 
     def _cb_fill_from_hold(self, dest):
         n = dest.shape[0]
+        self._hold_count = getattr(self, "_hold_count", 0) + 1
+        # 喂给其它软件时：欠载补静音，绝不能把上一块再念一遍（那就是卡+炸麦）
+        if getattr(self, "_virtual_out", False):
+            dest.fill(0.0)
+            fade = getattr(self, "_xrun_fade", None)
+            if (self._hold_count == 1 and self._last_out_n > 0
+                    and fade is not None and fade.size):
+                fade_n = min(n, self._last_out_n, int(fade.shape[0]))
+                dest[:fade_n] = self._last_out[:fade_n] * fade[:fade_n]
+            return
         if self._last_out_n <= 0 or self._last_out.size == 0:
             dest.fill(0.0)
             return
         src = self._last_out[:self._last_out_n]
-        # 连续欠载计数：前 3 块原样重复，之后线性淡到静音，避免循环同一块变成嗡鸣
-        self._hold_count = getattr(self, "_hold_count", 0) + 1
+        # 自听：前 3 块原样重复，之后线性淡到静音，避免循环同一块变成嗡鸣
         g = 1.0 if self._hold_count <= 3 else max(0.0, 1.0 - 0.25 * (self._hold_count - 3))
         if src.shape[0] >= n:
             dest[:] = src[:n] * g
@@ -2609,86 +2833,124 @@ class VCEngine(QObject):
             dest[:src.shape[0]] = src * g
             dest[src.shape[0]:] = (src[-1] * g) if src.size else 0.0
 
-    def _on_audio(self, indata, outdata, frames, times, status):
-        """音频回调：预分配环缓冲凑整块。欠载重复上一块，绝不在此发 Qt 信号。"""
+    def _on_capture(self, indata, frames, times, status):
+        if not self.running:
+            return
+        try:
+            self._ingest_input(indata)
+        except Exception:
+            pass
+
+    def _on_playback(self, outdata, frames, times, status):
         if not self.running:
             outdata.fill(0)
             return
         try:
-            mono = indata[:, 0] if indata.ndim > 1 else indata
-            n_needed = len(outdata)
-            if self.bypass:
-                n = min(len(mono), n_needed)
-                outdata[:n, 0] = mono[:n]
-                if n < n_needed:
-                    outdata[n:, 0] = 0
-                if outdata.shape[1] > 1:
-                    outdata[:, 1:] = outdata[:, :1]
-                self._apply_edge_fade(outdata)
-                self._push_monitor_view(outdata[:, 0], n_needed)
-                self._report_loop_latency(times, n_needed)
-                return
+            self._fill_output(outdata, None, frames, times)
+        except Exception:
+            outdata.fill(0)
 
-            if self.input_agc and self.agc is not None:
-                mono = self.agc.process(mono)
-
-            in_block = int(getattr(self.pipeline, "_block_frame", 0) or 0)
-            if in_block <= 0:
-                outdata.fill(0)
-                return
-            if mono.shape[0] == in_block and self._in_n == 0 and self._in_pool:
-                slot = self._in_pool[self._pool_i]
-                self._pool_i = (self._pool_i + 1) % len(self._in_pool)
-                if slot.shape[0] != in_block:
-                    slot = np.zeros(in_block, dtype=np.float32)
-                    self._in_pool[(self._pool_i - 1) % len(self._in_pool)] = slot
-                slot[:in_block] = mono[:in_block]
-                self._enqueue_input(slot)
-            else:
-                self._cb_push_in(mono)
-                while True:
-                    chunk = self._cb_take_in(in_block)
-                    if chunk is None:
-                        break
-                    self._enqueue_input(chunk)
-
-            while self._out_n < n_needed:
-                try:
-                    block = self.output_queue.get_nowait()
-                except queue.Empty:
+    def _ingest_input(self, indata):
+        if self.bypass:
+            self._last_cap = np.asarray(
+                indata[:, 0] if getattr(indata, "ndim", 1) > 1 else indata,
+                dtype=np.float32,
+            ).copy()
+            return
+        mono = indata[:, 0] if indata.ndim > 1 else indata
+        if self.input_agc and self.agc is not None:
+            mono = self.agc.process(mono)
+        self._last_cap = np.asarray(mono, dtype=np.float32).copy()
+        in_block = int(getattr(self.pipeline, "_block_frame", 0) or 0)
+        if in_block <= 0:
+            return
+        if mono.shape[0] == in_block and self._in_n == 0 and self._in_pool:
+            slot = self._in_pool[self._pool_i]
+            self._pool_i = (self._pool_i + 1) % len(self._in_pool)
+            if slot.shape[0] != in_block:
+                slot = np.zeros(in_block, dtype=np.float32)
+                self._in_pool[(self._pool_i - 1) % len(self._in_pool)] = slot
+            slot[:in_block] = mono[:in_block]
+            self._enqueue_input(slot)
+        else:
+            self._cb_push_in(mono)
+            while True:
+                chunk = self._cb_take_in(in_block)
+                if chunk is None:
                     break
-                self._cb_push_out(block)
+                self._enqueue_input(chunk)
 
-            if self._out_n >= n_needed:
-                outdata[:, 0] = self._out_buf[:n_needed]
-                remain = self._out_n - n_needed
-                if remain:
-                    self._out_buf[:remain] = self._out_buf[n_needed:self._out_n]
-                self._out_n = remain
-                hold_n = min(n_needed, self._last_out.shape[0])
-                self._last_out[:hold_n] = outdata[:hold_n, 0]
-                self._last_out_n = hold_n
-                self._hold_count = 0
-            else:
-                n_take = min(self._out_n, n_needed)
-                if n_take > 0:
-                    outdata[:n_take, 0] = self._out_buf[:n_take]
-                    self._out_n = 0
-                    self._cb_fill_from_hold(outdata[n_take:, 0])
-                else:
-                    self._cb_fill_from_hold(outdata[:, 0])
-                self.xrun_count += 1
+    def _fill_output(self, outdata, cap_mono, n_needed, times):
+        if self.bypass:
+            src = cap_mono if cap_mono is not None else getattr(self, "_last_cap", None)
+            outdata.fill(0)
+            if src is not None and len(src):
+                n = min(len(src), n_needed)
+                outdata[:n, 0] = src[:n]
             if outdata.shape[1] > 1:
                 outdata[:, 1:] = outdata[:, :1]
-            dry = float(self.dry_mix)
-            if dry > 0:
-                n = min(len(mono), n_needed)
-                outdata[:n, 0] = outdata[:n, 0] * (1.0 - dry) + mono[:n] * dry
-                if outdata.shape[1] > 1:
-                    outdata[:, 1:] = outdata[:, :1]
             self._apply_edge_fade(outdata)
+            self._protect_virtual_out(outdata)
             self._push_monitor_view(outdata[:, 0], n_needed)
             self._report_loop_latency(times, n_needed)
+            return
+        in_block = int(getattr(self.pipeline, "_block_frame", 0) or 0)
+        if in_block <= 0:
+            outdata.fill(0)
+            return
+        while self._out_n < n_needed:
+            try:
+                block = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._cb_push_out(block)
+        if self._out_n >= n_needed:
+            outdata[:, 0] = self._out_buf[:n_needed]
+            remain = self._out_n - n_needed
+            if remain:
+                self._out_buf[:remain] = self._out_buf[n_needed:self._out_n]
+            self._out_n = remain
+            hold_n = min(n_needed, self._last_out.shape[0])
+            self._last_out[:hold_n] = outdata[:hold_n, 0]
+            self._last_out_n = hold_n
+            self._hold_count = 0
+        else:
+            n_take = min(self._out_n, n_needed)
+            if n_take > 0:
+                outdata[:n_take, 0] = self._out_buf[:n_take]
+                self._out_n = 0
+                self._cb_fill_from_hold(outdata[n_take:, 0])
+            else:
+                self._cb_fill_from_hold(outdata[:, 0])
+            self.xrun_count += 1
+        if outdata.shape[1] > 1:
+            outdata[:, 1:] = outdata[:, :1]
+        dry = float(self.dry_mix)
+        src = cap_mono if cap_mono is not None else getattr(self, "_last_cap", None)
+        if dry > 0 and src is not None and len(src):
+            n = min(len(src), n_needed)
+            outdata[:n, 0] = outdata[:n, 0] * (1.0 - dry) + src[:n] * dry
+            if outdata.shape[1] > 1:
+                outdata[:, 1:] = outdata[:, :1]
+        self._apply_edge_fade(outdata)
+        self._protect_virtual_out(outdata)
+        self._push_monitor_view(outdata[:, 0], n_needed)
+        self._report_loop_latency(times, n_needed)
+
+    def _protect_virtual_out(self, outdata):
+        if not getattr(self, "_virtual_out", False):
+            return
+        np.clip(outdata, -0.89, 0.89, out=outdata)
+
+    def _on_audio(self, indata, outdata, frames, times, status):
+        """双工回调：同一设备自听时走这里。"""
+        if not self.running:
+            outdata.fill(0)
+            return
+        try:
+            self._ingest_input(indata)
+            mono = indata[:, 0] if indata.ndim > 1 else indata
+            self._fill_output(outdata, mono, len(outdata), times)
         except Exception:
             outdata.fill(0)
 
@@ -2761,7 +3023,7 @@ class MainWindow(QMainWindow):
         self._rl()
         self._set_light(LIGHT_GRAY, "未加载模型")
         self._dev_timer = QTimer(self)
-        self._dev_timer.setInterval(2500)
+        self._dev_timer.setInterval(8000)
         self._dev_timer.timeout.connect(self._poll_devices)
         self._dev_timer.start()
         # 冻结版：定时刷新本地推理安装状态
@@ -2859,8 +3121,14 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("虚拟声卡设置已更新", 4000)
 
     def _on_xrun(self, xruns):
-        self.xrun_label.setText(f"卡顿 {xruns}")
-        self.xrun_label.setStyleSheet("font-size:12px;font-weight:700;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:4px 8px;" if xruns > 0 else "font-size:12px;font-weight:700;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:4px 8px;")
+        text = f"卡顿 {xruns}"
+        if text != getattr(self, "_xrun_text", ""):
+            self.xrun_label.setText(text)
+            self._xrun_text = text
+        band = 1 if xruns > 0 else 0
+        if band != getattr(self, "_xrun_band", None):
+            self._xrun_band = band
+            self.xrun_label.setStyleSheet("font-size:12px;font-weight:700;color:#dc2626;background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:4px 8px;" if xruns > 0 else "font-size:12px;font-weight:700;color:#64748b;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:4px 8px;")
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -3224,7 +3492,7 @@ class MainWindow(QMainWindow):
         self.bs.setDecimals(3)
         self.bs.setSuffix(" 秒")
         self.bs.setMinimumHeight(28)
-        self.bs.setToolTip("音频块时长（秒）。越小嘴到耳越低，GPU 越容易卡顿。运行中修改下次启动生效")
+        self.bs.setToolTip("音频块时长（秒）。越小嘴到耳越低，越容易卡。输出到虚拟声卡给别人听时，启动会自动不低于 80ms。")
         self.bs.valueChanged.connect(lambda v: setattr(self.engine, "block_time", v))
         self.bs.valueChanged.connect(lambda _: self._sync_tradeoff_slider())
 
@@ -3301,13 +3569,13 @@ class MainWindow(QMainWindow):
         self.onc.toggled.connect(lambda v: setattr(self.engine, "O_noise_reduce", v))
         self.cap_ns_cb = QCheckBox("采集降噪")
         self.cap_ns_cb.setMinimumHeight(26)
-        self.cap_ns_cb.setToolTip("送出麦克风前压键盘/风扇底噪，服务器版默认开")
+        self.cap_ns_cb.setToolTip("送出麦克风前压键盘/风扇底噪。给别人听或用蓝牙麦时会自动关掉，避免叠降噪切字、炸麦。")
         self.cap_ns_cb.setChecked(True)
         self.cap_ns_cb.toggled.connect(lambda v: setattr(self.engine, "capture_denoise", v))
         self.inc_hubert_cb = QCheckBox("短窗特征")
         self.inc_hubert_cb.setMinimumHeight(26)
         self.inc_hubert_cb.setToolTip("只算最近一小段特征，更快、更利多人。关掉更稳、更像。")
-        self.inc_hubert_cb.setChecked(True)
+        self.inc_hubert_cb.setChecked(False)
         self.inc_hubert_cb.toggled.connect(lambda v: setattr(self.engine, "incremental_hubert", v))
 
         nr = QHBoxLayout()
@@ -3382,13 +3650,23 @@ class MainWindow(QMainWindow):
         dl.addWidget(self._lbl("临场感"), 2, 0)
         dl.addWidget(self.pres_spin, 2, 1)
 
+        self.protect_spin = QDoubleSpinBox()
+        self.protect_spin.setRange(0.0, 0.5)
+        self.protect_spin.setSingleStep(0.05)
+        self.protect_spin.setValue(DEFAULT_PARAMS.get("protect", 0.33))
+        self.protect_spin.setMinimumHeight(28)
+        self.protect_spin.setToolTip("清辅音保护。越小越留字头/气音，0.33 为原版默认，0.5 关闭。")
+        self.protect_spin.valueChanged.connect(lambda v: setattr(self.engine, "protect", v))
+        dl.addWidget(self._lbl("辅音保护"), 3, 0)
+        dl.addWidget(self.protect_spin, 3, 1)
+
         # 去齿音
         self.deess_cb = QCheckBox("自适应去齿音")
         self.deess_cb.setMinimumHeight(26)
         self.deess_cb.setToolTip("尖刺超标时软衰减。与「齿音保留」互斥。")
         self.deess_cb.setChecked(DEFAULT_PARAMS["deesser_enable"])
         self.deess_cb.toggled.connect(self._on_deesser)
-        dl.addWidget(self.deess_cb, 3, 0, 1, 2)
+        dl.addWidget(self.deess_cb, 4, 0, 1, 2)
 
         # 人声识别 (VAD)
         vr = QHBoxLayout()
@@ -3409,12 +3687,12 @@ class MainWindow(QMainWindow):
         self.vad_th.setToolTip("人声置信度门限（0.50 为推荐平衡点）")
         self.vad_th.valueChanged.connect(lambda v: setattr(self.engine, "vad_threshold", v))
         vr.addWidget(self.vad_th)
-        dl.addLayout(vr, 4, 0, 1, 2)
+        dl.addLayout(vr, 5, 0, 1, 2)
 
         # 阶段耗时
         self.st_lbl = QLabel("阶段耗时: --")
         self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
-        dl.addWidget(self.st_lbl, 5, 0, 1, 2)
+        dl.addWidget(self.st_lbl, 6, 0, 1, 2)
         dl.setColumnStretch(1, 1)
         l2.addWidget(g_dsp)
         l2.addStretch(1)
@@ -3433,7 +3711,7 @@ class MainWindow(QMainWindow):
 
         self.agc_cb = QCheckBox("输入自动增益")
         self.agc_cb.setMinimumHeight(26)
-        self.agc_cb.setToolTip("输入音量自动拉齐，远近说话时更稳（实时生效）")
+        self.agc_cb.setToolTip("输入音量自动拉齐。给别人听或用蓝牙麦时会自动关掉，避免和其它软件叠增益炸麦。")
         self.agc_cb.toggled.connect(self._on_agc)
         m.addWidget(self.agc_cb, 0, 0, 1, 2)
 
@@ -3535,20 +3813,45 @@ class MainWindow(QMainWindow):
     def _clear_dev_hint(self):
         self.dev_hint.setVisible(False)
 
+    def _refresh_route_hint(self):
+        """蓝牙麦 / 虚拟声卡路由提示。输入输出不在同一驱动组时不覆盖对齐提示。"""
+        if not hasattr(self, "ic") or not hasattr(self, "oc"):
+            return
+        in_api = self.ic.currentDeviceApi()
+        out_api = self.oc.currentDeviceApi()
+        if in_api is not None and out_api is not None and in_api != out_api:
+            return
+        in_name = self.ic.currentDeviceName() or ""
+        out_name = self.oc.currentDeviceName() or ""
+        if is_bluetooth_name(in_name):
+            self._show_dev_hint(
+                "当前输入是蓝牙耳机麦，延迟大、容易卡顿炸麦。"
+                "请改用电脑自带麦或有线耳机麦。"
+            )
+            return
+        if is_virtual_name(out_name):
+            self._show_dev_hint(
+                "输出已走虚拟声卡。请把要接收变声的软件，麦克风选成这条虚拟线的录制端"
+                "（如 CABLE Output）。给别人听时块长会自动不低于 80ms。",
+                warn=False,
+            )
+            return
+        self._clear_dev_hint()
+
     def _on_device_changed(self, which="input"):
         if self._device_guard:
             return
         self._align_device_apis(which)
         if not self.engine.running:
             self._persist_settings()
+            self._refresh_route_hint()
             return
         in_id, out_id, err = self._resolve_selected(reinit=False)
         if err:
             self._show_dev_hint(err)
             self.status_bar.showMessage(err, 8000)
             return
-        # 切换设备在后台执行，结果由引擎状态消息回报
-        self._clear_dev_hint()
+        self._refresh_route_hint()
         self.engine.reopen_stream(in_id, out_id)
         self._persist_settings()
 
@@ -3708,6 +4011,8 @@ class MainWindow(QMainWindow):
                 self.engine.request_hard_stop()
                 self._show_dev_hint("音频设备已断开: " + lost)
                 self.status_bar.showMessage("音频设备已断开: " + lost, 8000)
+                return
+        self._refresh_route_hint()
 
     def _poll_devices(self):
         if getattr(self, "_dev_query_busy", False):
@@ -3980,7 +4285,7 @@ class MainWindow(QMainWindow):
 
     def _on_recover_ok(self):
         self._set_light(LIGHT_GREEN, "运行中")
-        self._clear_dev_hint()
+        self._refresh_route_hint()
         if self.engine.mode == "server":
             self._set_server_status("已重新连上服务器", "ok")
         self.status_bar.showMessage("已重新连上服务器，变声继续", 5000)
@@ -4005,11 +4310,57 @@ class MainWindow(QMainWindow):
 
     def _on_started(self):
         self._set_light(LIGHT_GREEN, "运行中")
-        self._clear_dev_hint()
         self.sb.setEnabled(True)
         self.sb.setText("停止变声")
         self.sb.setProperty("state", "on")
         self.sb.style().unpolish(self.sb); self.sb.style().polish(self.sb)
+        bt = float(getattr(self.engine, "block_time", 0) or 0)
+        if hasattr(self, "bs") and abs(float(self.bs.value()) - bt) > 0.0005 and bt > 0:
+            self.bs.blockSignals(True)
+            try:
+                self.bs.setValue(bt)
+            finally:
+                self.bs.blockSignals(False)
+            self._sync_tradeoff_slider()
+        if getattr(self.engine, "_agc_held_off", False) and hasattr(self, "agc_cb"):
+            self.agc_cb.blockSignals(True)
+            self.agc_cb.setChecked(False)
+            self.agc_cb.blockSignals(False)
+        if getattr(self.engine, "_ns_held_off", False) and hasattr(self, "cap_ns_cb"):
+            self.cap_ns_cb.blockSignals(True)
+            self.cap_ns_cb.setChecked(False)
+            self.cap_ns_cb.blockSignals(False)
+        if getattr(self.engine, "_deess_held_off", False) and hasattr(self, "deess_cb"):
+            self.deess_cb.blockSignals(True)
+            self.deess_cb.setChecked(False)
+            self.deess_cb.blockSignals(False)
+        if getattr(self.engine, "_vad_held_off", False) and hasattr(self, "vad_cb"):
+            self.vad_cb.blockSignals(True)
+            self.vad_cb.setChecked(False)
+            self.vad_cb.blockSignals(False)
+        if hasattr(self, "inc_hubert_cb"):
+            self.inc_hubert_cb.blockSignals(True)
+            self.inc_hubert_cb.setChecked(False)
+            self.inc_hubert_cb.blockSignals(False)
+        if hasattr(self, "hf_spin"):
+            hf = float(getattr(self.engine, "hf_mix_rate", 0) or 0)
+            if abs(float(self.hf_spin.value()) - hf) > 0.001:
+                self.hf_spin.blockSignals(True)
+                self.hf_spin.setValue(hf)
+                self.hf_spin.blockSignals(False)
+        if hasattr(self, "pres_spin"):
+            pr = float(getattr(self.engine, "presence", 0) or 0)
+            if abs(float(self.pres_spin.value()) - pr) > 0.001:
+                self.pres_spin.blockSignals(True)
+                self.pres_spin.setValue(pr)
+                self.pres_spin.blockSignals(False)
+        if getattr(self.engine, "_index_bumped", False) and hasattr(self, "live_index"):
+            self.live_index.blockSignals(True)
+            self.live_index.setValue(0.5)
+            self.live_index.blockSignals(False)
+        self._refresh_route_hint()
+        self._persist_settings(
+            save_speakers=bool(getattr(self.engine, "_index_bumped", False)))
 
     def _on_stopped(self):
         self._set_light(LIGHT_GRAY, "已停止")
@@ -4033,7 +4384,7 @@ class MainWindow(QMainWindow):
             self._apply_mode(mode)
 
     def _on_status(self, m):
-        hold = 8000 if any(k in str(m) for k in ("失败", "中断", "错误", "断开")) else 5000
+        hold = 8000 if any(k in str(m) for k in ("失败", "中断", "错误", "断开", "蓝牙", "80ms", "自动增益")) else 5000
         self.status_bar.showMessage(m, hold)
 
     # 录音测试暂时关闭
@@ -4082,15 +4433,20 @@ class MainWindow(QMainWindow):
     def _on_infer_time(self, ms):
         budget = max(30, int(float(self.engine.block_time) * 1000))
         if ms < budget * 0.7:
-            c, bg, bd = "#059669", "#ecfdf5", "#a7f3d0"
+            band, c, bg, bd = 0, "#059669", "#ecfdf5", "#a7f3d0"
         elif ms < budget:
-            c, bg, bd = "#d97706", "#fffbeb", "#fde68a"
+            band, c, bg, bd = 1, "#d97706", "#fffbeb", "#fde68a"
         else:
-            c, bg, bd = "#dc2626", "#fef2f2", "#fecaca"
-        self.latency_label.setText(f"推理 {ms}ms")
-        self.latency_label.setStyleSheet(
-            f"font-size:12px;font-weight:700;color:{c};background:{bg};border:1px solid {bd};border-radius:6px;padding:4px 8px;"
-        )
+            band, c, bg, bd = 2, "#dc2626", "#fef2f2", "#fecaca"
+        text = f"推理 {ms}ms"
+        if text != getattr(self, "_lat_text", ""):
+            self.latency_label.setText(text)
+            self._lat_text = text
+        if band != getattr(self, "_lat_band", None):
+            self._lat_band = band
+            self.latency_label.setStyleSheet(
+                f"font-size:12px;font-weight:700;color:{c};background:{bg};border:1px solid {bd};border-radius:6px;padding:4px 8px;"
+            )
 
     def _tg(self):
         if self.engine.running:
@@ -4392,14 +4748,22 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_loop_latency(self, ms):
-        self.e2e_label.setText(f"嘴到耳 {ms:.0f}ms")
+        text = f"嘴到耳 {ms:.0f}ms"
+        if text == getattr(self, "_e2e_text", ""):
+            return
+        self._e2e_text = text
+        self.e2e_label.setText(text)
 
     def _on_stage_stats(self, s):
         try:
-            self.st_lbl.setText(
+            text = (
                 "阶段耗时: 特征 %.1f · 检索 %.1f · 音高 %.1f · 模型 %.1f ms"
                 % (s.get("feature", 0.0), s.get("index", 0.0),
                    s.get("pitch", 0.0), s.get("model", 0.0)))
+            if text == getattr(self, "_st_text", ""):
+                return
+            self._st_text = text
+            self.st_lbl.setText(text)
         except Exception:
             pass
 
@@ -4431,6 +4795,8 @@ class MainWindow(QMainWindow):
             self.hf_spin.setValue(float(params["hf_mix_rate"]))
         if "presence" in params and hasattr(self, "pres_spin"):
             self.pres_spin.setValue(float(params["presence"]))
+        if "protect" in params and hasattr(self, "protect_spin"):
+            self.protect_spin.setValue(float(params["protect"]))
         if "vad_enable" in params and hasattr(self, "vad_cb"):
             self.vad_cb.setChecked(bool(params["vad_enable"]))
         if "incremental_hubert" in params and hasattr(self, "inc_hubert_cb"):
@@ -4479,6 +4845,7 @@ class MainWindow(QMainWindow):
             "threhold": self.engine.threhold,
             "hf_mix_rate": float(self.hf_spin.value()) if hasattr(self, "hf_spin") else 0.2,
             "presence": float(self.pres_spin.value()) if hasattr(self, "pres_spin") else 0.10,
+            "protect": float(self.protect_spin.value()) if hasattr(self, "protect_spin") else 0.33,
             "deesser_enable": bool(self.deess_cb.isChecked()) if hasattr(self, "deess_cb") else False,
             "vad_enable": bool(self.vad_cb.isChecked()) if hasattr(self, "vad_cb") else False,
             "incremental_hubert": bool(self.inc_hubert_cb.isChecked()) if hasattr(self, "inc_hubert_cb") else True,
@@ -4753,6 +5120,11 @@ class MainWindow(QMainWindow):
                 self.pres_spin.setValue(float(s["presence"]))
             except Exception:
                 pass
+        if "protect" in s and hasattr(self, "protect_spin"):
+            try:
+                self.protect_spin.setValue(float(s["protect"]))
+            except Exception:
+                pass
         if "deesser_enable" in s:
             self.deess_cb.setChecked(bool(s["deesser_enable"]))
         if "vad_enable" in s:
@@ -4840,6 +5212,7 @@ class MainWindow(QMainWindow):
             "limiter_threshold_db": float(self.limiter_th.value()),
             "hf_mix_rate": float(self.hf_spin.value()),
             "presence": float(self.pres_spin.value()),
+            "protect": float(self.protect_spin.value()) if hasattr(self, "protect_spin") else 0.33,
             "deesser_enable": bool(self.deess_cb.isChecked()),
             "vad_enable": bool(self.vad_cb.isChecked()),
             "vad_threshold": float(self.vad_th.value()),

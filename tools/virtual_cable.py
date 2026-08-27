@@ -12,6 +12,28 @@ CABLE_HINTS = (
     "loopback",
 )
 
+# 蓝牙免提麦：16 kHz、大缓冲、和虚拟声卡两套时钟，给别人听时极易卡/炸麦
+BT_HINTS = (
+    "bluetooth",
+    "bth",
+    "hands-free",
+    "handsfree",
+    "hfp",
+    "hsp",
+    "a2dp",
+    "tws",
+    "airpods",
+    "earbuds",
+    "galaxy buds",
+    "redmi buds",
+    "true wireless",
+    "蓝牙",
+    "免提",
+    "headset (",
+    "headphones (",
+    "耳机 (",
+)
+
 INSTALL_URLS = (
     ("VB-Audio Cable（推荐）", "https://vb-audio.com/Cable/"),
     ("VoiceMeeter", "https://vb-audio.com/Voicemeeter/"),
@@ -21,6 +43,11 @@ INSTALL_URLS = (
 def is_virtual_name(name):
     n = (name or "").lower()
     return any(h in n for h in CABLE_HINTS)
+
+
+def is_bluetooth_name(name):
+    n = (name or "").lower()
+    return any(h in n for h in BT_HINTS)
 
 
 def find_virtual_devices(devs, apis):

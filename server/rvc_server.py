@@ -12,7 +12,7 @@ RVC 推理服务器 — 通过 WebSocket 接收音频帧，调用 RVCPipeline �
 依赖: websockets, numpy, torch (GPU 推理用)
 """
 
-import asyncio, json, struct, argparse, traceback, sys, socket, os
+import asyncio, json, struct, argparse, traceback, sys, socket, os, threading
 import concurrent.futures
 from collections import deque
 from pathlib import Path
@@ -24,7 +24,7 @@ if "--cpu" in sys.argv:
 import numpy as np
 import websockets
 
-from worker.rvc_pipeline import RVCPipeline
+from worker.rvc_pipeline import RVCPipeline, cuda_sync_or_die
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -35,6 +35,7 @@ INFER_KEYS = (
     "hf_mix_rate", "presence", "deesser_enable",
     "vad_enable", "vad_threshold",
     "incremental_hubert",
+    "protect",
 )
 
 
@@ -187,6 +188,16 @@ class FairInfer:
         self._q = {}
         self._rr = deque()
         self._busy = False
+        self._idle = None
+
+    def _ensure_idle(self):
+        if self._idle is None:
+            self._idle = asyncio.Event()
+            self._idle.set()
+        return self._idle
+
+    async def wait_idle(self):
+        await self._ensure_idle().wait()
 
     async def submit(self, session, fn, *args):
         loop = asyncio.get_running_loop()
@@ -230,6 +241,7 @@ class FairInfer:
             if fut.done():
                 continue
             self._busy = True
+            self._ensure_idle().clear()
             cf = loop.run_in_executor(self._pool, fn, *args)
 
             def _done(cf, fut=fut, loop=loop):
@@ -245,6 +257,8 @@ class FairInfer:
                         if not fut.done():
                             fut.set_result(None)
                     self._busy = False
+                    if not self._rr:
+                        self._ensure_idle().set()
                     self._kick(loop)
                 try:
                     loop.call_soon_threadsafe(_finish)
@@ -263,7 +277,7 @@ class Session:
         self.remote = websocket.remote_address
         self.pipeline = None
         self.claimed = False
-        self.pending = deque(maxlen=3)
+        self.pending = deque()
         self.pump_task = None
         self.lock = asyncio.Lock()
 
@@ -284,6 +298,8 @@ class RVCServer:
         self._sessions = {}
         self._pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="rvc-infer")
+        self._io_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="rvc-io")
         self._fair = FairInfer(self._pool)
         self._slot_lock = asyncio.Lock()
 
@@ -320,20 +336,38 @@ class RVCServer:
             return
         session.claimed = False
         session.pending.clear()
-        try:
-            self._fair.drop(session)
-        except Exception:
-            pass
         p = session.pipeline
         if p is not None:
             try:
                 p.stop()
             except Exception:
                 pass
+        try:
+            self._fair.drop(session)
+        except Exception:
+            pass
+        # 等当前推理从线程池出来，再旁路同步 GPU；卡住则退出交给看门狗
+        self._wait_infer_idle_or_die(timeout=5.0)
+        try:
+            cuda_sync_or_die(timeout=5.0)
+        except Exception:
+            pass
+        if p is not None:
             rvc = getattr(p, "rvc", None)
             if rvc is not None:
                 self.hub.remember(rvc)
         print("[*] %s: %s" % (reason, session.remote))
+
+    def _wait_infer_idle_or_die(self, timeout=5.0):
+        """推理线程若还在跑，排一个空任务等它结束；超时视为 GPU 卡死。"""
+        done = threading.Event()
+        try:
+            self._pool.submit(done.set)
+        except Exception:
+            return
+        if not done.wait(float(timeout)):
+            print("[!] 推理线程卡住，退出交给看门狗", flush=True)
+            os._exit(1)
 
     def _prepare_loaded(self, pipeline):
         try:
@@ -359,6 +393,17 @@ class RVCServer:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._pool, fn, *args)
 
+    async def _on_io_thread(self, fn, *args):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._io_pool, fn, *args)
+
+    async def _send_skip(self, session, seq):
+        """丢块/停机时立刻回 n=0，避免客户端空等到超时后连锁错位。"""
+        try:
+            await session.ws.send(struct.pack(">II", int(seq) & 0xFFFFFFFF, 0))
+        except Exception:
+            pass
+
     async def handle(self, websocket):
         """处理单个 WebSocket 连接"""
         session = Session(websocket)
@@ -366,6 +411,17 @@ class RVCServer:
         remote = session.remote
         print(f"[+] 客户端连接: {remote}")
         try:
+            sock = None
+            try:
+                trans = getattr(websocket, "transport", None)
+                if trans is None:
+                    writer = getattr(websocket, "writer", None)
+                    trans = getattr(writer, "transport", None) if writer is not None else None
+                sock = trans.get_extra_info("socket") if trans is not None else None
+                if sock is not None:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
             async for message in websocket:
                 if isinstance(message, bytes):
                     await self._handle_audio(session, message)
@@ -478,7 +534,11 @@ class RVCServer:
                     "active": bool(pipeline.is_active),
                     **files,
                 }
-            resp = await self._on_infer_thread(_load)
+            try:
+                await asyncio.wait_for(self._fair.wait_idle(), 2.0)
+            except asyncio.TimeoutError:
+                pass
+            resp = await self._on_io_thread(_load)
             await websocket.send(json.dumps(resp))
             if isinstance(resp, dict) and "error" not in resp:
                 self._pool.submit(self._prepare_loaded, pipeline)
@@ -549,7 +609,7 @@ class RVCServer:
         if len(data) < expected_len:
             print(f"[!] 音频数据不完整: 期望 {n_samples} 采样点 ({expected_len} 字节), 实际 {len(data)} 字节")
             return None
-        audio = np.frombuffer(data[8:expected_len], dtype=np.float32)
+        audio = np.frombuffer(data[8:expected_len], dtype=np.float32).copy()
         return req_seq, np.asarray(audio, dtype=np.float32)
 
     def _infer_audio(self, pipeline, audio):
@@ -568,6 +628,9 @@ class RVCServer:
         req_seq, audio = parsed
         async with session.lock:
             if session.pump_task is not None and not session.pump_task.done():
+                if len(session.pending) >= 3:
+                    drop_seq, _ = session.pending.popleft()
+                    asyncio.create_task(self._send_skip(session, drop_seq))
                 session.pending.append((req_seq, audio))
                 return
             session.pending.clear()
@@ -582,7 +645,12 @@ class RVCServer:
                 packed = await self._fair.submit(
                     session, self._infer_audio, pipeline, audio)
                 if packed is None:
-                    return
+                    await self._send_skip(session, req_seq)
+                    async with session.lock:
+                        if not session.pending:
+                            return
+                        req_seq, audio = session.pending.popleft()
+                    continue
                 out, stage = packed
                 if self._sessions.get(websocket) is not session:
                     return
