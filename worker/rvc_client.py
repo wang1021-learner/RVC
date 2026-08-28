@@ -502,6 +502,15 @@ class RVCClient:
                 self._rtt_m2 = 0.85 * float(getattr(self, "_rtt_m2", 0.0)) + 0.15 * (delta * delta)
                 mono = out[:, 0] if out.ndim > 1 else out
                 self._last_good = np.asarray(mono, dtype=np.float32).reshape(-1).copy()
+                streak = int(getattr(self, "_conceal_streak", 0) or 0)
+                if streak > 0:
+                    sr = float(self.samplerate or 48000)
+                    fade_n = min(int(out.shape[0]), max(1, int(0.005 * sr)))
+                    w = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+                    if out.ndim > 1:
+                        out[:fade_n, 0] *= w
+                    else:
+                        out[:fade_n] *= w
                 self._conceal_streak = 0
                 return out, elapsed
         except _WS_TIMEOUT_EXC:

@@ -499,7 +499,7 @@ class CableWizard(QDialog):
                     "· %s  [%s]  入%d / 出%d"
                     % (d["name"], d["api"] or "?", d["in_ch"], d["out_ch"])
                 )
-            self.hint.setText("已检测到虚拟声卡。把它设为「输出」，游戏/Discord 里选同一条虚拟线当麦克风。")
+            self.hint.setText("已检测到虚拟声卡。把它设为「输出」，其它软件选同一条虚拟线当麦克风。")
             self.list_lbl.setText("\n".join(lines))
             self.use_out.setEnabled(True)
             self.use_in.setEnabled(any(d["in_ch"] > 0 for d in self._found))
@@ -547,7 +547,7 @@ from tools.virtual_cable import (
     find_virtual_devices, is_virtual_name, is_bluetooth_name,
     INSTALL_URLS, open_install_page, route_self_check,
 )
-from tools.audio_process import AutoGain
+from tools.audio_process import AutoGain, PeakLimiter
 
 
 def setup_logging():
@@ -719,7 +719,7 @@ DEFAULT_PARAMS = {
     "rms_mix_rate": 0.3,
     "threhold": -50,
     "limiter_enable": True,
-    "limiter_threshold_db": -1.0,
+    "limiter_threshold_db": -3.0,
     "hf_mix_rate": 0.25,
     "presence": 0.15,
     "deesser_enable": False,
@@ -732,6 +732,13 @@ DEFAULT_PARAMS = {
 
 # 输出到虚拟声卡给别人听时，块太短会欠载；欠载再复读上一块就是卡+炸麦
 VIRTUAL_OUT_MIN_BLOCK = 0.08
+
+
+def _split_hw_frames(sr):
+    """分路采集/播放的声卡回调帧数。两套时钟就用短回调，与麦是否蓝牙、下游是哪款软件无关。"""
+    sr = int(sr or 48000)
+    n = int(round(sr * 0.02 / 64.0) * 64)
+    return max(256, n)
 
 # 场景预设：低延迟 / 高音质 / 游戏语音 / 唱歌
 BUILTIN_PRESETS = [
@@ -1446,7 +1453,7 @@ class InferenceWorkerThread(QThread):
         self.running = False
 
     def _emit_out(self, out_block, elapsed_ms, in_rms):
-        cap = 2 if getattr(self.pipeline, "is_remote", False) else 4
+        cap = 3 if getattr(self.pipeline, "is_remote", False) else 4
         dropped = False
         while self.output_queue.qsize() >= cap:
             try:
@@ -1736,6 +1743,14 @@ class VCEngine(QObject):
         self._mon_scratch = np.zeros(0, dtype=np.float32)
         self._virtual_out = False
         self._bt_in = False
+        self._asrc_on = False
+        self._asrc_ready = False
+        self._asrc_pos = 0.0
+        self._asrc_step = 1.0
+        self._asrc_int = 0.0
+        self._asrc_ramp = np.zeros(0, dtype=np.float32)
+        self._asrc_idx = np.zeros(0, dtype=np.float32)
+        self._recover_fade = np.zeros(0, dtype=np.float32)
         self._agc_held_off = False
         self._ns_held_off = False
         self._deess_held_off = False
@@ -1764,6 +1779,7 @@ class VCEngine(QObject):
         # 输入 AGC / 监听混音 / 端到端延迟
         self.input_agc = False
         self.agc = None
+        self._peak_lim = None
         self.monitor_enabled = False
         self.monitor_device = None
         self.monitor_volume = 0.8
@@ -2065,7 +2081,7 @@ class VCEngine(QObject):
 
     def _alloc_rt_buffers(self, block):
         """音频回调用的预分配缓冲：回调内不再 numpy 拼接/新建数组。"""
-        cap = max(int(block) * 4, 1024)
+        cap = max(int(block) * 8, 2048)
         self._in_buf = np.zeros(cap, dtype=np.float32)
         self._in_n = 0
         self._out_buf = np.zeros(cap, dtype=np.float32)
@@ -2079,7 +2095,17 @@ class VCEngine(QObject):
         sr = int(getattr(self.pipeline, "samplerate", 0) or 48000)
         fade_n = max(8, int(0.008 * sr))
         self._xrun_fade = np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
+        rec_n = max(8, int(0.005 * sr))
+        self._recover_fade = np.linspace(0.0, 1.0, rec_n, dtype=np.float32)
         self._mon_scratch = np.zeros(max(block, 1), dtype=np.float32)
+        hw = _split_hw_frames(sr)
+        ramp_n = max(int(block), int(hw), 1024) + 64
+        self._asrc_ramp = np.arange(ramp_n, dtype=np.float32)
+        self._asrc_idx = np.zeros(ramp_n, dtype=np.float32)
+        self._asrc_pos = 0.0
+        self._asrc_step = 1.0
+        self._asrc_int = 0.0
+        self._asrc_ready = False
 
     def _start_blocking(self):
         if self.stream is not None or self.running:
@@ -2128,6 +2154,7 @@ class VCEngine(QObject):
                 self.agc = AutoGain(sample_rate=self.pipeline.samplerate, gate_db=float(self.threhold))
             else:
                 self.agc = None
+            self._peak_lim = PeakLimiter(sample_rate=self.pipeline.samplerate)
 
             # 不能把 self(VCEngine, 主线程对象) 当 parent 传给跨线程创建的 QThread，
             # 否则 Qt 报「Cannot create children for a parent in a different thread」。
@@ -2296,6 +2323,7 @@ class VCEngine(QObject):
         split = self.input_device != self.output_device
         if split:
             return self._open_split_streams(int(block), virtual_out)
+        self._asrc_on = False
         kwargs = dict(
             callback=self._on_audio,
             blocksize=block,
@@ -2366,18 +2394,18 @@ class VCEngine(QObject):
             return False, str(e)
 
     def _open_split_streams(self, block, virtual_out):
-        """麦和输出不是同一设备：拆开采集/播放，避免两套时钟绑死（给别人听走 CABLE）。"""
+        """麦和输出不是同一设备：拆开采集/播放，两套时钟用短回调 + ASRC 对钟。"""
         sr = self.pipeline.samplerate
         ch = self.pipeline.channels
-        bt_in = bool(getattr(self, "_bt_in", False))
-        in_lat = "high" if bt_in else "low"
+        hw = _split_hw_frames(sr)
+        in_lat = "low"
         out_lat = "high" if virtual_out else "low"
         in_kw = dict(
-            blocksize=block, samplerate=sr, channels=ch, dtype="float32",
+            blocksize=hw, samplerate=sr, channels=ch, dtype="float32",
             latency=in_lat, callback=self._on_capture, device=self.input_device,
         )
         out_kw = dict(
-            blocksize=block, samplerate=sr, channels=ch, dtype="float32",
+            blocksize=hw, samplerate=sr, channels=ch, dtype="float32",
             latency=out_lat, callback=self._on_playback, device=self.output_device,
         )
         errors = []
@@ -2399,9 +2427,14 @@ class VCEngine(QObject):
                 raise
             self.stream = ins
             self._out_stream = outs
+            self._asrc_on = True
+            self._asrc_ready = False
+            self._asrc_pos = 0.0
+            self._asrc_step = 1.0
+            self._asrc_int = 0.0
             return True, label
 
-        if not virtual_out and not bt_in:
+        if not virtual_out:
             try:
                 return try_pair(
                     sd.WasapiSettings(exclusive=True),
@@ -2410,15 +2443,14 @@ class VCEngine(QObject):
                 )
             except Exception as e:
                 errors.append(e)
-        if not bt_in:
-            try:
-                return try_pair(
-                    sd.WasapiSettings(exclusive=True),
-                    self._wasapi_shared(),
-                    "麦独占 · 输出共享（适合虚拟声卡给其它软件听）",
-                )
-            except Exception as e:
-                errors.append(e)
+        try:
+            return try_pair(
+                sd.WasapiSettings(exclusive=True),
+                self._wasapi_shared(),
+                "麦独占 · 输出共享",
+            )
+        except Exception as e:
+            errors.append(e)
         try:
             return try_pair(self._wasapi_shared(), self._wasapi_shared(), "分路共享")
         except Exception as e:
@@ -2804,7 +2836,14 @@ class VCEngine(QObject):
         if n <= 0:
             return
         if self._out_n + n > self._out_buf.shape[0]:
-            self._out_n = 0
+            drop = self._out_n + n - self._out_buf.shape[0]
+            if drop >= self._out_n:
+                self._out_n = 0
+                self._asrc_pos = 0.0
+            else:
+                self._out_buf[: self._out_n - drop] = self._out_buf[drop:self._out_n]
+                self._out_n -= drop
+                self._asrc_pos = max(0.0, float(getattr(self, "_asrc_pos", 0.0)) - drop)
             self.xrun_count += 1
         self._out_buf[self._out_n:self._out_n + n] = np.asarray(src[:n], dtype=np.float32)
         self._out_n += n
@@ -2816,10 +2855,11 @@ class VCEngine(QObject):
         if getattr(self, "_virtual_out", False):
             dest.fill(0.0)
             fade = getattr(self, "_xrun_fade", None)
-            if (self._hold_count == 1 and self._last_out_n > 0
+            last_n = int(getattr(self, "_last_out_n", 0) or 0)
+            if (self._hold_count == 1 and last_n > 0
                     and fade is not None and fade.size):
-                fade_n = min(n, self._last_out_n, int(fade.shape[0]))
-                dest[:fade_n] = self._last_out[:fade_n] * fade[:fade_n]
+                fade_n = min(n, last_n, int(fade.shape[0]))
+                dest[:fade_n] = self._last_out[last_n - fade_n:last_n] * fade[:fade_n]
             return
         if self._last_out_n <= 0 or self._last_out.size == 0:
             dest.fill(0.0)
@@ -2860,6 +2900,9 @@ class VCEngine(QObject):
         mono = indata[:, 0] if indata.ndim > 1 else indata
         if self.input_agc and self.agc is not None:
             mono = self.agc.process(mono)
+        peak_lim = getattr(self, "_peak_lim", None)
+        if peak_lim is not None:
+            mono = peak_lim.process(mono)
         self._last_cap = np.asarray(mono, dtype=np.float32).copy()
         in_block = int(getattr(self.pipeline, "_block_frame", 0) or 0)
         if in_block <= 0:
@@ -2898,31 +2941,10 @@ class VCEngine(QObject):
         if in_block <= 0:
             outdata.fill(0)
             return
-        while self._out_n < n_needed:
-            try:
-                block = self.output_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._cb_push_out(block)
-        if self._out_n >= n_needed:
-            outdata[:, 0] = self._out_buf[:n_needed]
-            remain = self._out_n - n_needed
-            if remain:
-                self._out_buf[:remain] = self._out_buf[n_needed:self._out_n]
-            self._out_n = remain
-            hold_n = min(n_needed, self._last_out.shape[0])
-            self._last_out[:hold_n] = outdata[:hold_n, 0]
-            self._last_out_n = hold_n
-            self._hold_count = 0
+        if getattr(self, "_asrc_on", False):
+            self._fill_output_asrc(outdata, n_needed, in_block)
         else:
-            n_take = min(self._out_n, n_needed)
-            if n_take > 0:
-                outdata[:n_take, 0] = self._out_buf[:n_take]
-                self._out_n = 0
-                self._cb_fill_from_hold(outdata[n_take:, 0])
-            else:
-                self._cb_fill_from_hold(outdata[:, 0])
-            self.xrun_count += 1
+            self._fill_output_copy(outdata, n_needed, in_block)
         if outdata.shape[1] > 1:
             outdata[:, 1:] = outdata[:, :1]
         dry = float(self.dry_mix)
@@ -2937,10 +2959,170 @@ class VCEngine(QObject):
         self._push_monitor_view(outdata[:, 0], n_needed)
         self._report_loop_latency(times, n_needed)
 
+    def _fill_output_copy(self, outdata, n_needed, in_block):
+        while self._out_n < n_needed:
+            try:
+                block = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._cb_push_out(block)
+        was_hold = int(getattr(self, "_hold_count", 0) or 0) > 0
+        if self._out_n >= n_needed:
+            outdata[:, 0] = self._out_buf[:n_needed]
+            remain = self._out_n - n_needed
+            if remain:
+                self._out_buf[:remain] = self._out_buf[n_needed:self._out_n]
+            self._out_n = remain
+            hold_n = min(n_needed, self._last_out.shape[0])
+            self._last_out[:hold_n] = outdata[:hold_n, 0]
+            self._last_out_n = hold_n
+            if was_hold:
+                self._apply_recover_fade(outdata[:, 0], n_needed)
+            self._hold_count = 0
+        else:
+            n_take = min(self._out_n, n_needed)
+            if n_take > 0:
+                outdata[:n_take, 0] = self._out_buf[:n_take]
+                self._out_n = 0
+                self._cb_fill_from_hold(outdata[n_take:, 0])
+            else:
+                self._cb_fill_from_hold(outdata[:, 0])
+            self.xrun_count += 1
+
+    def _asrc_target_n(self, n_needed, in_block):
+        n = max(int(n_needed), 1)
+        ib = max(int(in_block), n)
+        return min(2 * n, ib)
+
+    def _asrc_update_step(self, n_needed, in_block):
+        n = max(int(n_needed), 1)
+        ib = max(int(in_block), n)
+        target = float(self._asrc_target_n(n, ib))
+        occ = float(self._out_n)
+        try:
+            occ += self.output_queue.qsize() * ib
+        except Exception:
+            pass
+        lo = target
+        hi = target + ib
+        if occ < lo:
+            err = (occ - lo) / lo
+        elif occ > hi:
+            err = (occ - hi) / ib
+        else:
+            err = 0.0
+        integ = 0.995 * float(getattr(self, "_asrc_int", 0.0) or 0.0) + err
+        if integ > 40.0:
+            integ = 40.0
+        elif integ < -40.0:
+            integ = -40.0
+        self._asrc_int = integ
+        step = 1.0 + 0.0004 * err + 5e-5 * integ
+        if step < 0.998:
+            step = 0.998
+        elif step > 1.002:
+            step = 1.002
+        self._asrc_step = step
+
+    def _apply_recover_fade(self, mono, n):
+        fade = getattr(self, "_recover_fade", None)
+        if fade is None or fade.size == 0 or mono is None:
+            return
+        fn = min(int(n), int(mono.shape[0]), int(fade.shape[0]))
+        if fn > 0:
+            mono[:fn] *= fade[:fn]
+
+    def _fill_output_asrc(self, outdata, n_needed, in_block):
+        n = int(n_needed)
+        dest = outdata[:n, 0]
+        target = self._asrc_target_n(n, in_block)
+        while self._out_n < max(target, n) + max(int(in_block), n):
+            try:
+                block = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._cb_push_out(block)
+        if not getattr(self, "_asrc_ready", False):
+            if self._out_n >= target:
+                self._asrc_ready = True
+            else:
+                dest.fill(0.0)
+                return
+        step = float(getattr(self, "_asrc_step", 1.0) or 1.0)
+        pos = float(getattr(self, "_asrc_pos", 0.0) or 0.0)
+        if pos < 0.0:
+            pos = 0.0
+        src_need = int(pos + n * step) + 2
+        while self._out_n < src_need:
+            try:
+                block = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._cb_push_out(block)
+        was_hold = int(getattr(self, "_hold_count", 0) or 0) > 0
+        ramp = getattr(self, "_asrc_ramp", None)
+        can_interp = (
+            ramp is not None and ramp.size >= n and self._out_n >= src_need
+            and self._out_n >= 2
+        )
+        if can_interp:
+            idx = pos + ramp[:n] * np.float32(step)
+            max_i = self._out_n - 2
+            i0 = np.clip(np.floor(idx).astype(np.int32), 0, max_i)
+            frac = (idx - i0).astype(np.float32)
+            buf = self._out_buf
+            dest[:] = buf[i0] * (1.0 - frac) + buf[i0 + 1] * frac
+            next_pos = pos + n * step
+            consumed = int(next_pos)
+            if consumed > 0:
+                if consumed >= self._out_n:
+                    consumed = max(0, self._out_n - 1)
+                    pos = 0.0
+                else:
+                    pos = next_pos - consumed
+                remain = self._out_n - consumed
+                if remain > 0:
+                    self._out_buf[:remain] = self._out_buf[consumed:self._out_n]
+                self._out_n = remain
+            else:
+                pos = next_pos
+            self._asrc_pos = pos
+            hold_n = min(n, self._last_out.shape[0])
+            self._last_out[:hold_n] = dest[:hold_n]
+            self._last_out_n = hold_n
+            if was_hold:
+                self._apply_recover_fade(dest, n)
+            self._hold_count = 0
+            self._asrc_update_step(n, in_block)
+            return
+        n_take = min(self._out_n, n)
+        if n_take > 0:
+            dest[:n_take] = self._out_buf[:n_take]
+            remain = self._out_n - n_take
+            if remain > 0:
+                self._out_buf[:remain] = self._out_buf[n_take:self._out_n]
+            self._out_n = remain
+            if n_take < n:
+                self._cb_fill_from_hold(dest[n_take:])
+        else:
+            self._cb_fill_from_hold(dest)
+        self._asrc_pos = 0.0
+        self.xrun_count += 1
+        self._asrc_update_step(n, in_block)
+
     def _protect_virtual_out(self, outdata):
         if not getattr(self, "_virtual_out", False):
             return
-        np.clip(outdata, -0.89, 0.89, out=outdata)
+        # 膝点软折，避免硬夹平顶齿波；不绑下游软件
+        a = np.abs(outdata)
+        knee = 0.70
+        lim = 0.89
+        over = a > knee
+        if not np.any(over):
+            return
+        t = (a - knee) / (lim - knee)
+        folded = knee + (lim - knee) * np.tanh(t)
+        np.copyto(outdata, np.sign(outdata) * folded, where=over)
 
     def _on_audio(self, indata, outdata, frames, times, status):
         """双工回调：同一设备自听时走这里。"""
@@ -3620,10 +3802,10 @@ class MainWindow(QMainWindow):
         self.limiter_th.setRange(-12.0, 0.0)
         self.limiter_th.setSingleStep(0.5)
         self.limiter_th.setSuffix(" dB")
-        self.limiter_th.setValue(-1.0)
+        self.limiter_th.setValue(-3.0)
         self.limiter_th.setFixedWidth(82)
         self.limiter_th.setMinimumHeight(26)
-        self.limiter_th.setToolTip("起限阈值，-1 dB 为推荐值")
+        self.limiter_th.setToolTip("起限阈值，-3 dB 为推荐值，避免硬夹平顶")
         self.limiter_th.valueChanged.connect(lambda v: setattr(self.engine, "limiter_threshold_db", v))
         pr.addWidget(self.limiter_th)
         dl.addLayout(pr, 0, 0, 1, 2)

@@ -79,7 +79,7 @@ def open_install_page(url):
 
 
 def route_self_check(devs, apis):
-    """路由自检：判断虚拟声卡是否具备「RVC 输出 → 软电话麦克风」两侧。
+    """路由自检：判断虚拟声卡是否具备「RVC 输出 → 其它软件麦克风」两侧。
 
     VB-Cable 命名：播放端(CABLE Input，RVC 输出到这里) / 录制端(CABLE Output，
     软电话把它选作麦克风)。这里按 max_output_channels / max_input_channels 区分。
@@ -102,17 +102,17 @@ def route_self_check(devs, apis):
     if not installed:
         message = (
             "未检测到虚拟声卡：请先安装 VB-Audio Cable，"
-            "再把 RVC 输出设备选为 CABLE，软电话麦克风选为 CABLE Output。"
+            "再把 RVC 输出设备选为 CABLE，其它软件麦克风选为 CABLE Output。"
         )
     elif ok:
         message = (
             "虚拟声卡就绪：RVC 输出设备选「%s」，"
-            "软电话/通话软件里的麦克风选「%s」。"
+            "其它软件里的麦克风选「%s」。"
         ) % (out_devs[0], in_devs[0])
     elif not out_ok:
         message = "虚拟声卡缺「播放端」：找不到可作为 RVC 输出目标的虚拟设备，请检查声卡驱动。"
     else:
-        message = "虚拟声卡缺「录制端」：找不到可喂给软电话的虚拟麦克风，请检查声卡驱动。"
+        message = "虚拟声卡缺「录制端」：找不到可喂给其它软件的虚拟麦克风，请检查声卡驱动。"
 
     return {
         "installed": installed,

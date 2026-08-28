@@ -187,7 +187,7 @@
       "model_path": "shanxi_e200_s11800.pth",
       "index_path": "shanxi.index",
       "speaker_id": 0,
-      "pitch": 0,
+      "pitch": 3,
       "index_rate": 0.5,
       "formant": 0.0,
       "f0method": "rmvpe",

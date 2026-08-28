@@ -50,11 +50,13 @@ class OutputProtector:
         self._prev_x = torch.zeros(1, device=self.device, dtype=torch.float32)
         self._prev_y = torch.zeros(1, device=self.device, dtype=torch.float32)
         self._env = torch.zeros(1, device=self.device, dtype=torch.float32)
+        self._gain_last = torch.ones(1, device=self.device, dtype=torch.float32)
 
     def reset(self):
         self._prev_x.zero_()
         self._prev_y.zero_()
         self._env.zero_()
+        self._gain_last.fill_(1.0)
 
     def set_threshold_db(self, value):
         self.threshold_db = float(value)
@@ -95,19 +97,20 @@ class OutputProtector:
         zc = self.zc
         n = x.shape[0]
         if n < zc:
-            # 安全路径：极端短块按标量峰值处理
             peak = x.abs().max()
+            g_now = self._gain_last[0]
             if peak > self.threshold:
-                g = min(1.0, (self.threshold / peak).item())
-                self._env.fill_(peak.item())
-                return x * g
-            return x
+                g_now = torch.minimum(g_now, self.threshold / peak.clamp(min=1e-6))
+                self._env.fill_(peak)
+            else:
+                g_now = g_now + (1.0 - g_now) * (1.0 - self._frame_release)
+            self._gain_last.fill_(g_now)
+            return x * g_now
         n_frames = n // zc
         use = n_frames * zc
         tail = x[use:]
         body = x[:use].view(n_frames, zc)
         peaks = body.abs().amax(dim=1)
-        # env[m] = rel^m * max(env[-1]*rel, cummax_{k<=m}(peak[k]*rel^-k))
         rel = self._frame_release
         m = torch.arange(n_frames, device=x.device, dtype=x.dtype)
         rel_m = torch.pow(
@@ -116,17 +119,19 @@ class OutputProtector:
         env = torch.cummax(peaks / rel_m, dim=0).values * rel_m
         env = torch.maximum(env, self._env[0] * rel * rel_m)
         self._env.copy_(env[-1:])
-        # gain = min(1, threshold/env)，env<=threshold 时增益为 1（不改变信号）
         gains = torch.where(
             env > self.threshold,
             self.threshold / env.clamp(min=1e-6),
             torch.ones_like(env),
         )
-        # 帧增益 → 样本级线性插值
-        g_lin = F.interpolate(
-            gains.view(1, 1, -1), size=use, mode="linear", align_corners=True
-        ).view(-1)
-        out = torch.cat([body.view(-1) * g_lin, tail * gains[-1]])
+        # 逐帧从上一增益 lerp 到本帧，控制点落在帧末，避免整块插值漏峰
+        ends = torch.cat([self._gain_last.reshape(1).to(dtype=gains.dtype), gains])
+        w = torch.arange(1, zc + 1, device=x.device, dtype=x.dtype) / float(zc)
+        g_lin = (ends[:-1].unsqueeze(1) * (1.0 - w) + ends[1:].unsqueeze(1) * w).reshape(-1)
+        self._gain_last.copy_(gains[-1:])
+        out = body.reshape(-1) * g_lin
+        if tail.numel():
+            out = torch.cat([out, tail * gains[-1]])
         return out
 
     def process(self, x):

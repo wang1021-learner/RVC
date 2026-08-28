@@ -101,3 +101,42 @@ class AutoGain:
         self.gain_db = new_gain_db
         self.gain = new_gain
         return out.astype(np.float32, copy=False)
+
+
+class PeakLimiter:
+    """采集尖峰限制：attack 即时，与 AGC 无关。纯 numpy。"""
+
+    def __init__(self, sample_rate=48000, threshold_db=-6.0, release_time=0.05):
+        self.sample_rate = int(sample_rate)
+        self.threshold = float(10.0 ** (float(threshold_db) / 20.0))
+        self.release_time = float(release_time)
+        self.gain = 1.0
+
+    def reset(self):
+        self.gain = 1.0
+
+    def process(self, x):
+        x = np.asarray(x, dtype=np.float32)
+        n = int(x.shape[0])
+        if n == 0:
+            return x
+        peak = float(np.max(np.abs(x)))
+        old = float(self.gain)
+        if peak > self.threshold:
+            new = min(old, self.threshold / max(peak, 1e-8))
+        else:
+            coef = 1.0 - math.exp(-n / max(1.0, self.sample_rate * self.release_time))
+            new = old + (1.0 - old) * coef
+            if new > 1.0:
+                new = 1.0
+        self.gain = new
+        if abs(new - old) > 0.02:
+            fade = min(n, max(1, int(0.003 * self.sample_rate)))
+            ramp = np.linspace(old, new, fade, dtype=np.float32)
+            out = x.copy()
+            out[:fade] *= ramp
+            out[fade:] *= np.float32(new)
+            return out
+        if new >= 0.999:
+            return x
+        return (x * np.float32(new)).astype(np.float32, copy=False)

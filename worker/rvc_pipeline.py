@@ -70,7 +70,7 @@ class RVCPipeline:
         self.threhold = -50
         # 输出保护：直流高通 + 软限幅（默认开启，-1 dBFS 起限）
         self.limiter_enable = True
-        self.limiter_threshold_db = -1.0
+        self.limiter_threshold_db = -3.0
         # 音质增强：高频齿音直通 / 临场感 / 去齿音（实时生效）
         self.hf_mix_rate = 0.2
         self.presence = 0.10
@@ -585,24 +585,33 @@ class RVCPipeline:
                 infer_wav, (0, need + self._sola_search_frame - infer_wav.shape[0])
             )
         ci = infer_wav[None, None, : sbf + self._sola_search_frame]
-        cn = F.conv1d(ci, self._sola_buffer[None, None, :])
+        buf = self._sola_buffer
+        cn = F.conv1d(ci, buf[None, None, :])
+        c_sum = F.conv1d(ci, self._sola_den_kernel)
+        cn = cn - buf.mean() * c_sum
         cd = torch.sqrt(F.conv1d(ci ** 2, self._sola_den_kernel) + 1e-8)
         corr = cn[0, 0] / cd[0, 0]
         windows = infer_wav.unfold(0, need, 1)
-        n_off = min(int(corr.shape[0]), int(windows.shape[0]))
-        aligned = windows[:n_off][torch.argmax(corr[:n_off])]
-        aligned = aligned.clone()
+        n_cand = min(int(corr.shape[0]), int(windows.shape[0]))
+        n_off = int(torch.argmax(corr[:n_cand])) if n_cand > 0 else 0
+        aligned = windows[n_off].clone() if n_cand > 0 else infer_wav[:need].clone()
         aligned[:sbf] = aligned[:sbf] * self._fade_in_window + self._sola_buffer * self._fade_out_window
         self._sola_buffer.copy_(aligned[self._block_frame : self._block_frame + sbf])
         block = aligned[: self._block_frame]
         use_hf = self.hf_mix_rate > 0 and not self.deesser_enable
         if use_hf and hasattr(self, "_hf_line"):
-            hf_block = self._hf_line.latest(self._block_frame)
-            in_tail = self._in_line.latest(self._block_frame)
-            ratio = hf_block.square().mean() / in_tail.square().mean().clamp(min=1e-8)
-            gate = ((ratio - 0.005) / 0.03).clamp(0.0, 1.0)
-            mix = self.hf_mix_rate * gate * 0.7
-            block = block * (1.0 - mix) + hf_block * mix
+            span = int(self._block_frame + self._sola_search_frame)
+            hf_span = self._hf_line.latest(span)
+            in_span = self._in_line.latest(span)
+            i0 = min(n_off, max(0, hf_span.shape[0] - self._block_frame))
+            i1 = i0 + self._block_frame
+            hf_block = hf_span[i0:i1]
+            in_tail = in_span[i0:i1]
+            if hf_block.shape[0] == self._block_frame and in_tail.shape[0] == self._block_frame:
+                ratio = hf_block.square().mean() / in_tail.square().mean().clamp(min=1e-8)
+                gate = ((ratio - 0.005) / 0.03).clamp(0.0, 1.0)
+                mix = self.hf_mix_rate * gate * 0.7
+                block = block * (1.0 - mix) + hf_block * mix
         if self.deesser_enable and hasattr(self, "_deesser") and not use_hf:
             block = self._deesser.process(block)
         if self.presence > 0 and hasattr(self, "_hp_pres"):

@@ -203,7 +203,7 @@ class RVC:
             self.index_gpu = None
             self._index_norm = None
             self._gpu_index_checked = False
-            self.index_temp = 0.05  # Softmax 温度：越小越接近硬选择（余弦相似度分布较窄）
+            self.index_temp = 0.12  # Softmax 温度：略升减轻帧间硬切近邻
             reused_index = (
                 last_rvc is not None
                 and index_rate != 0
@@ -252,6 +252,7 @@ class RVC:
                 self._f0_stream = None
             self._f0_pending = None
             self._feat_cache = None
+            self._index_mix_tail = None
             self._hubert_win = None
             self._p_len_tensor = None
             self._sid_tensor = None
@@ -299,6 +300,30 @@ class RVC:
 
     def reset_feat_cache(self):
         self._feat_cache = None
+        self._index_mix_tail = None
+
+    def _blend_index_mix(self, mixed):
+        """相邻块检索结果交叉淡化，减轻角色帧间跳变。"""
+        prev = getattr(self, "_index_mix_tail", None)
+        if (
+            prev is not None
+            and mixed.shape[0] > 0
+            and prev.dim() == mixed.dim()
+            and prev.shape[-1] == mixed.shape[-1]
+        ):
+            n = min(4, int(mixed.shape[0]), int(prev.shape[0]))
+            if n > 0:
+                w = torch.linspace(
+                    0.0, 1.0, n, device=mixed.device, dtype=mixed.dtype
+                ).view(n, 1)
+                mixed = mixed.clone()
+                mixed[:n] = prev[-n:].to(dtype=mixed.dtype) * (1.0 - w) + mixed[:n] * w
+        keep = min(4, int(mixed.shape[0]))
+        if keep > 0:
+            self._index_mix_tail = mixed[-keep:].detach().clone()
+        else:
+            self._index_mix_tail = None
+        return mixed
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -585,8 +610,8 @@ class RVC:
         t2 = ttime()
         try:
             if hasattr(self, "index") and self.index_rate != 0:
-                # HuBERT hop=320@16k。只搜本块新帧 + 2 帧重叠
-                n_new = max(1, int(block_frame_16k) // 320 + 2)
+                # HuBERT hop=320@16k。搜本块新帧 + 4 帧重叠，便于跨块淡化
+                n_new = max(1, int(block_frame_16k) // 320 + 4)
                 start = max(int(skip_head) // 2, feats.shape[1] - n_new)
                 # ── 优化3：GPU 余弦 Top-K + 温度 Softmax（低显存自动回退 CPU）──
                 self._ensure_gpu_index()
@@ -604,6 +629,7 @@ class RVC:
                         retrieved.to(dtype=mixed.dtype) * self.index_rate
                         + (1.0 - self.index_rate) * mixed
                     )
+                    mixed = self._blend_index_mix(mixed)
                     feats[0][start:] = mixed
                 else:
                     npy = feats[0][start:].cpu().numpy().astype("float32")
@@ -632,6 +658,7 @@ class RVC:
                             retrieved_t[use_t] * self.index_rate
                             + (1.0 - self.index_rate) * mixed[use_t]
                         )
+                        mixed = self._blend_index_mix(mixed)
                         feats[0][start:] = mixed
                     elif report_status:
                         printt(i18n("索引检索失败或未启用"))
