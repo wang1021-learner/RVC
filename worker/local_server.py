@@ -12,20 +12,10 @@ import sys
 import time
 from pathlib import Path
 
+from tools.app_paths import is_frozen, package_root
 from worker.rvc_client import RVCClient
 
 DEFAULT_LOCAL_PORT = 8765
-
-
-def is_frozen():
-    return bool(getattr(sys, "frozen", False))
-
-
-def package_root():
-    """包根目录：冻结版为 exe 所在目录，源码版为项目根目录。"""
-    if is_frozen():
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent.parent
 
 
 def runtime_python():
@@ -114,15 +104,18 @@ class LocalServerPipeline(RVCClient):
             return True
         if not local_infer_ready():
             if pack_mode() == "server":
-                self._on_status("本包为服务器客户端，不能本地推理，请连接远程服务器")
+                msg = "本包为服务器客户端，不能本地推理，请连接远程服务器"
             else:
-                self._on_status("本地推理未安装：请先点击「安装本地推理」")
+                msg = "本地推理未安装：请先点击「安装本地推理」"
+            self.last_error = msg
+            self._on_status(msg)
             return False
         py = runtime_python()
         src = source_dir()
         script = src / "server" / "rvc_server.py"
         if not py.is_file() or not script.is_file():
-            self._on_status("本地推理文件缺失，请重新安装")
+            self.last_error = "本地推理文件缺失，请重新安装"
+            self._on_status(self.last_error)
             return False
         self._on_status("正在启动本地推理服务（首次约 10~30 秒）...")
         # 服务端输出写入日志文件，方便排查（冻结版无控制台）
@@ -143,17 +136,20 @@ class LocalServerPipeline(RVCClient):
             )
             self._owns_process = True
         except Exception as e:
-            self._on_status("本地推理启动失败: %s" % e)
+            self.last_error = "本地推理启动失败: %s" % e
+            self._on_status(self.last_error)
             return False
         deadline = time.time() + timeout
         while time.time() < deadline:
             if port_in_use(DEFAULT_LOCAL_PORT):
                 return True
             if self._proc is not None and self._proc.poll() is not None:
-                self._on_status("本地推理服务异常退出（检查显卡驱动与安装日志）")
+                self.last_error = "本地推理服务异常退出（检查显卡驱动与安装日志）"
+                self._on_status(self.last_error)
                 return False
             time.sleep(0.2)
-        self._on_status("本地推理服务启动超时")
+        self.last_error = "本地推理服务启动超时"
+        self._on_status(self.last_error)
         return False
 
     def stop_server(self):

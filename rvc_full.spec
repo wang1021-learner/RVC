@@ -33,6 +33,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=[
         'worker.rvc_client',
+        'worker.engine',
         'worker.rvc_pipeline',
         'websocket',
         'websocket._abnf',
@@ -40,7 +41,9 @@ a = Analysis(
         'infer.module.models', 'infer.module.modules', 'infer.module.attentions',
         'infer.module.commons', 'infer.module.transforms',
         'tools.cuda_graph', 'tools.torchgate', 'tools.audio_meter',
-        'tools.file_io',
+        'tools.file_io', 'tools.app_paths',
+        'ui', 'ui.theme', 'ui.common', 'ui.devices', 'ui.widgets',
+        'ui.speakers', 'ui.main_window',
         'configs.config', 'i18n.i18n',
         'faiss', 'librosa', 'parselmouth', 'soundfile',
         'sounddevice', 'numpy',

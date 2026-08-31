@@ -193,6 +193,14 @@ class RVCPipeline:
             self.configure(**params)
         model_path = self._resolve_path(model_path, is_index=False)
         index_path = self._resolve_path(index_path, is_index=True)
+        if not model_path or not os.path.isfile(model_path):
+            name = os.path.basename(model_path or "") or "（空路径）"
+            self.last_error = (
+                "找不到模型文件 %s。请把 .pth 放到 assets/weights/ 后重新选择角色。"
+                % name
+            )
+            self._on_status("加载失败: " + self.last_error)
+            return False
         self._on_status(f"Loading: {os.path.basename(model_path)}")
         old = self.rvc
         if not self._gpu_lock.acquire(timeout=8.0):

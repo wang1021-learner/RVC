@@ -62,8 +62,41 @@ class RVCClient:
     def is_active(self) -> bool:
         return self._active
 
+    def _ws_alive(self) -> bool:
+        ws = self._ws
+        if not self._connected or ws is None:
+            return False
+        try:
+            if getattr(ws, "connected", True) is False:
+                return False
+        except Exception:
+            return False
+        sock = getattr(ws, "sock", None)
+        if sock is None:
+            return False
+        try:
+            if sock.fileno() < 0:
+                return False
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _is_closed_err(e) -> bool:
+        s = str(e or "").lower()
+        return any(
+            k in s
+            for k in (
+                "closed", "10054", "10053", "broken pipe",
+                "not connected", "断开", "reset",
+            )
+        )
+
     def is_connected(self) -> bool:
-        return self._connected
+        if self._ws_alive():
+            return True
+        self._connected = False
+        return False
 
     @property
     def is_remote(self):
@@ -119,14 +152,17 @@ class RVCClient:
 
     def connect(self, timeout=5):
         """建立 WebSocket 连接（已连接则直接返回）"""
-        if self._connected and self._ws is not None:
+        if self._ws_alive():
             return True
+        if self._ws is not None:
+            self.abort()
         try:
             self._ws = websocket.create_connection(self.server_url, timeout=timeout)
             try:
                 sock = getattr(self._ws, "sock", None)
                 if sock is not None:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             except Exception:
                 pass
             self._connected = True
@@ -136,9 +172,8 @@ class RVCClient:
                 if not self._acquire_io(min(3.0, float(timeout))):
                     return True
                 try:
-                    self._ws.settimeout(min(5.0, float(timeout)))
                     self._ws.send(json.dumps({"action": "status"}))
-                    resp = json.loads(self._ws.recv())
+                    resp = self._recv_json(min(5.0, float(timeout)))
                 finally:
                     self._release_io()
                 self._model_loaded = bool(resp.get("loaded", False))
@@ -203,10 +238,7 @@ class RVCClient:
     def load_speaker(self, model_path: str, index_path: str = "",
                      pitch: int = 0, index_rate: float = 0.0,
                      formant: float = 0.0, **params) -> bool:
-        """发送加载模型命令到服务器（未连接则自动重连）"""
-        if not self._ws:
-            if not self.connect(timeout=5):
-                return False
+        """发送加载模型命令到服务器（未连接或连接已死则自动重连）"""
         cmd = {
             "action": "load",
             "model_path": model_path,
@@ -233,70 +265,87 @@ class RVCClient:
             if k in params:
                 cmd[k] = params[k]
         self._on_status("正在加载模型...")
-        try:
-            if not self._acquire_io(8.0):
-                self.last_error = "服务器正忙"
-                self._on_status("加载失败: 服务器正忙")
-                return False
+        last_exc = None
+        for attempt in (1, 2):
+            if not self._ws_alive():
+                if not self.connect(timeout=8):
+                    return False
             try:
-                self._ws.settimeout(60.0)   # 模型加载可能 30s+
-                self._ws.send(json.dumps(cmd))
-                resp = json.loads(self._ws.recv())
-            finally:
-                self._release_io()
-            if "error" in resp:
-                self.last_error = str(resp["error"])
-                self._on_status(f"加载失败: {resp['error']}")
+                if not self._acquire_io(8.0):
+                    self.last_error = "服务器正忙"
+                    self._on_status("加载失败: 服务器正忙")
+                    return False
+                try:
+                    self._ws.send(json.dumps(cmd))
+                    resp = self._recv_json(60.0)
+                finally:
+                    self._release_io()
+                if "error" in resp:
+                    self.last_error = str(resp["error"])
+                    self._on_status(f"加载失败: {resp['error']}")
+                    return False
+                self.samplerate = resp.get("samplerate", 48000)
+                self.channels = resp.get("channels", 1)
+                if resp.get("block_size"):
+                    self._block_frame = resp.get("block_size", 256)
+                self._model_loaded = True
+                self._active = bool(resp.get("active", False))
+                self._apply_loaded_files(resp)
+                self.last_error = ""
+                self._on_status(self._loaded_status_text(self.samplerate))
+                return True
+            except Exception as e:
+                last_exc = e
+                self.last_error = str(e)
+                self._on_status(f"加载失败: {e}")
+                self._drain()
+                if attempt == 1 and self._is_closed_err(e):
+                    self.abort()
+                    continue
                 return False
-            self.samplerate = resp.get("samplerate", 48000)
-            self.channels = resp.get("channels", 1)
-            if resp.get("block_size"):
-                self._block_frame = resp.get("block_size", 256)
-            self._model_loaded = True
-            self._active = bool(resp.get("active", False))
-            self._apply_loaded_files(resp)
-            self.last_error = ""
-            self._on_status(self._loaded_status_text(self.samplerate))
-            return True
-        except Exception as e:
-            self.last_error = str(e)
-            self._on_status(f"加载失败: {e}")
-            self._drain()   # 清掉可能残留的响应，防止污染下一个请求
-            return False
+        self.last_error = str(last_exc or "连接已关闭")
+        return False
 
     def start(self, **params):
         """通知服务器恢复推理（模型已加载时停止后重启用）"""
-        if not self._connected:
-            raise RuntimeError("未连接服务器")
-        if not self._ws:
-            return True
-        try:
-            cmd = {"action": "start"}
-            cmd.update(params)
-            if not self._acquire_io(8.0):
-                return False
+        cmd = {"action": "start"}
+        cmd.update(params)
+        for attempt in (1, 2):
+            if not self._ws_alive():
+                if not self.connect(timeout=8):
+                    self.last_error = self.last_error or "未连接服务器"
+                    return False
             try:
-                # start 本身很快；若碰到旧服务端仍在推理线程里预热，最多等 60s
-                self._ws.settimeout(60.0)
-                self._ws.send(json.dumps(cmd))
-                resp = json.loads(self._ws.recv())
-            finally:
-                self._release_io()
-            if isinstance(resp, dict) and "error" in resp:
-                self._on_status(resp["error"])
+                if not self._acquire_io(8.0):
+                    self.last_error = "服务器正忙"
+                    return False
+                try:
+                    self._ws.send(json.dumps(cmd))
+                    resp = self._recv_json(60.0)
+                finally:
+                    self._release_io()
+                if isinstance(resp, dict) and "error" in resp:
+                    self.last_error = str(resp["error"])
+                    self._on_status(resp["error"])
+                    return False
+                if isinstance(resp, dict):
+                    if resp.get("samplerate"):
+                        self.samplerate = resp["samplerate"]
+                    if resp.get("channels"):
+                        self.channels = resp["channels"]
+                    if resp.get("block_size"):
+                        self._block_frame = resp["block_size"]
+                self._active = True
+                self.last_error = ""
+                return True
+            except Exception as e:
+                self.last_error = str(e)
+                self._drain()
+                if attempt == 1 and self._is_closed_err(e):
+                    self.abort()
+                    continue
                 return False
-            if isinstance(resp, dict):
-                if resp.get("samplerate"):
-                    self.samplerate = resp["samplerate"]
-                if resp.get("channels"):
-                    self.channels = resp["channels"]
-                if resp.get("block_size"):
-                    self._block_frame = resp["block_size"]
-            self._active = True
-            return True
-        except Exception:
-            self._drain()
-            return False
+        return False
 
     def abort(self):
         """立刻掐断连接。不要走 ws.close()：默认还要等 3 秒握手，界面会卡死。
@@ -428,6 +477,7 @@ class RVCClient:
             return seq, len(indata), time.perf_counter()
         except Exception:
             self._connected = False
+            self.last_error = "发送音频失败，连接已断开"
             return None
         finally:
             self._send_lock.release()
@@ -514,9 +564,15 @@ class RVCClient:
                 self._conceal_streak = 0
                 return out, elapsed
         except _WS_TIMEOUT_EXC:
-            return self._silence(n_in), 0
+            out = self._silence(n_in)
+            # 连续超时多半是服务挂了或链路死了，标断线让上层重连
+            if int(getattr(self, "_conceal_streak", 0) or 0) >= 3:
+                self._connected = False
+                self.last_error = "服务器长时间无响应"
+            return out, 0
         except Exception:
             self._connected = False
+            self.last_error = "连接已断开"
             return self._silence(n_in), 0
         finally:
             self._recv_lock.release()
@@ -530,7 +586,7 @@ class RVCClient:
         return self.recv_audio(*token)
 
     def try_reconnect(self):
-        if self._connected and self._ws is not None:
+        if self._ws_alive():
             return True
         return self.connect(timeout=3)
 
@@ -578,6 +634,29 @@ class RVCClient:
             return data.get("indices", [])
         return []
 
+    def _recv_json(self, timeout):
+        """等一条 JSON 控制回复；跳过残留的二进制音频帧。"""
+        deadline = time.time() + float(timeout)
+        last_err = "服务器没有返回有效结果"
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                raise socket.timeout(last_err)
+            self._ws.settimeout(min(remain, 1.0))
+            raw = self._ws.recv()
+            if isinstance(raw, (bytes, bytearray)):
+                last_err = "收到残留音频，继续等待加载结果"
+                continue
+            text = (raw or "").strip() if isinstance(raw, str) else ""
+            if not text:
+                last_err = "服务器回复为空"
+                continue
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                last_err = "服务器加载角色时没有返回有效结果"
+                continue
+
     def _rpc(self, cmd, timeout=5.0):
         if not self._ws:
             if not self.connect(timeout=timeout):
@@ -586,14 +665,10 @@ class RVCClient:
             if not self._acquire_io(min(3.0, float(timeout))):
                 return None
             try:
-                self._ws.settimeout(timeout)
                 self._ws.send(json.dumps(cmd))
-                resp = self._ws.recv()
+                return self._recv_json(timeout)
             finally:
                 self._release_io()
-            if isinstance(resp, (bytes, bytearray)):
-                return None
-            return json.loads(resp)
         except Exception:
             self._drain()
             return None

@@ -12,7 +12,7 @@ RVC 推理服务器 — 通过 WebSocket 接收音频帧，调用 RVCPipeline �
 依赖: websockets, numpy, torch (GPU 推理用)
 """
 
-import asyncio, json, struct, argparse, traceback, sys, socket, os, threading
+import asyncio, json, struct, argparse, traceback, sys, socket, os, threading, time
 import concurrent.futures
 from collections import deque
 from pathlib import Path
@@ -108,8 +108,21 @@ def _list_indices():
     return sorted(set(found))
 
 
+_LIST_CACHE = {"t": 0.0, "models": None, "indices": None}
+
+
 def _list_models_payload():
-    return _list_pth(), _list_indices()
+    now = time.monotonic()
+    if (
+        _LIST_CACHE["models"] is not None
+        and now - _LIST_CACHE["t"] < 2.0
+    ):
+        return _LIST_CACHE["models"], _LIST_CACHE["indices"]
+    models, indices = _list_pth(), _list_indices()
+    _LIST_CACHE["t"] = now
+    _LIST_CACHE["models"] = models
+    _LIST_CACHE["indices"] = indices
+    return models, indices
 
 
 def _ws_alive(ws):
@@ -420,6 +433,7 @@ class RVCServer:
                 sock = trans.get_extra_info("socket") if trans is not None else None
                 if sock is not None:
                     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             except Exception:
                 pass
             async for message in websocket:
@@ -514,7 +528,9 @@ class RVCServer:
                         last_rvc=donor,
                     )
                     if not ok:
-                        return {"error": "模型加载失败"}
+                        return {
+                            "error": pipeline.last_error or "模型加载失败",
+                        }
                     pipeline.change_formant(formant)
                     self._apply_infer_params(pipeline, cmd)
                     hub.remember(pipeline.rvc)

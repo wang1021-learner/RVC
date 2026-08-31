@@ -37,13 +37,13 @@ class VUMeterWidget(QWidget):
         w = self.width()
         h = self.height()
 
-        # 底框 (纯浅色风格)
-        painter.setBrush(QBrush(QColor("#f8fafc")))
-        painter.setPen(QPen(QColor("#cbd5e1"), 1))
+        from ui.theme import meter_colors
+        pal = meter_colors(self._dark)
+        painter.setBrush(QBrush(QColor(pal["bg"])))
+        painter.setPen(QPen(QColor(pal["border"]), 1))
         painter.drawRoundedRect(0, 0, w - 1, h - 1, 5, 5)
 
-        # 标题文本
-        painter.setPen(QColor("#475569"))
+        painter.setPen(QColor(pal["title"]))
         font = painter.font()
         font.setPointSize(9)
         font.setBold(True)
@@ -59,8 +59,7 @@ class VUMeterWidget(QWidget):
         if bar_width <= 0:
             return
 
-        # 槽底
-        painter.setBrush(QBrush(QColor("#e2e8f0")))
+        painter.setBrush(QBrush(QColor(pal["slot"])))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(bar_left, bar_top, bar_width, bar_height, 2, 2)
 
@@ -82,7 +81,7 @@ class VUMeterWidget(QWidget):
         peak_ratio = (self.peak_db + 60.0) / 60.0
         peak_x = bar_left + bar_width * max(0.0, min(1.0, peak_ratio))
         if peak_x > bar_left:
-            painter.setPen(QPen(QColor("#0f172a"), 1.5))
+            painter.setPen(QPen(QColor(pal["peak"]), 1.5))
             painter.drawLine(int(peak_x), bar_top, int(peak_x), bar_top + bar_height)
 
 
@@ -117,9 +116,10 @@ class SpectrumWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         w, h = self.width(), self.height()
-        bg = QColor("#f1f5f9")
-        painter.setBrush(QBrush(bg))
-        painter.setPen(QPen(QColor("#e2e8f0"), 1))
+        from ui.theme import meter_colors
+        pal = meter_colors(self._dark)
+        painter.setBrush(QBrush(QColor(pal["spec_bg"])))
+        painter.setPen(QPen(QColor(pal["spec_border"]), 1))
         painter.drawRoundedRect(0, 0, w - 1, h - 1, 6, 6)
         n = int(self.bins.size)
         if n <= 0 or w < 8:
