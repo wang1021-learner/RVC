@@ -4,18 +4,18 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtWidgets import (
-    QDialog, QFormLayout, QLineEdit, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QPushButton, QHBoxLayout, QDialogButtonBox, QMessageBox,
-    QInputDialog, QFileDialog, QComboBox,
+    QDialog, QFormLayout, QHBoxLayout, QDialogButtonBox, QMessageBox,
+    QInputDialog, QFileDialog,
 )
 from PySide6.QtGui import QCursor
 
 from tools.app_paths import speakers_path, package_root
 from tools.file_io import write_json_atomic
 from ui.common import (
-    NL, PROJECT_ROOT, WEIGHTS_DIR, fill_f0_combo, f0_from_combo,
+    NL, WEIGHTS_DIR, INDICES_DIR, fill_f0_combo, f0_from_combo,
 )
 from ui.widgets import create_styled_combo
+from ui.fw import LineEdit, SpinBox, DoubleSpinBox, CheckBox, PushButton, ComboBox
 
 class SpeakerConfig:
     __slots__ = (
@@ -86,36 +86,39 @@ class SpeakerDialog(QDialog):
         s = speaker or SpeakerConfig()
         l = QFormLayout(self); l.setSpacing(10)
 
-        self.ne = QLineEdit(s.name)
+        self.ne = LineEdit()
+        self.ne.setText(s.name)
         self.ne.setPlaceholderText("例如: 女声A")
         l.addRow("角色名称:", self.ne)
 
         mr = QHBoxLayout()
-        self.me = QLineEdit(s.model_path)
+        self.me = LineEdit()
+        self.me.setText(s.model_path)
         self.me.setPlaceholderText("选择 .pth 模型文件")
         mr.addWidget(self.me, 1)
-        mb = QPushButton("浏览...")
+        mb = PushButton("浏览...")
         mb.clicked.connect(lambda: self._br("模型文件 (*.pth)", WEIGHTS_DIR, self.me))
         mr.addWidget(mb)
-        ms = QPushButton("从服务器获取")
+        ms = PushButton("从服务器获取")
         ms.setToolTip("列出当前模式可用的 .pth（本地目录或服务器）")
         ms.clicked.connect(self._from_server)
         mr.addWidget(ms)
         l.addRow("模型文件:", mr)
 
         ir = QHBoxLayout()
-        self.ie = QLineEdit(s.index_path)
+        self.ie = LineEdit()
+        self.ie.setText(s.index_path)
         self.ie.setPlaceholderText("可选 .index 文件")
         ir.addWidget(self.ie, 1)
-        ib = QPushButton("浏览...")
-        ib.clicked.connect(lambda: self._br("索引文件 (*.index)", PROJECT_ROOT, self.ie))
+        ib = PushButton("浏览...")
+        ib.clicked.connect(lambda: self._br("索引文件 (*.index)", INDICES_DIR, self.ie))
         ir.addWidget(ib)
         l.addRow("索引文件:", ir)
 
-        self.si = QSpinBox(); self.si.setRange(0, 200); self.si.setValue(s.speaker_id)
+        self.si = SpinBox(); self.si.setRange(0, 200); self.si.setValue(s.speaker_id)
         l.addRow("说话人编号:", self.si)
 
-        self.preset_combo = QComboBox()
+        self.preset_combo = ComboBox()
         self.preset_combo.addItems([
             "保持当前设置",
             "女声角色 (男变女推荐 +12)",
@@ -126,19 +129,19 @@ class SpeakerDialog(QDialog):
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         l.addRow("音高推荐:", self.preset_combo)
 
-        self.ps = QSpinBox(); self.ps.setRange(-36, 36); self.ps.setValue(s.pitch)
+        self.ps = SpinBox(); self.ps.setRange(-36, 36); self.ps.setValue(s.pitch)
         self.ps.setSuffix(" 半音")
         self.ps.setToolTip("男转女 +12, 女转男 -12")
         l.addRow("音高偏移:", self.ps)
 
         self.ne.textChanged.connect(self._on_name_auto_preset)
 
-        self.irs = QDoubleSpinBox(); self.irs.setRange(0.0, 1.0); self.irs.setSingleStep(0.1)
+        self.irs = DoubleSpinBox(); self.irs.setRange(0.0, 1.0); self.irs.setSingleStep(0.1)
         self.irs.setValue(s.index_rate)
         self.irs.setToolTip("越高越像角色，越低越像你自己")
         l.addRow("像角色:", self.irs)
 
-        self.fs = QDoubleSpinBox(); self.fs.setRange(-12.0, 12.0); self.fs.setSingleStep(0.5)
+        self.fs = DoubleSpinBox(); self.fs.setRange(-12.0, 12.0); self.fs.setSingleStep(0.5)
         self.fs.setValue(getattr(s, "formant", 0.0) or 0.0)
         self.fs.setToolTip("共振峰偏移（半音），0 为不偏移")
         l.addRow("共振峰:", self.fs)
@@ -148,8 +151,8 @@ class SpeakerDialog(QDialog):
         l.addRow("音高算法:", self.fmc)
 
         nr = QHBoxLayout(); nr.setSpacing(12)
-        self.inc2 = QCheckBox("输入降噪"); self.inc2.setChecked(bool(getattr(s, "I_noise_reduce", False)))
-        self.onc2 = QCheckBox("输出降噪"); self.onc2.setChecked(bool(getattr(s, "O_noise_reduce", False)))
+        self.inc2 = CheckBox("输入降噪"); self.inc2.setChecked(bool(getattr(s, "I_noise_reduce", False)))
+        self.onc2 = CheckBox("输出降噪"); self.onc2.setChecked(bool(getattr(s, "O_noise_reduce", False)))
         nr.addWidget(self.inc2); nr.addWidget(self.onc2); nr.addStretch()
         l.addRow("降噪:", nr)
 

@@ -13,6 +13,13 @@ import time
 import traceback
 from pathlib import Path
 
+if sys.version_info[:2] != (3, 11):
+    sys.stderr.write(
+        "RVC requires Python 3.11 x64 (got %s). Use runtime\\python.exe or py -3.11.\n"
+        % sys.version.split()[0]
+    )
+    raise SystemExit(1)
+
 MAGIC = 0x50564352
 PROTOCOL_VERSION = 1
 HEADER_BYTES = 4096

@@ -12,6 +12,7 @@ from torchaudio.transforms import Resample
 from infer.hubert import extract_hubert_features, load_hubert_model
 from i18n.i18n import I18nAuto
 from tools.cuda_graph import run_cuda_graph
+from tools.model_assets import INDEX_TOPK
 
 
 i18n = I18nAuto()
@@ -621,7 +622,7 @@ class RVC:
                     if self._index_norm.dtype == torch.float16:
                         qn = qn.half()
                     sim = qn @ self._index_norm
-                    top_sim, top_ix = sim.topk(k=4, dim=-1)
+                    top_sim, top_ix = sim.topk(k=INDEX_TOPK, dim=-1)
                     w = torch.softmax(top_sim / self.index_temp, dim=-1)
                     retrieved = (w.unsqueeze(-1) * self.index_gpu[top_ix]).sum(-2)
                     mixed = feats[0][start:]
@@ -633,7 +634,7 @@ class RVC:
                     feats[0][start:] = mixed
                 else:
                     npy = feats[0][start:].cpu().numpy().astype("float32")
-                    score, ix = self.index.search(npy, k=4)
+                    score, ix = self.index.search(npy, k=INDEX_TOPK)
                     valid = ix >= 0
                     if valid.any():
                         weight = np.square(1.0 / (np.maximum(score, 0.0) + 1e-6))

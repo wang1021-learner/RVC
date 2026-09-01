@@ -6,11 +6,15 @@ from pathlib import Path
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from tools.pyver import require_python_311
+require_python_311()
+
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from tools.app_paths import ensure_user_data, log_dir
 from ui.common import NL, STYLE_QSS, _friendly_error
+from ui.fw import apply_fluent_theme
 from ui.main_window import MainWindow
 
 
@@ -75,7 +79,7 @@ if __name__ == "__main__":
     if hasattr(threading, "excepthook"):
         threading.excepthook = _thread_excepthook
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    apply_fluent_theme()
     app.setStyleSheet(STYLE_QSS)
     w = MainWindow()
     w.show()

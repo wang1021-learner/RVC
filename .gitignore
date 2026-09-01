@@ -1,4 +1,5 @@
 # Python
+.vscode/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -11,18 +12,14 @@ runtime/
 build/
 dist/
 
-# 部署包中的二进制资产与日志副本（源码脚本保留）
-deploy/assets/
-deploy/logs/
-
 # 运行时输出
 logs/
 record_out/
+user_settings.json
 
 # 模型权重与索引（体积超过 GitHub 100MB 限制，请另行准备）
 assets/weights/
 assets/rmvpe/
 assets/hubert_base/*.safetensors
-assets/pretrained_v2/
 *.index
 *.onnx

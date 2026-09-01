@@ -14,18 +14,23 @@ import os
 import sys
 import wave
 import argparse
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.getcwd())
+
+from tools.pyver import require_python_311
+require_python_311()
+
 import numpy as np
 import torch
 import librosa
 import faiss
 
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.getcwd())
-
 from configs.config import Config
 from infer.module.models import SynthesizerTrnMs768NSFsid
 from infer.hubert import extract_hubert_features, load_hubert_model
 from infer.rmvpe import RMVPE
+from tools.model_assets import INDEX_TOPK, resolve_index_path, resolve_model_path
 
 
 def load_model(pth_path: str, device: torch.device, is_half: bool = False):
@@ -40,14 +45,18 @@ def load_model(pth_path: str, device: torch.device, is_half: bool = False):
 def convert_audio(
     input_path: str,
     output_path: str = None,
-    pth_path: str = "assets/weights/thchs_female_100e.pth",
-    index_path: str = "logs/thchs_v2/added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
+    pth_path: str = "assets/weights/thchs_v2_e200_s13200.pth",
+    index_path: str = "assets/indices/thchs_v2.index",
     index_rate: float = 0.5,
     pitch: int = 0,
 ):
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_converted{ext}"
+
+    root = os.path.dirname(os.path.abspath(__file__))
+    pth_path = resolve_model_path(pth_path, root)
+    index_path = resolve_index_path(index_path, root, model_path=pth_path)
 
     config = Config()
     device = config.device
@@ -83,15 +92,24 @@ def convert_audio(
     feats = extract_hubert_features(hubert_model, feats, "v2")
 
     if index is not None and index_rate > 0:
-        print(f"执行索引检索 (rate={index_rate})...")
+        print(f"执行索引检索 (k={INDEX_TOPK}, rate={index_rate})...")
         npy = feats[0].float().cpu().numpy()
-        score, ix = index.search(npy, k=8)
-        if (ix >= 0).all():
-            weight = np.square(1 / np.maximum(score, 1e-6))
-            weight /= weight.sum(axis=1, keepdims=True)
-            npy_new = np.sum(index_vectors[ix] * np.expand_dims(weight, axis=2), axis=1)
-            npy_mixed = index_rate * npy_new + (1 - index_rate) * npy
-            feats[0] = torch.from_numpy(npy_mixed).to(device=feats.device, dtype=feats.dtype)
+        score, ix = index.search(npy, k=INDEX_TOPK)
+        valid = ix >= 0
+        if valid.any():
+            weight = np.square(1.0 / (np.maximum(score, 0.0) + 1e-6))
+            weight = np.where(valid, weight, 0.0)
+            denom = weight.sum(axis=1, keepdims=True)
+            use = denom[:, 0] > 0
+            weight[use] /= denom[use]
+            ix_safe = np.where(valid, ix, 0)
+            npy_new = np.sum(
+                index_vectors[ix_safe] * np.expand_dims(weight, axis=2),
+                axis=1,
+            )
+            mixed = npy.copy()
+            mixed[use] = index_rate * npy_new[use] + (1.0 - index_rate) * npy[use]
+            feats[0] = torch.from_numpy(mixed).to(device=feats.device, dtype=feats.dtype)
 
     print("提取 F0...")
     f0_result = rmvpe_model.infer_from_audio(
@@ -175,13 +193,13 @@ def main():
     parser.add_argument(
         "--model",
         "-m",
-        default="assets/weights/thchs_female_100e.pth",
+        default="assets/weights/thchs_v2_e200_s13200.pth",
         help="模型权重路径",
     )
     parser.add_argument(
         "--index",
         "-i",
-        default="logs/thchs_v2/added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index",
+        default="assets/indices/thchs_v2.index",
         help="FAISS 索引路径",
     )
     parser.add_argument(

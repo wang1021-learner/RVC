@@ -200,7 +200,7 @@ index files *.index            optional
 Verified runtime versions:
 
 ```text
-Python 3.12.10 x64
+Python 3.11 x64 (portable runtime / install_local.bat: 3.11.9)
 PyTorch 2.7.1+cu118
 Torchaudio 2.7.1+cu118
 NumPy 1.26.4

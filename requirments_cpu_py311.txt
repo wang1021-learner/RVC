@@ -1,0 +1,32 @@
+# Python 3.11 x64 / Windows + Linux / CPU (optional DirectML on Windows)
+#
+# Stage 1:
+#   python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+# Optional Windows DirectML:
+#   python -m pip install torch-directml
+# Stage 2:
+#   python -m pip install -r requirments_cpu_py311.txt
+
+--index-url https://mirrors.pku.edu.cn/pypi/simple
+
+setuptools>=75.0
+wheel>=0.45,<1
+packaging>=24.0
+
+faiss-cpu>=1.13.0,<2
+librosa>=0.10.2,<0.11
+numpy>=1.26.4,<2
+onnxruntime>=1.18.0,<1.21
+onnx>=1.16.0,<2
+praat-parselmouth>=0.4.5,<1
+PySide6>=6.5
+PySide6-Fluent-Widgets>=1.7.0
+PyYAML>=6.0.1
+scipy>=1.13.1,<2
+sounddevice>=0.5.0,<1
+soundfile>=0.13.0,<1
+torchfcpe>=0.0.4,<0.1
+tqdm>=4.67.0,<5
+transformers>=4.49.0,<4.50
+websocket-client>=1.6
+websockets>=10.4,<11

@@ -200,7 +200,7 @@ tools/cuda_graph.py
 当前已验证的 runtime 版本：
 
 ```text
-Python 3.12.10 x64
+Python 3.11 x64（便携 runtime / install_local.bat 为 3.11.9）
 PyTorch 2.7.1+cu118
 Torchaudio 2.7.1+cu118
 NumPy 1.26.4

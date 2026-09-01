@@ -8,6 +8,12 @@ echo ============================================
 echo   RVC 服务器客户端打包（不含模型、不含 torch）
 echo ============================================
 
+python -c "import sys; raise SystemExit(0 if sys.version_info[:2]==(3,11) else 1)"
+if errorlevel 1 (
+    echo [ERROR] 打包需要 Python 3.11 x64
+    goto :err
+)
+
 echo [1/3] 构建瘦客户端 exe...
 python -m PyInstaller rvc_realtime.spec --noconfirm
 if errorlevel 1 goto :err

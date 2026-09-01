@@ -10,7 +10,9 @@ from tools.app_paths import (
 )
 from tools.file_io import write_json_atomic
 from tools.virtual_cable import is_bluetooth_name
-from ui.theme import LIGHT_QSS
+from ui.theme import (
+    LIGHT_QSS, LIGHT_GRAY, LIGHT_YELLOW, LIGHT_GREEN, LIGHT_RED,
+)
 
 ensure_user_data()
 
@@ -19,6 +21,7 @@ SETTINGS_FILE = settings_path()
 PRESETS_FILE = presets_path()
 SPEAKERS_FILE = speakers_path()
 WEIGHTS_DIR = bundled_dir() / "assets" / "weights"
+INDICES_DIR = bundled_dir() / "assets" / "indices"
 STYLE_QSS = LIGHT_QSS
 
 NL = chr(10)
@@ -317,7 +320,7 @@ def fill_f0_combo(cb, current="rmvpe"):
     cb.blockSignals(True)
     cb.clear()
     for key, label in F0_CHOICES:
-        cb.addItem(label, key)
+        cb.addItem(label, userData=key)
     i = cb.findData(current or "rmvpe")
     cb.setCurrentIndex(i if i >= 0 else 0)
     cb.blockSignals(False)
@@ -350,7 +353,7 @@ def _hostapi_zh(name):
 
 
 def to_server_path(local_path: str) -> str:
-    """只传文件名，由服务器在自己的 assets/weights、logs 下解析。"""
+    """只传文件名，由服务器在自己的 assets/weights、assets/indices 下解析。"""
     return Path(str(local_path or "")).name
 
 
@@ -378,6 +381,7 @@ def _local_model_path(path):
         cands.extend((
             root / raw,
             root / "assets" / "weights" / name,
+            root / "assets" / "indices" / name,
         ))
     for cand in cands:
         try:
@@ -388,8 +392,4 @@ def _local_model_path(path):
     return Path()
 
 
-# 状态灯颜色
-LIGHT_GRAY  = "#bdc3c7"   # 未加载
-LIGHT_YELLOW = "#f39c12"  # 加载中
-LIGHT_GREEN = "#27ae60"   # 运行中
-LIGHT_RED   = "#e74c3c"   # 错误
+

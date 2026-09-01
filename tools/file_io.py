@@ -5,12 +5,9 @@ import tempfile
 
 def read_text(path, errors="strict", newline=None):
     last_error = None
-    for encoding in (None, "utf8", "gbk"):
+    for encoding in ("utf-8", "utf-8-sig", "gbk"):
         try:
-            kwargs = {"errors": "strict", "newline": newline}
-            if encoding is not None:
-                kwargs["encoding"] = encoding
-            with open(path, "r", **kwargs) as file:
+            with open(path, "r", encoding=encoding, errors="strict", newline=newline) as file:
                 return file.read()
         except UnicodeDecodeError as error:
             last_error = error

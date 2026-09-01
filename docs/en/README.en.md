@@ -1,232 +1,199 @@
 <div align="center">
 
 <h1>Retrieval-based-Voice-Conversion-WebUI</h1>
-A simple, easy-to-use voice timbre conversion / voice changer framework.<br><br>
-
-[![madewithlove](https://img.shields.io/badge/made_with-%E2%9D%A4-red?style=for-the-badge&labelColor=orange
-)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
-
-<img src="https://counter.seku.su/cmoe?name=rvc&theme=r34" /><br>
+Realtime voice-changer client (Qt) + inference server + offline conversion<br><br>
 
 [![Licence](https://img.shields.io/github/license/RVC-Project/Retrieval-based-Voice-Conversion-WebUI?style=for-the-badge)](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/blob/main/LICENSE)
 [![Huggingface](https://img.shields.io/badge/🤗%20-Models-yellow.svg?style=for-the-badge)](https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main/)
 
-
-[**Changelog**](./Changelog_EN.md) | [**FAQ (Frequently Asked Questions)**](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/wiki/FAQ-(Frequently-Asked-Questions))
-
-[**English**](../en/README.en.md) | [**中文简体**](../../README.md) | [**日本語**](../jp/README.ja.md) | [**한국어**](../kr/README.ko.md) ([**韓國語**](../kr/README.ko.han.md)) | [**Français**](../fr/README.fr.md) | [**Türkçe**](../tr/README.tr.md) | [**Português**](../pt/README.pt.md)
+[**Changelog**](./Changelog_EN.md) | [**English**](../en/README.en.md) | [**简体中文**](../../README.md)
 
 </div>
 
-> Check out our [Demo Video](https://www.bilibili.com/video/BV1pm4y1z7Gm/) here!
+This tree is the **inference** side of RVC. It is not a Gradio WebUI and it does not ship a training suite (no `webui.py`, `go-webui.bat`, or `train/`).
 
-<table>
-   <tr>
-		<td align="center">Training and inference Webui</td>
-		<td align="center">Real-time voice changing GUI</td>
-	</tr>
-  <tr>
-		<td align="center"><img src="https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/assets/129054828/092e5c12-0d49-4168-a590-0b0ef6a4f630"></td>
-    <td align="center"><img src="https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/assets/129054828/730b4114-8805-44a1-ab1a-04668f3c30a6"></td>
-	</tr>
-	<tr>
-		<td align="center">go-webui.bat</td>
-		<td align="center">go-realtime_gui.bat</td>
-	</tr>
-  <tr>
-    <td align="center">You can freely choose the action you want to perform.</td>
-		<td align="center">We have achieved an end-to-end latency of 170ms. With the use of ASIO input and output devices, we have managed to achieve an end-to-end latency of 90ms, but it is highly dependent on hardware driver support.</td>
-	</tr>
-</table>
+Current entry points:
 
-> The dataset for the pre-training model uses nearly 50 hours of high quality audio from the VCTK open source dataset.
+| Role | Command |
+| --- | --- |
+| Realtime desktop client | `python realtime_qt.py` |
+| Standalone / remote inference server | `python server/rvc_server.py` |
+| Offline file conversion | `python convert_audio.py input.wav output.wav -m <model.pth> -i <index.index>` |
 
-> High quality licensed song datasets will be added to the training-set often for your use, without having to worry about copyright infringement.
+The pretrained base model uses the open VCTK set. Put speaker weights in `assets/weights/` and matching FAISS indexes in `assets/indices/`.
 
-> Please look forward to the pretrained base model of RVCv3, which has larger parameters, more training data, better results, unchanged inference speed, and requires less training data for training.
+## Features
 
-## Features:
-+ Reduce tone leakage by replacing the source feature to training-set feature using top1 retrieval;
-+ Easy + fast training, even on poor graphics cards;
-+ Training with a small amounts of data (>=10min low noise speech recommended);
-+ Model fusion to change timbres (using ckpt processing tab->ckpt merge);
-+ Easy-to-use WebUI;
-+ pymss/MSST model to quickly separate vocals and instruments;
-+ High-pitch Voice Extraction Algorithm [InterSpeech2023-RMVPE](#Credits) to prevent a muted sound problem. Provides the best results (significantly) and is faster with lower resource consumption than Crepe_full;
-+ AMD/Intel systems use the CPU dependency set; Windows may use DirectML and Linux uses CPU;
++ **Realtime VC**: PySide6 client captures the mic, runs local or remote GPU inference, and plays the result
++ **Retrieval mix**: FAISS **top-k (k=4)** neighbors from training features are blended with source HuBERT features using `index_rate` (“sound like the character”). With retrieval off or no index, the source HuBERT is used and timbre leakage returns
++ **Pitch**: [RMVPE](https://github.com/Dream-High/RMVPE) by default (InterSpeech 2023); FCPE / PM optional
++ **Devices**: NVIDIA CUDA; DirectML on Windows AMD/Intel; otherwise CPU
++ This tree has **no** training WebUI, ckpt-merge, or pymss/UVR vocal separation
 
 ## Environment setup
 
-This branch targets **Python 3.12 x64**. Run every command from the repository root. Ubuntu 24.04 x86_64 is recommended.
+**Python 3.11 x64 only.** The portable `runtime/` and `install_local.bat` use **3.11.9**. Do not use 3.10 or 3.12. For source work use `.venv`. Run commands from the repository root.
 
 ### Ubuntu 24.04
 
+The distro default is 3.12; install 3.11 separately:
+
 ```bash
 sudo apt update
-sudo apt install -y python3.12 python3.12-venv python3.12-dev ffmpeg unzip libsndfile1 libportaudio2
+sudo apt install -y software-properties-common
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv python3.11-dev ffmpeg unzip libsndfile1 libportaudio2
 
-python3.12 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 ```
 
 ### Windows
 
-Install Python 3.12 x64, then create a virtual environment:
-
 ```powershell
-py -3.12 -m venv .venv
+py -3.11 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip setuptools wheel
 ```
 
+Packaged/standalone builds use `runtime\python.exe` (3.11.9). `start_server.bat` skips any venv that is not 3.11.
+
 ### Choose dependencies by hardware
+
+Install a matching Torch build first, then this repo’s requirements. Ignore older docs that mention `go-webui.bat` or Gradio.
 
 | Hardware | Installation |
 | --- | --- |
-| CPU, AMD, Intel | Use `requirments_cpu_py312.txt`; Windows may use DirectML, while Linux uses CPU |
-| NVIDIA RTX 50 series | Install the CUDA 12.8 Torch pair first, then `requirments_cu128_py312.txt` |
-| NVIDIA GPUs before the RTX 50 series | Install the CUDA 11.8 Torch pair first, then `requirments_cu118_py312.txt` |
+| CPU, AMD, Intel | CPU Torch, then `requirments_cpu_py311.txt`. On Windows you may also install `torch-directml` |
+| NVIDIA RTX 50 series | CUDA 12.8 Torch, then `requirments_cu128_py311.txt` |
+| NVIDIA GPUs before RTX 50 | CUDA 11.8 Torch, then `requirments_cu118_py311.txt` |
 
 #### CPU, AMD, Intel
 
 ```bash
-python -m pip install -r requirments_cpu_py312.txt
+python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirments_cpu_py311.txt
 ```
 
-#### NVIDIA RTX 50 series: two stages
+Optional Windows DirectML:
+
+```bash
+python -m pip install torch-directml
+```
+
+#### NVIDIA RTX 50 series
 
 ```bash
 python -m pip install torch==2.7.1+cu128 torchaudio==2.7.1+cu128 \
   --index-url https://download.pytorch.org/whl/cu128 \
   --extra-index-url https://pypi.org/simple
-python -m pip install -r requirments_cu128_py312.txt
+python -m pip install -r requirments_cu128_py311.txt
 ```
 
-#### NVIDIA GPUs before the RTX 50 series: two stages
+#### NVIDIA GPUs before RTX 50
 
 ```bash
 python -m pip install torch==2.7.1+cu118 torchaudio==2.7.1+cu118 \
   --index-url https://download.pytorch.org/whl/cu118 \
   --extra-index-url https://pypi.org/simple
-python -m pip install -r requirments_cu118_py312.txt
+python -m pip install -r requirments_cu118_py311.txt
 ```
 
-Verify Torch and CUDA:
+If Torch is already installed and you only need the client libraries, `requirements.txt` is enough.
 
 ```bash
 python -c "import torch; print('torch:', torch.__version__); print('cuda:', torch.version.cuda); print('cuda available:', torch.cuda.is_available())"
 ```
 
-
-### Package indexes
-
-The three `requirments_*.txt` files define their package indexes at the top. Keep the default mirrors in mainland China. To use official indexes, replace only `--index-url` and `--extra-index-url`; keep package versions, CUDA suffixes, and the two-stage order unchanged.
-
-| Default mirror | Official source |
-| --- | --- |
-| `https://mirrors.pku.edu.cn/pypi/simple` | `https://pypi.org/simple` |
-| `https://mirrors.nju.edu.cn/pytorch/whl/cpu` | `https://download.pytorch.org/whl/cpu` |
-| `https://mirrors.nju.edu.cn/pytorch/whl/cu118` | `https://download.pytorch.org/whl/cu118` |
-| `https://mirrors.nju.edu.cn/pytorch/whl/cu128` | `https://download.pytorch.org/whl/cu128` |
+The `requirments_*.txt` files already set package indexes. To use official indexes, replace only `--index-url` and `--extra-index-url`.
 
 ## Models and runtime directories
 
-The WebUI creates runtime directories automatically. Download models from the [Hugging Face model repository](https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main) and keep this layout:
+Download shared weights from [Hugging Face](https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main). Keep speaker models and indexes grouped by family:
 
 ```text
 assets/
 ├── hubert_base/
 │   ├── config.json
 │   ├── preprocessor_config.json
-│   └── pytorch_model.bin
+│   ├── model.safetensors    # Transformers HuBERT
+│   ├── final_proj.pt        # RVC v1 768→256 projector; unused for v2
+│   ├── hubert_v1.onnx       # optional
+│   └── hubert_v2.onnx       # optional
 ├── rmvpe/rmvpe.pt
-├── pretrained/
-├── pretrained_v2/
-├── pymss_weights/
-├── weights/        # user RVC .pth models
-└── indices/        # user .index files
-logs/
-└── mute/           # training silence samples
-
-# Exact paths used by the code
-assets/hubert_base/config.json
-assets/hubert_base/preprocessor_config.json
-assets/hubert_base/pytorch_model.bin
-assets/rmvpe/rmvpe.pt
-assets/pretrained/*.pth
-assets/pretrained_v2/*.pth
-assets/pymss_weights/*
-assets/weights/*.pth
-assets/indices/*.index
-logs/mute/*
+├── weights/                 # user .pth
+└── indices/                 # matching .index, e.g. thchs_v2.index
 ```
 
-### Download models
+### Download shared models
 
 ```bash
 python -m pip install --upgrade huggingface_hub
 
-# Required for inference and feature extraction
 hf download lj1995/VoiceConversionWebUI --revision main \
   --include "hubert_base/*" --local-dir assets
 hf download lj1995/VoiceConversionWebUI rmvpe.pt --revision main \
   --local-dir assets/rmvpe
-
-# Required for v1/v2 training
-hf download lj1995/VoiceConversionWebUI --revision main \
-  --include "pretrained/*" "pretrained_v2/*" --local-dir assets
-hf download lj1995/VoiceConversionWebUI mute.zip --revision main \
-  --local-dir .model-downloads
-python -m zipfile -e .model-downloads/mute.zip logs
-
-# Required only for pymss/MSST vocal separation
-hf download lj1995/VoiceConversionWebUI --revision main \
-  --include "pymss_weights/*" --local-dir assets
 ```
 
-Windows AMD/Intel DirectML environments additionally need:
+If Hugging Face gives `pytorch_model.bin`, place it under `assets/hubert_base/` (either that or `model.safetensors`). v1 models also need `final_proj.pt`.
+
+Windows AMD/Intel DirectML additionally needs:
 
 ```bash
 hf download lj1995/VoiceConversionWebUI rmvpe.onnx --revision main \
   --local-dir assets/rmvpe
 ```
 
-
 ### FFmpeg
 
-The Ubuntu setup command above installs FFmpeg. On Windows, place these files in the repository root:
+The Ubuntu setup command installs FFmpeg. On Windows, put these in the repo root:
 
 - [ffmpeg.exe](https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/ffmpeg.exe?download=true)
 - [ffprobe.exe](https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/ffprobe.exe?download=true)
 
-## Start the WebUI
+## Usage
+
+### 1. Realtime desktop client
 
 ```bash
-python webui.py
+python realtime_qt.py
 ```
 
-For a headless Ubuntu server:
+### 2. Standalone / remote inference server
 
 ```bash
-python webui.py --noautoopen
+# Default is 0.0.0.0:8765 (LAN-reachable). Use --host 127.0.0.1 for localhost only.
+python server/rvc_server.py
+
+python server/rvc_server.py --host 0.0.0.0 --port 8765
+python server/rvc_server.py --cpu
 ```
 
-The default port is `7865`. Put personal `.pth` models in `assets/weights/` and `.index` files in `assets/indices/`.
+On Windows you can also run `start_server.bat`.
+
+### 3. Offline conversion
+
+```bash
+python convert_audio.py input.wav output.wav \
+  -m assets/weights/your_model.pth \
+  -i assets/indices/your_index.index
+```
+
+Put `.pth` files in `assets/weights/` and the matching `.index` in `assets/indices/` (family name, e.g. `thchs_v2.index`). Retrieval uses k=4, same as realtime. `index_rate=0` or a missing index skips retrieval.
 
 ## Credits
+
 + [ContentVec](https://github.com/auspicious3000/contentvec/)
 + [VITS](https://github.com/jaywalnut310/vits)
 + [HIFIGAN](https://github.com/jik876/hifi-gan)
-+ [Gradio](https://github.com/gradio-app/gradio)
 + [FFmpeg](https://github.com/FFmpeg/FFmpeg)
-+ [Ultimate Vocal Remover](https://github.com/Anjok07/ultimatevocalremovergui)
-+ [pymss-project/pymss](https://github.com/pymss-project/pymss)
-+ [audio-slicer](https://github.com/openvpi/audio-slicer)
-+ [Vocal pitch extraction:RMVPE](https://github.com/Dream-High/RMVPE)
-  + The pretrained model is trained and tested by [yxlllc](https://github.com/yxlllc/RMVPE) and [RVC-Boss](https://github.com/RVC-Boss).
++ [Vocal pitch extraction: RMVPE](https://github.com/Dream-High/RMVPE)
+  + Pretrained model trained and tested by [yxlllc](https://github.com/yxlllc/RMVPE) and [RVC-Boss](https://github.com/RVC-Boss)
 
-## Thanks to all contributors for their efforts
+## Thanks to all contributors
 <a href="https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI/graphs/contributors" target="_blank">
   <img src="https://contrib.rocks/image?repo=RVC-Project/Retrieval-based-Voice-Conversion-WebUI" />
 </a>

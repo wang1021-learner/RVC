@@ -2,10 +2,7 @@ import argparse
 import os
 import re
 import sys
-import json
 from multiprocessing import cpu_count
-from pathlib import Path
-from tools.file_io import read_text
 
 import torch
 import logging
@@ -145,16 +142,6 @@ if infer_device.type != "cuda" and not _FORCE_CPU:
 CUDA_GRAPH_AVAILABLE = configure_cuda_graph(infer_device)
 
 
-CONFIGS_DIR = Path(__file__).resolve().parent
-MODEL_CONFIG_FILES = (
-    "v1/32k.json",
-    "v1/40k.json",
-    "v1/48k.json",
-    "v2/48k.json",
-    "v2/32k.json",
-)
-
-
 def singleton_variable(func):
     def wrapper(*args, **kwargs):
         if not wrapper.instance:
@@ -174,61 +161,20 @@ class Config:
         self.cuda_graph = CUDA_GRAPH_AVAILABLE
         self.n_cpu = 0
         self.gpu_name = None
-        self.json_config = self.load_config_json()
         self.gpu_mem = None
-        (
-            self.python_cmd,
-            self.listen_port,
-            self.iscolab,
-            self.noparallel,
-            self.noautoopen,
-            self.dml,
-        ) = self.arg_parse()
+        self.python_cmd = sys.executable or "python"
         # DML is an automatic fallback when no CUDA device satisfies the rule.
-        self.dml = self.dml or (infer_device.type == "privateuseone")
+        self.dml = bool(self._dml_flag() or infer_device.type == "privateuseone")
         self.instead = ""
         self.preprocess_per = 3.7
         self.x_pad, self.x_query, self.x_center, self.x_max = self.device_config()
 
     @staticmethod
-    def load_config_json() :
-        d = {}
-        for config_file in MODEL_CONFIG_FILES:
-            d[config_file] = json.loads(read_text(CONFIGS_DIR / config_file))
-        return d
-
-    @staticmethod
-    def arg_parse() :
-        exe = sys.executable or "python"
-        parser = argparse.ArgumentParser()
-        parser.add_argument("--port", type=int, default=7865, help="Listen port")
-        parser.add_argument("--pycmd", type=str, default=exe, help="Python command")
-        parser.add_argument("--colab", action="store_true", help="Launch in colab")
-        parser.add_argument(
-            "--noparallel", action="store_true", help="Disable parallel processing"
-        )
-        parser.add_argument(
-            "--noautoopen",
-            action="store_true",
-            help="Do not open in browser automatically",
-        )
-        parser.add_argument(
-            "--dml",
-            action="store_true",
-            help="torch_dml",
-        )
+    def _dml_flag():
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--dml", action="store_true")
         cmd_opts, _unknown = parser.parse_known_args()
-
-        cmd_opts.port = cmd_opts.port if 0 <= cmd_opts.port <= 65535 else 7865
-
-        return (
-            cmd_opts.pycmd,
-            cmd_opts.port,
-            cmd_opts.colab,
-            cmd_opts.noparallel,
-            cmd_opts.noautoopen,
-            cmd_opts.dml,
-        )
+        return bool(cmd_opts.dml)
 
     def device_config(self) :
         if infer_device.type == "cuda":

@@ -6,15 +6,13 @@ import numpy as np
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QSize, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QComboBox, QSpinBox, QDoubleSpinBox,
-    QCheckBox, QRadioButton, QFileDialog, QGroupBox, QMessageBox,
-    QLineEdit, QStatusBar, QSplitter, QSlider,
-    QDialog, QDialogButtonBox, QFormLayout, QFrame, QListView,
+    QLabel, QFileDialog, QGroupBox, QMessageBox,
+    QStatusBar, QSplitter, QSizePolicy,
+    QDialog, QDialogButtonBox, QFormLayout, QFrame,
     QInputDialog, QScrollArea, QTabWidget, QSystemTrayIcon, QMenu,
 )
 from PySide6.QtGui import (
-    QDragEnterEvent, QDropEvent, QColor, QPainter, QFontMetrics,
-    QStandardItemModel, QStandardItem, QIcon, QAction, QPixmap,
+    QDragEnterEvent, QDropEvent, QIcon, QAction, QPixmap,
 )
 
 from tools.app_paths import (
@@ -31,7 +29,7 @@ from tools.virtual_cable import (
     find_virtual_devices, is_virtual_name, is_bluetooth_name,
     INSTALL_URLS, open_install_page, route_self_check,
 )
-from ui.theme import LIGHT_QSS
+from ui.theme import LIGHT_QSS, MUTED, OCHRE, status_kind_colors, hint_colors
 from ui.common import (
     NL, PROJECT_ROOT, SETTINGS_FILE, PRESETS_FILE, SPEAKERS_FILE, WEIGHTS_DIR,
     STYLE_QSS, LIGHT_GRAY, LIGHT_YELLOW, LIGHT_GREEN, LIGHT_RED,
@@ -44,8 +42,12 @@ from ui.common import (
     to_server_path, _speaker_file_sub, _local_model_path, _hostapi_zh,
 )
 from ui.devices import DeviceCombo, CableWizard, DeviceQueryThread
-from ui.widgets import StyledCombo, SpeakerCardList, create_styled_combo
+from ui.widgets import create_styled_combo
 from ui.speakers import SpeakerConfig, SpeakerManager, SpeakerDialog
+from ui.fw import (
+    PushButton, PrimaryPushButton, LineEdit, CheckBox, RadioButton,
+    Slider, SpinBox, DoubleSpinBox,
+)
 
 # ==============================================================================
 # 主窗口 - 三栏布局
@@ -54,7 +56,6 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("RVC 实时变声")
-        self.setMinimumSize(1040, 640)
         self.setAcceptDrops(True)
         self._apply_app_icon()
         self.speaker_mgr = SpeakerManager()
@@ -239,9 +240,22 @@ class MainWindow(QMainWindow):
         w.setObjectName("fieldLabel")
         return w
 
+    def _scroll_page(self, inner):
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(QFrame.NoFrame)
+        sc.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sc.setWidget(inner)
+        sc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        return sc
+
+    def _expand_h(self, w):
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return w
+
     def _build_ui(self):
         self.resize(1200, 760)
-        self.setMinimumSize(1060, 680)
+        self.setMinimumSize(860, 520)
         central = QWidget(); self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 10)
@@ -269,11 +283,12 @@ class MainWindow(QMainWindow):
 
         self.in_meter = VUMeterWidget(title="输入")
         self.in_meter.setAccessibleName("输入电平")
+        self.in_meter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.out_meter = VUMeterWidget(title="输出")
         self.out_meter.setAccessibleName("输出电平")
-        top.addWidget(self.in_meter)
-        top.addWidget(self.out_meter)
-        top.addStretch()
+        self.out_meter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        top.addWidget(self.in_meter, 1)
+        top.addWidget(self.out_meter, 1)
 
         # 状态微型标签
         self.badge_box = QFrame()
@@ -305,23 +320,33 @@ class MainWindow(QMainWindow):
         self.xrun_label.setObjectName("chipMute")
         self.xrun_label.setAccessibleName("卡顿次数")
         top.addWidget(self.xrun_label)
-        root.addWidget(header)
+        header.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        root.addWidget(header, 0)
 
         # ── 三栏主体布局 ──
         sp = QSplitter(Qt.Horizontal)
-        sp.addWidget(self._build_left())
-        sp.addWidget(self._build_mid())
-        sp.addWidget(self._build_right())
-        sp.setStretchFactor(0, 0)
-        sp.setStretchFactor(1, 1)
-        sp.setStretchFactor(2, 1)
-        sp.setSizes([260, 480, 380])
+        sp.setChildrenCollapsible(True)
+        left = self._build_left()
+        mid = self._build_mid()
+        right = self._build_right()
+        left.setMinimumWidth(200)
+        mid.setMinimumWidth(280)
+        right.setMinimumWidth(260)
+        sp.addWidget(left)
+        sp.addWidget(mid)
+        sp.addWidget(right)
+        sp.setStretchFactor(0, 2)
+        sp.setStretchFactor(1, 3)
+        sp.setStretchFactor(2, 3)
+        sp.setSizes([280, 520, 400])
+        self._splitter = sp
         root.addWidget(sp, 1)
 
         self.status_bar = QStatusBar(); self.setStatusBar(self.status_bar)
 
     def _build_left(self):
         g = QGroupBox("声音角色")
+        g.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         l = QVBoxLayout(g)
         l.setContentsMargins(12, 16, 12, 12)
         l.setSpacing(10)
@@ -330,6 +355,7 @@ class MainWindow(QMainWindow):
         self.sc = create_styled_combo(max_visible=12)
         self.sc.setObjectName("speakerCombo")
         self.sc.setMinimumHeight(36)
+        self._expand_h(self.sc)
         self.sc.setToolTip("选择要变成的声音")
         self.sc.setAccessibleName("角色")
         self.sc.currentIndexChanged.connect(self._sel)
@@ -339,7 +365,7 @@ class MainWindow(QMainWindow):
         br = QHBoxLayout()
         br.setSpacing(6)
         for t, fn in [("添加", self._a), ("编辑", self._e), ("删除", self._d)]:
-            b = QPushButton(t)
+            b = PushButton(t)
             b.setObjectName("btnGhost")
             b.setMinimumHeight(28)
             b.clicked.connect(fn)
@@ -377,28 +403,28 @@ class MainWindow(QMainWindow):
         gl.setHorizontalSpacing(10)
         gl.setVerticalSpacing(8)
 
-        self.live_pitch = QSpinBox()
+        self.live_pitch = SpinBox()
         self.live_pitch.setRange(-36, 36)
         self.live_pitch.setSuffix(" 半音")
         self.live_pitch.setToolTip("男变女大约 +12，女变男大约 -12")
         self.live_pitch.setAccessibleName("音高")
         self.live_pitch.valueChanged.connect(self._on_live_pitch)
 
-        self.live_index = QDoubleSpinBox()
+        self.live_index = DoubleSpinBox()
         self.live_index.setRange(0.0, 1.0)
         self.live_index.setSingleStep(0.1)
         self.live_index.setToolTip("越高越像角色，越低越像你自己。0 表示不用检索")
         self.live_index.setAccessibleName("像角色的程度")
         self.live_index.valueChanged.connect(self._on_live_index)
 
-        self.live_formant = QDoubleSpinBox()
+        self.live_formant = DoubleSpinBox()
         self.live_formant.setRange(-12.0, 12.0)
         self.live_formant.setSingleStep(0.5)
         self.live_formant.setToolTip("声道长短：正值更亮更女声，负值更厚")
         self.live_formant.setAccessibleName("共鸣")
         self.live_formant.valueChanged.connect(self._on_live_formant)
 
-        self.live_dry = QDoubleSpinBox()
+        self.live_dry = DoubleSpinBox()
         self.live_dry.setRange(0.0, 1.0)
         self.live_dry.setSingleStep(0.1)
         self.live_dry.setToolTip("0=只听变声，1=只听原声")
@@ -414,12 +440,16 @@ class MainWindow(QMainWindow):
         gl.addWidget(self._lbl("原声混合"), 3, 0)
         gl.addWidget(self.live_dry, 3, 1)
 
-        self.bypass = QCheckBox("旁通（听原声）")
+        self.bypass = CheckBox("旁通（听原声）")
         self.bypass.setToolTip("临时输出原声，不关变声")
         self.bypass.setAccessibleName("旁通听原声")
         self.bypass.toggled.connect(self._on_bypass)
         gl.addWidget(self.bypass, 4, 0, 1, 2)
         gl.setColumnStretch(1, 1)
+        self._expand_h(self.live_pitch)
+        self._expand_h(self.live_index)
+        self._expand_h(self.live_formant)
+        self._expand_h(self.live_dry)
 
         l.addWidget(live)
         l.addStretch(1)
@@ -427,21 +457,23 @@ class MainWindow(QMainWindow):
 
     def _build_mid(self):
         g = QGroupBox("转换控制")
+        g.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         l = QVBoxLayout(g)
         l.setContentsMargins(12, 16, 12, 12)
         l.setSpacing(10)
 
-        self.mode_local = QRadioButton("本地推理")
-        self.mode_server = QRadioButton("服务器")
+        self.mode_local = RadioButton("本地推理")
+        self.mode_server = RadioButton("服务器")
         if self.engine.mode == "server":
             self.mode_server.setChecked(True)
         else:
             self.mode_local.setChecked(True)
         self.mode_local.toggled.connect(lambda on: on and self._apply_mode("local"))
         self.mode_server.toggled.connect(lambda on: on and self._apply_mode("server"))
-        self.server_edit = QLineEdit(self._settings.get("server_url") or DEFAULT_SERVER_URL)
+        self.server_edit = LineEdit()
+        self.server_edit.setText(self._settings.get("server_url") or DEFAULT_SERVER_URL)
         self.server_edit.setPlaceholderText("ws://主机:8765")
-        self.conn_btn = QPushButton("连接")
+        self.conn_btn = PrimaryPushButton("连接")
         self.conn_btn.setObjectName("btnConnect")
         self.conn_btn.setMinimumWidth(88)
         self.conn_btn.setMinimumHeight(32)
@@ -452,6 +484,7 @@ class MainWindow(QMainWindow):
         sl = QHBoxLayout(self.server_row)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(8)
+        self._expand_h(self.server_edit)
         sl.addWidget(self.server_edit, 1)
         sl.addWidget(self.conn_btn)
         self.server_status = QLabel("未连接")
@@ -466,8 +499,8 @@ class MainWindow(QMainWindow):
         il.setSpacing(8)
         self.local_install_lbl = QLabel("")
         self.local_install_lbl.setWordWrap(True)
-        self.local_install_lbl.setStyleSheet("font-size:12px;color:#b45309;")
-        self.local_install_btn = QPushButton("安装本地推理")
+        self.local_install_lbl.setStyleSheet(f"font-size:12px;color:{OCHRE};")
+        self.local_install_btn = PrimaryPushButton("安装本地推理")
         self.local_install_btn.setObjectName("btnConnect")
         self.local_install_btn.setToolTip("下载并安装本机推理环境（需英伟达显卡与网络）")
         self.local_install_btn.clicked.connect(self._install_local)
@@ -484,6 +517,7 @@ class MainWindow(QMainWindow):
         dl.addWidget(self._lbl("输入设备"), 0, 0)
         self.ic = DeviceCombo(direction="input")
         self.ic.setMinimumHeight(30)
+        self._expand_h(self.ic)
         self.ic.setToolTip("麦克风。尽量和输出选同一类接口（都选系统低延迟）")
         self.ic.setAccessibleName("输入设备")
         self.ic.currentIndexChanged.connect(lambda: self._on_device_changed("input"))
@@ -492,19 +526,20 @@ class MainWindow(QMainWindow):
         dl.addWidget(self._lbl("输出设备"), 1, 0)
         self.oc = DeviceCombo(direction="output")
         self.oc.setMinimumHeight(30)
+        self._expand_h(self.oc)
         self.oc.setToolTip("耳机听自己，或选虚拟声卡给游戏/会议软件")
         self.oc.setAccessibleName("输出设备")
         self.oc.currentIndexChanged.connect(lambda: self._on_device_changed("output"))
         dl.addWidget(self.oc, 1, 1)
 
-        rb = QPushButton("刷新设备")
+        rb = PushButton("刷新设备")
         rb.setObjectName("btnGhost")
         rb.setMinimumHeight(28)
         rb.setCursor(Qt.PointingHandCursor)
         rb.clicked.connect(self._refresh_devices_clicked)
         self.dev_refresh_btn = rb
 
-        cable_btn = QPushButton("虚拟声卡向导")
+        cable_btn = PushButton("虚拟声卡向导")
         cable_btn.setObjectName("btnGhost")
         cable_btn.setMinimumHeight(28)
         cable_btn.setToolTip("检测虚拟声卡；没有则打开安装页")
@@ -541,7 +576,7 @@ class MainWindow(QMainWindow):
         self.tq_fast.setObjectName("fieldLabel")
         self.tq_fast.setFixedWidth(18)
         tq.addWidget(self.tq_fast)
-        self.tq_slider = QSlider(Qt.Horizontal)
+        self.tq_slider = Slider(Qt.Horizontal)
         self.tq_slider.setRange(0, 100)
         self.tq_slider.setValue(40)
         self.tq_slider.setFixedHeight(22)
@@ -555,26 +590,26 @@ class MainWindow(QMainWindow):
         tq.addWidget(self.tq_hq)
         l.addLayout(tq)
 
-        # 输出频谱
+        # 输出频谱：随窗口拉高，填掉中间空白
         self.spectrum = SpectrumWidget()
         self.spectrum.setToolTip("输出频谱实时监视")
-        l.addWidget(self.spectrum)
+        self.spectrum.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        l.addWidget(self.spectrum, 1)
 
-        # 主按钮紧跟频谱，不再被空白顶到底
-        self.sb = QPushButton("开始变声")
+        self.sb = PrimaryPushButton("开始变声")
         self.sb.setObjectName("btnStart")
         self.sb.setProperty("state", "off")
         self.sb.setMinimumHeight(40)
         self.sb.setMaximumHeight(44)
+        self.sb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.sb.setToolTip("开始或停止实时变声")
         self.sb.setAccessibleName("开始或停止变声")
         self.sb.setDefault(True)
         self.sb.clicked.connect(self._tg)
         l.addWidget(self.sb)
-        l.addStretch(1)
 
         # 录音测试暂时关闭
-        # self.rec_btn = QPushButton("录音测试 (10 秒)")
+        # self.rec_btn = PushButton("录音测试 (10 秒)")
         # self.rec_btn.setObjectName("btnGhost")
         # self.rec_btn.setMinimumHeight(34)
         # self.rec_btn.setToolTip("录 10 秒，用当前角色变声后保存并播放")
@@ -585,6 +620,7 @@ class MainWindow(QMainWindow):
     def _build_right(self):
         tabs = QTabWidget()
         tabs.setObjectName("rightTabs")
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # ── Tab 1: 核心算法 ──
         t1 = QWidget()
@@ -601,12 +637,13 @@ class MainWindow(QMainWindow):
         self.fc = create_styled_combo(max_visible=10)
         fill_f0_combo(self.fc, DEFAULT_PARAMS["f0method"])
         self.fc.setMinimumHeight(28)
+        self._expand_h(self.fc)
         self.fc.currentIndexChanged.connect(
             lambda: setattr(self.engine, "f0method", f0_from_combo(self.fc)))
         self.fc.setToolTip("音高提取：准确最稳，最快负担最小")
         self.fc.setAccessibleName("音高算法")
 
-        self.bs = QDoubleSpinBox()
+        self.bs = DoubleSpinBox()
         self.bs.setRange(0.03, 0.5)
         self.bs.setSingleStep(0.01)
         self.bs.setValue(DEFAULT_PARAMS["block_time"])
@@ -618,7 +655,7 @@ class MainWindow(QMainWindow):
         self.bs.valueChanged.connect(lambda v: setattr(self.engine, "block_time", v))
         self.bs.valueChanged.connect(lambda _: self._sync_tradeoff_slider())
 
-        self.xs = QDoubleSpinBox()
+        self.xs = DoubleSpinBox()
         self.xs.setRange(0.01, 0.5)
         self.xs.setSingleStep(0.01)
         self.xs.setValue(DEFAULT_PARAMS["crossfade_time"])
@@ -627,7 +664,7 @@ class MainWindow(QMainWindow):
         self.xs.setToolTip("运行中修改将在下次启动后生效")
         self.xs.valueChanged.connect(lambda v: setattr(self.engine, "crossfade_time", v))
 
-        self.es = QDoubleSpinBox()
+        self.es = DoubleSpinBox()
         self.es.setRange(0.4, 5.0)
         self.es.setSingleStep(0.1)
         self.es.setValue(DEFAULT_PARAMS["extra_time"])
@@ -636,7 +673,7 @@ class MainWindow(QMainWindow):
         self.es.setToolTip("上下文长度：越大音色越稳，但不增加听感延迟，只增加每块算力。运行中修改下次启动生效")
         self.es.valueChanged.connect(lambda v: setattr(self.engine, "extra_time", v))
 
-        self.ts = QSpinBox()
+        self.ts = SpinBox()
         self.ts.setRange(-80, 0)
         self.ts.setValue(-50)
         self.ts.setSuffix(" dB")
@@ -644,7 +681,7 @@ class MainWindow(QMainWindow):
         self.ts.setToolTip("低于此音量视为静音。-80 关闭门限")
         self.ts.valueChanged.connect(lambda v: setattr(self.engine, "threhold", v))
 
-        self.calib_noise_btn = QPushButton("测底噪")
+        self.calib_noise_btn = PushButton("测底噪")
         self.calib_noise_btn.setObjectName("btnGhost")
         self.calib_noise_btn.setMinimumWidth(72)
         self.calib_noise_btn.setMinimumHeight(28)
@@ -659,7 +696,7 @@ class MainWindow(QMainWindow):
         ts_l.addWidget(self.ts, 1)
         ts_l.addWidget(self.calib_noise_btn)
 
-        self.rs = QDoubleSpinBox()
+        self.rs = DoubleSpinBox()
         self.rs.setRange(0.0, 1.0)
         self.rs.setSingleStep(0.1)
         self.rs.setValue(0.3)
@@ -681,20 +718,20 @@ class MainWindow(QMainWindow):
             l.addWidget(lbl, i, 0)
             l.addWidget(w, i, 1)
 
-        self.inc = QCheckBox("输入降噪")
+        self.inc = CheckBox("输入降噪")
         self.inc.setMinimumHeight(26)
         self.inc.setToolTip("运行中修改将在下次启动后生效")
         self.inc.toggled.connect(lambda v: setattr(self.engine, "I_noise_reduce", v))
-        self.onc = QCheckBox("输出降噪")
+        self.onc = CheckBox("输出降噪")
         self.onc.setMinimumHeight(26)
         self.onc.setToolTip("运行中修改将在下次启动后生效")
         self.onc.toggled.connect(lambda v: setattr(self.engine, "O_noise_reduce", v))
-        self.cap_ns_cb = QCheckBox("采集降噪")
+        self.cap_ns_cb = CheckBox("采集降噪")
         self.cap_ns_cb.setMinimumHeight(26)
         self.cap_ns_cb.setToolTip("送出麦克风前压键盘/风扇底噪。给别人听或用蓝牙麦时会自动关掉，避免叠降噪切字、炸麦。")
         self.cap_ns_cb.setChecked(True)
         self.cap_ns_cb.toggled.connect(lambda v: setattr(self.engine, "capture_denoise", v))
-        self.inc_hubert_cb = QCheckBox("短窗特征")
+        self.inc_hubert_cb = CheckBox("短窗特征")
         self.inc_hubert_cb.setMinimumHeight(26)
         self.inc_hubert_cb.setToolTip("只算最近一小段特征，更快、更利多人。关掉更稳、更像。")
         self.inc_hubert_cb.setChecked(False)
@@ -743,14 +780,14 @@ class MainWindow(QMainWindow):
         # 输出保护
         pr = QHBoxLayout()
         pr.setSpacing(8)
-        self.limiter_cb = QCheckBox("输出保护")
+        self.limiter_cb = CheckBox("输出保护")
         self.limiter_cb.setMinimumHeight(26)
         self.limiter_cb.setToolTip("直流高通 + 软限幅，防止爆音/直流偏移（实时生效）")
         self.limiter_cb.setChecked(True)
         self.limiter_cb.toggled.connect(lambda v: setattr(self.engine, "limiter_enable", v))
         pr.addWidget(self.limiter_cb)
 
-        self.limiter_th = QDoubleSpinBox()
+        self.limiter_th = DoubleSpinBox()
         self.limiter_th.setRange(-12.0, 0.0)
         self.limiter_th.setSingleStep(0.5)
         self.limiter_th.setSuffix(" dB")
@@ -763,7 +800,7 @@ class MainWindow(QMainWindow):
         dl.addLayout(pr, 0, 0, 1, 2)
 
         # 齿音保留
-        self.hf_spin = QDoubleSpinBox()
+        self.hf_spin = DoubleSpinBox()
         self.hf_spin.setRange(0.0, 1.0)
         self.hf_spin.setSingleStep(0.05)
         self.hf_spin.setValue(DEFAULT_PARAMS["hf_mix_rate"])
@@ -774,7 +811,7 @@ class MainWindow(QMainWindow):
         dl.addWidget(self.hf_spin, 1, 1)
 
         # 临场感
-        self.pres_spin = QDoubleSpinBox()
+        self.pres_spin = DoubleSpinBox()
         self.pres_spin.setRange(0.0, 1.0)
         self.pres_spin.setSingleStep(0.05)
         self.pres_spin.setValue(DEFAULT_PARAMS["presence"])
@@ -784,7 +821,7 @@ class MainWindow(QMainWindow):
         dl.addWidget(self._lbl("临场感"), 2, 0)
         dl.addWidget(self.pres_spin, 2, 1)
 
-        self.protect_spin = QDoubleSpinBox()
+        self.protect_spin = DoubleSpinBox()
         self.protect_spin.setRange(0.0, 0.5)
         self.protect_spin.setSingleStep(0.05)
         self.protect_spin.setValue(DEFAULT_PARAMS.get("protect", 0.33))
@@ -795,7 +832,7 @@ class MainWindow(QMainWindow):
         dl.addWidget(self.protect_spin, 3, 1)
 
         # 去齿音
-        self.deess_cb = QCheckBox("自适应去齿音")
+        self.deess_cb = CheckBox("自适应去齿音")
         self.deess_cb.setMinimumHeight(26)
         self.deess_cb.setToolTip("尖刺超标时软衰减。与「齿音保留」互斥。")
         self.deess_cb.setChecked(DEFAULT_PARAMS["deesser_enable"])
@@ -805,14 +842,14 @@ class MainWindow(QMainWindow):
         # 人声识别 (VAD)
         vr = QHBoxLayout()
         vr.setSpacing(8)
-        self.vad_cb = QCheckBox("人声识别")
+        self.vad_cb = CheckBox("人声识别")
         self.vad_cb.setMinimumHeight(26)
         self.vad_cb.setToolTip("区分人声与环境杂音，非人声自动静音")
         self.vad_cb.setChecked(False)
         self.vad_cb.toggled.connect(lambda v: setattr(self.engine, "vad_enable", v))
         vr.addWidget(self.vad_cb)
 
-        self.vad_th = QDoubleSpinBox()
+        self.vad_th = DoubleSpinBox()
         self.vad_th.setRange(0.10, 0.90)
         self.vad_th.setSingleStep(0.05)
         self.vad_th.setValue(0.50)
@@ -825,7 +862,7 @@ class MainWindow(QMainWindow):
 
         # 阶段耗时
         self.st_lbl = QLabel("阶段耗时: --")
-        self.st_lbl.setStyleSheet("font-size:11px;color:#6b7c8a;")
+        self.st_lbl.setStyleSheet(f"font-size:11px;color:{MUTED};")
         dl.addWidget(self.st_lbl, 6, 0, 1, 2)
         dl.setColumnStretch(1, 1)
         l2.addWidget(g_dsp)
@@ -843,7 +880,7 @@ class MainWindow(QMainWindow):
         m.setHorizontalSpacing(10)
         m.setVerticalSpacing(8)
 
-        self.agc_cb = QCheckBox("输入自动增益")
+        self.agc_cb = CheckBox("输入自动增益")
         self.agc_cb.setMinimumHeight(26)
         self.agc_cb.setToolTip("输入音量自动拉齐。给别人听或用蓝牙麦时会自动关掉，避免和其它软件叠增益炸麦。")
         self.agc_cb.toggled.connect(self._on_agc)
@@ -855,11 +892,12 @@ class MainWindow(QMainWindow):
         self._preset_map = load_presets()
         self.preset_cb = create_styled_combo()
         self.preset_cb.setMinimumHeight(28)
+        self._expand_h(self.preset_cb)
         for p in self._preset_map:
             self.preset_cb.addItem(p["name"])
         pbtn_row.addWidget(self.preset_cb, 1)
 
-        pb_apply = QPushButton("应用")
+        pb_apply = PushButton("应用")
         pb_apply.setObjectName("btnGhost")
         pb_apply.setFixedWidth(48)
         pb_apply.setMinimumHeight(28)
@@ -867,7 +905,7 @@ class MainWindow(QMainWindow):
         pb_apply.clicked.connect(self._apply_preset)
         pbtn_row.addWidget(pb_apply)
 
-        pb_save = QPushButton("保存")
+        pb_save = PushButton("保存")
         pb_save.setObjectName("btnGhost")
         pb_save.setFixedWidth(48)
         pb_save.setMinimumHeight(28)
@@ -876,7 +914,7 @@ class MainWindow(QMainWindow):
         pbtn_row.addWidget(pb_save)
         m.addLayout(pbtn_row, 1, 1)
 
-        self.monitor_cb = QCheckBox("耳机监听")
+        self.monitor_cb = CheckBox("耳机监听")
         self.monitor_cb.setMinimumHeight(26)
         self.monitor_cb.setToolTip("主输出给别人听时，用第二路耳机听自己")
         self.monitor_cb.setAccessibleName("耳机监听")
@@ -886,7 +924,7 @@ class MainWindow(QMainWindow):
         vol_row = QHBoxLayout()
         vol_row.setSpacing(8)
         vol_row.addWidget(self._lbl("音量"))
-        self.monitor_vol = QSlider(Qt.Horizontal)
+        self.monitor_vol = Slider(Qt.Horizontal)
         self.monitor_vol.setRange(0, 100)
         self.monitor_vol.setValue(80)
         self.monitor_vol.setFixedHeight(22)
@@ -904,6 +942,7 @@ class MainWindow(QMainWindow):
         m.addWidget(self._lbl("听筒"), 4, 0)
         self.mc = DeviceCombo(direction="output", empty_text="选择耳机")
         self.mc.setMinimumHeight(30)
+        self._expand_h(self.mc)
         self.mc.setToolTip("监听耳机，可不同于主输出")
         self.mc.setAccessibleName("监听耳机")
         self.mc.currentIndexChanged.connect(lambda: self._on_monitor_changed())
@@ -915,9 +954,9 @@ class MainWindow(QMainWindow):
 
         self._sync_mode_ui()
 
-        tabs.addTab(t1, "延迟与音质")
-        tabs.addTab(t2, "声音修饰")
-        tabs.addTab(t3, "场景与监听")
+        tabs.addTab(self._scroll_page(t1), "延迟与音质")
+        tabs.addTab(self._scroll_page(t2), "声音修饰")
+        tabs.addTab(self._scroll_page(t3), "场景与监听")
         tabs.setTabToolTip(0, "块大小、音高算法、远程服务器")
         tabs.setTabToolTip(1, "防爆音、齿音、人声识别")
         tabs.setTabToolTip(2, "场景预设、耳机监听")
@@ -926,12 +965,11 @@ class MainWindow(QMainWindow):
     # ── 事件处理 ──
     def _show_dev_hint(self, text, warn=True):
         icon = "⚠ " if warn else "ℹ "
-        color = "#b45309" if warn else "#1d4ed8"
-        bg = "#fef3c7" if warn else "#dbeafe"
+        color, bg, bd = hint_colors(warn)
         self.dev_hint.setText(icon + text)
         self.dev_hint.setStyleSheet(
             f"font-size:12px;color:{color};background:{bg};"
-            "border:1px solid #e5e7eb;border-radius:6px;padding:6px 8px;")
+            f"border:1px solid {bd};border-radius:4px;padding:6px 8px;")
         self.dev_hint.setVisible(True)
 
     def _clear_dev_hint(self):
@@ -1161,14 +1199,9 @@ class MainWindow(QMainWindow):
         self.sc.clear()
         local = self.engine.mode == "local"
         for s in self.speaker_mgr.speakers:
-            self.sc.addItem(s.name)
-            row = self.sc.count() - 1
             missing = local and not _local_model_path(s.model_path).is_file()
-            sub = _speaker_file_sub(s)
-            if missing:
-                sub = "本机没有这个模型  ·  " + sub
-            self.sc.setItemData(row, sub, Qt.UserRole + 2)
-            self.sc.setItemData(row, missing, Qt.UserRole + 4)
+            label = s.name + ("  · 缺模型" if missing else "")
+            self.sc.addItem(label, userData={"sub": _speaker_file_sub(s), "warn": missing})
         if self.speaker_mgr.speakers:
             if self.engine.current_speaker:
                 names = [s.name for s in self.speaker_mgr.speakers]
@@ -1496,14 +1529,14 @@ class MainWindow(QMainWindow):
         self.light.setStyleSheet(f"background:{color};border-radius:4px;")
         self.state_label.setText(text)
         if color == LIGHT_GREEN:
-            c = "#0f766e"
+            c = LIGHT_GREEN
         elif color == LIGHT_YELLOW:
-            c = "#b45309"
+            c = OCHRE
         elif color == LIGHT_RED:
-            c = "#b91c1c"
+            c = LIGHT_RED
         else:
-            c = "#475569"
-        self.state_label.setStyleSheet(f"font-size:12px;font-weight:700;color:{c};")
+            c = MUTED
+        self.state_label.setStyleSheet(f"font-size:12px;font-weight:600;color:{c};")
 
     def _on_started(self):
         self._set_light(LIGHT_GREEN, "运行中")
@@ -2195,20 +2228,14 @@ class MainWindow(QMainWindow):
     def _set_server_status(self, text, kind="idle"):
         if not hasattr(self, "server_status"):
             return
-        colors = {
-            "idle": ("#6b7280", "#f8fafc", "#e5e7eb"),
-            "busy": ("#1d4ed8", "#dbeafe", "#93c5fd"),
-            "ok": ("#0f766e", "#ecfdf5", "#99f6e4"),
-            "fail": ("#b91c1c", "#fef2f2", "#fecaca"),
-        }
-        fg, bg, bd = colors.get(kind, colors["idle"])
+        fg, bg, bd = status_kind_colors(kind)
         fm = self.server_status.fontMetrics()
         shown = fm.elidedText(text, Qt.ElideMiddle, max(120, self.server_status.width() - 16))
         self.server_status.setText(shown)
         self.server_status.setToolTip(text if shown != text else "")
         self.server_status.setStyleSheet(
             f"font-size:12px;font-weight:600;color:{fg};background:{bg};"
-            f"border:1px solid {bd};border-radius:6px;padding:6px 8px;")
+            f"border:1px solid {bd};border-radius:4px;padding:6px 8px;")
 
     def _tick_connect_busy(self):
         btn = getattr(self, "conn_btn", None)

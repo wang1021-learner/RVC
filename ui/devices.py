@@ -1,88 +1,30 @@
 """音频设备下拉框、虚拟声卡向导。"""
-from PySide6.QtCore import Qt, Signal, QSize, QThread
+from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtWidgets import (
-    QStyledItemDelegate, QComboBox, QDialog, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QDialogButtonBox, QListView,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QDialogButtonBox,
 )
-from PySide6.QtGui import QColor, QStandardItemModel, QStandardItem
 import sounddevice as sd
 
 from tools.virtual_cable import (
     find_virtual_devices, INSTALL_URLS, open_install_page, route_self_check,
 )
 from ui.common import _hostapi_zh, _fp_from_devs
-
-class DeviceItemDelegate(QStyledItemDelegate):
-    """自定义绘制: 分组标题 / 设备项(两行)"""
-
-    def __init__(self, direction="input", parent=None):
-        super().__init__(parent)
-        self.direction = direction
-        self.icon = "🎤 " if direction == "input" else "🔊 "
-
-    def paint(self, painter, option, index):
-        is_group = index.data(Qt.UserRole + 1) == "group"
-
-        from ui.theme import device_row_colors
-        pal = device_row_colors()
-        if is_group:
-            painter.save()
-            painter.fillRect(option.rect, QColor(pal["group_bg"]))
-            painter.setPen(QColor(pal["group_fg"]))
-            f = painter.font(); f.setPointSize(9); f.setBold(True)
-            painter.setFont(f)
-            painter.drawText(option.rect.x() + 10, option.rect.y() + 16, str(index.data() or ""))
-            painter.restore()
-            return
-
-        # 设备项
-        name = index.data(Qt.DisplayRole) or ""
-        detail = index.data(Qt.UserRole + 2) or ""
-        is_default = index.data(Qt.UserRole + 3) or False
-
-        painter.save()
-        if option.state & QStyle.State_Selected:
-            painter.fillRect(option.rect, QColor(pal["selected"]))
-        elif option.state & QStyle.State_MouseOver:
-            painter.fillRect(option.rect, QColor(pal["hover"]))
-
-        painter.setPen(QColor(pal["title"]))
-        f = painter.font(); f.setPointSize(10); f.setBold(False)
-        painter.setFont(f)
-        text = self.icon + name
-        if is_default:
-            text += "  ⭐"
-        painter.drawText(option.rect.x() + 8, option.rect.y() + 17, text)
-
-        # 副行: 采样率/声道 (Line 2)
-        if detail:
-            painter.setPen(QColor(pal["sub"]))
-            f2 = painter.font(); f2.setPointSize(8)
-            painter.setFont(f2)
-            painter.drawText(option.rect.x() + 28, option.rect.y() + 33, detail)
-        painter.restore()
-
-    def sizeHint(self, option, index):
-        if index.data(Qt.UserRole + 1) == "group":
-            return QSize(option.rect.width(), 24)
-        return QSize(option.rect.width(), 40)
+from ui.theme import INK, MUTED, MOSS, OCHRE, PAPER, LINE
+from ui.fw import PushButton, PrimaryPushButton
+from ui.widgets import InstantComboBox
 
 
-class DeviceCombo(QComboBox):
+class DeviceCombo(InstantComboBox):
     """音频设备下拉框: 按 API 分组, 显示设备详情"""
 
     def __init__(self, direction="input", parent=None, empty_text="默认设备"):
         super().__init__(parent)
         self.direction = direction
         self.empty_text = empty_text or "默认设备"
-        self.setView(QListView(self))
-        self._model = QStandardItemModel(self)
-        self.setModel(self._model)
-        self.setItemDelegate(DeviceItemDelegate(direction, self))
-        self.setMaxVisibleItems(8)
-        self._device_ids = {}   # row -> device index
-        self._device_names = {}  # row -> 完整设备名（防 ID 漂移）
-        self._device_apis = {}   # row -> hostapi（同名设备区分 MME/WASAPI）
+        self.setMaxVisibleItems(12)
+        self._device_ids = {}
+        self._device_names = {}
+        self._device_apis = {}
 
     @staticmethod
     def _api_rank(api_name):
@@ -101,18 +43,14 @@ class DeviceCombo(QComboBox):
 
     def populate(self, devs, apis, ch):
         """按 hostapi 分组填充，WASAPI 优先。"""
-        self._model.clear()
+        self.blockSignals(True)
+        self.clear()
         self._device_ids = {}
         self._device_names = {}
         self._device_apis = {}
         row = 0
 
-        default_item = QStandardItem(self.empty_text)
-        default_item.setData("device", Qt.UserRole + 1)
-        default_item.setData("", Qt.UserRole + 2)
-        default_item.setData(True, Qt.UserRole + 3)
-        default_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        self._model.appendRow(default_item)
+        self.addItem(self.empty_text, userData={"kind": "device"})
         self._device_ids[row] = None
         row += 1
 
@@ -127,29 +65,21 @@ class DeviceCombo(QComboBox):
             a,
         )):
             api_name = apis[api_idx]["name"] if api_idx < len(apis) else "其他"
-            head = QStandardItem(_hostapi_zh(api_name))
-            head.setData("group", Qt.UserRole + 1)
-            head.setFlags(Qt.ItemIsEnabled)
-            self._model.appendRow(head)
+            self.addItem("— " + _hostapi_zh(api_name) + " —", userData={"kind": "group"})
+            self.setItemEnabled(row, False)
             row += 1
             for i, d in buckets[api_idx]:
                 name = d["name"]
-                show = name if len(name) <= 36 else name[:34] + "..."
+                show = name if len(name) <= 32 else name[:30] + "..."
                 sr = int(d.get("default_samplerate", 0))
                 chs = d[ch]
-                detail = (
-                    f"{sr // 1000} kHz · {chs} 声道" if sr > 0 else f"{chs} 声道"
-                )
-                item = QStandardItem(show)
-                item.setData("device", Qt.UserRole + 1)
-                item.setData(detail, Qt.UserRole + 2)
-                item.setData(False, Qt.UserRole + 3)
-                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                self._model.appendRow(item)
+                detail = f"{sr // 1000}kHz {chs}ch" if sr > 0 else f"{chs}ch"
+                self.addItem(f"{show}  ·  {detail}", userData={"kind": "device"})
                 self._device_ids[row] = i
                 self._device_names[row] = d["name"]
                 self._device_apis[row] = api_idx
                 row += 1
+        self.blockSignals(False)
 
     def currentDeviceId(self):
         """返回当前选中的 sounddevice 设备 ID"""
@@ -184,19 +114,6 @@ class DeviceCombo(QComboBox):
                 return True
         return False
 
-    def showPopup(self):
-        super().showPopup()
-        view = self.view()
-        h = 6
-        # PySide6 不暴露 protected 的 viewOptions()，改用 public 的 sizeHintForRow
-        for i in range(self.count()):
-            h += view.sizeHintForRow(i)
-        h = min(h, 380)
-        view.setFixedHeight(h)
-        parent = view.parentWidget()
-        if parent is not None and parent is not self:
-            parent.setFixedHeight(h + 4)
-
 
 class CableWizard(QDialog):
     """检测虚拟声卡；没有则给出安装入口。"""
@@ -214,7 +131,7 @@ class CableWizard(QDialog):
         # 1. 状态
         self.hint = QLabel()
         self.hint.setWordWrap(True)
-        self.hint.setStyleSheet("color:#334155;font-size:13px;")
+        self.hint.setStyleSheet(f"color:{INK};font-size:13px;")
         lay.addLayout(self._section("状态", self.hint))
 
         # 2. 检测到的虚拟声卡
@@ -232,8 +149,7 @@ class CableWizard(QDialog):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         for name, url in INSTALL_URLS:
-            b = QPushButton("打开 " + name)
-            b.setObjectName("btnGhost")
+            b = PushButton("打开 " + name)
             b.clicked.connect(lambda _, u=url: open_install_page(u))
             btn_row.addWidget(b)
         btn_row.addStretch(1)
@@ -242,16 +158,13 @@ class CableWizard(QDialog):
         # 应用 / 刷新
         apply_row = QHBoxLayout()
         apply_row.setSpacing(8)
-        self.use_out = QPushButton("设为输出")
-        self.use_out.setObjectName("btnConnect")
+        self.use_out = PrimaryPushButton("设为输出")
         self.use_out.setToolTip("把 RVC 输出设备设为这条虚拟线")
         self.use_out.clicked.connect(self._apply_out)
-        self.use_in = QPushButton("设为输入")
-        self.use_in.setObjectName("btnGhost")
+        self.use_in = PushButton("设为输入")
         self.use_in.setToolTip("把 RVC 输入设备设为这条虚拟线")
         self.use_in.clicked.connect(self._apply_in)
-        refresh_btn = QPushButton("重新检测")
-        refresh_btn.setObjectName("btnGhost")
+        refresh_btn = PushButton("重新检测")
         refresh_btn.clicked.connect(self.refresh)
         apply_row.addWidget(self.use_out)
         apply_row.addWidget(self.use_in)
@@ -270,7 +183,7 @@ class CableWizard(QDialog):
         box = QVBoxLayout()
         box.setSpacing(5)
         hdr = QLabel(title)
-        hdr.setStyleSheet("font-size:12px;font-weight:700;color:#64748b;")
+        hdr.setStyleSheet(f"font-size:12px;font-weight:600;color:{MUTED};")
         box.addWidget(hdr)
         box.addWidget(widget)
         return box
@@ -291,11 +204,11 @@ class CableWizard(QDialog):
             return
         self._found = find_virtual_devices(devs, apis)
         check = route_self_check(devs, apis)
-        color = "#059669" if check["ok"] else "#d97706"
+        color = MOSS if check["ok"] else OCHRE
         self.route_lbl.setText(check["message"])
         self.route_lbl.setStyleSheet(
-            "color:%s;font-weight:600;background:#f8fafc;border:1px solid #e2e8f0;"
-            "border-radius:6px;padding:8px 10px;" % color
+            "color:%s;font-weight:600;background:%s;border:1px solid %s;"
+            "border-radius:4px;padding:8px 10px;" % (color, PAPER, LINE)
         )
         if self._found:
             lines = []

@@ -15,7 +15,7 @@ echo.
 
 REM 1. Embedded Python
 if exist "%RT%\python.exe" goto :deps
-echo [1/4] Downloading embedded Python 3.11...
+echo [1/4] Downloading embedded Python 3.11.9 (required portable runtime)...
 if not exist "%RT%" mkdir "%RT%"
 set "PY_ZIP=%TEMP%\python-3.11.9-embed-amd64.zip"
 powershell -NoProfile -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -Uri 'https://registry.npmmirror.com/-/binary/python/3.11.9/python-3.11.9-embed-amd64.zip' -OutFile '%PY_ZIP%' -TimeoutSec 120 -UseBasicParsing } catch { Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip' -OutFile '%PY_ZIP%' -TimeoutSec 120 -UseBasicParsing }"

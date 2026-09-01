@@ -5,7 +5,7 @@ RVC Audio Level Meter & Visualizer
 """
 import numpy as np
 from PySide6.QtCore import Qt, QRectF
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QWidget, QSizePolicy
 from PySide6.QtGui import QPainter, QColor, QLinearGradient, QBrush, QPen
 
 
@@ -16,8 +16,9 @@ class VUMeterWidget(QWidget):
         self.level_db = -60.0
         self.peak_db = -60.0
         self._dark = False
-        self.setMinimumSize(130, 26)
+        self.setMinimumSize(72, 26)
         self.setMaximumHeight(28)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def set_dark(self, dark):
         self._dark = bool(dark)
@@ -41,7 +42,7 @@ class VUMeterWidget(QWidget):
         pal = meter_colors(self._dark)
         painter.setBrush(QBrush(QColor(pal["bg"])))
         painter.setPen(QPen(QColor(pal["border"]), 1))
-        painter.drawRoundedRect(0, 0, w - 1, h - 1, 5, 5)
+        painter.drawRoundedRect(0, 0, w - 1, h - 1, 3, 3)
 
         painter.setPen(QColor(pal["title"]))
         font = painter.font()
@@ -70,9 +71,9 @@ class VUMeterWidget(QWidget):
 
         if fill_w > 0:
             gradient = QLinearGradient(bar_left, 0, bar_left + bar_width, 0)
-            gradient.setColorAt(0.0, QColor("#16a34a"))  # 翠绿
-            gradient.setColorAt(0.75, QColor("#d97706")) # 暖黄
-            gradient.setColorAt(1.0, QColor("#dc2626"))  # 鲜红
+            gradient.setColorAt(0.0, QColor(pal["fill_lo"]))
+            gradient.setColorAt(0.75, QColor(pal["fill_mid"]))
+            gradient.setColorAt(1.0, QColor(pal["fill_hi"]))
 
             painter.setBrush(QBrush(gradient))
             painter.drawRoundedRect(bar_left, bar_top, fill_w, bar_height, 2, 2)
@@ -91,8 +92,8 @@ class SpectrumWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.bins = np.zeros(32, dtype=np.float32)
-        self.setMinimumHeight(56)
-        self.setMaximumHeight(72)
+        self.setMinimumHeight(48)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._dark = False
 
     def set_dark(self, dark):
@@ -120,25 +121,23 @@ class SpectrumWidget(QWidget):
         pal = meter_colors(self._dark)
         painter.setBrush(QBrush(QColor(pal["spec_bg"])))
         painter.setPen(QPen(QColor(pal["spec_border"]), 1))
-        painter.drawRoundedRect(0, 0, w - 1, h - 1, 6, 6)
+        painter.drawRoundedRect(0, 0, w - 1, h - 1, 3, 3)
         n = int(self.bins.size)
         if n <= 0 or w < 8:
             return
         gap = 2
         bar_w = max(2.0, (w - 10 - gap * (n - 1)) / n)
         x0 = 5
+        base = QColor(pal["spec_bar"])
         for i, v in enumerate(self.bins):
             bh = max(2.0, float(v) * (h - 10))
             x = x0 + i * (bar_w + gap)
             y = h - 5 - bh
-            if v > 0.75:
-                c = QColor("#ef4444")
-            elif v > 0.4:
-                c = QColor("#0d9488")
-            else:
-                c = QColor("#10b981")
+            c = QColor(base)
+            c.setAlpha(90 + int(165 * min(1.0, float(v))))
             painter.setBrush(QBrush(c))
-            painter.drawRoundedRect(QRectF(x, y, bar_w, bh), 1.5, 1.5)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(QRectF(x, y, bar_w, bh), 1.0, 1.0)
 
 
 def spec_bins(audio, n_out=32):

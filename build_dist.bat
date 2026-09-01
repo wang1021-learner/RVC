@@ -9,6 +9,12 @@ echo ============================================
 echo   RVC 单机版打包装配（构建机执行）
 echo ============================================
 
+python -c "import sys; raise SystemExit(0 if sys.version_info[:2]==(3,11) else 1)"
+if errorlevel 1 (
+    echo [ERROR] 打包需要 Python 3.11 x64
+    goto :err
+)
+
 echo [1/5] 构建客户端 exe...
 python -m PyInstaller rvc_realtime.spec --noconfirm
 if errorlevel 1 goto :err
@@ -32,10 +38,10 @@ copy /y "assets\weights\myvoice.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\shanxi.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\shanxi_e200_s14800.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\shanxi_e200_s11800.pth" "%SRC%\assets\weights\" >nul
-mkdir "%SRC%\logs\thchs_v2"
-copy /y "logs\thchs_v2\added_IVF2716_Flat_nprobe_1_thchs_v2_v2.index" "%SRC%\logs\thchs_v2\" >nul
-copy /y "logs\thchs_v2\added_IVF314_Flat_nprobe_1_myvoice_v2.index" "%SRC%\logs\thchs_v2\" >nul
-copy /y "logs\thchs_v2\shanxi.index" "%SRC%\logs\thchs_v2\" >nul
+mkdir "%SRC%\assets\indices"
+copy /y "assets\indices\thchs_v2.index" "%SRC%\assets\indices\" >nul
+copy /y "assets\indices\myvoice.index" "%SRC%\assets\indices\" >nul
+copy /y "assets\indices\shanxi.index" "%SRC%\assets\indices\" >nul
 copy /y "requirements_local_cu118.txt" "%SRC%\requirements_local_cu118.txt" >nul
 
 echo [4/5] 复制安装脚本与使用说明...

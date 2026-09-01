@@ -10,6 +10,7 @@ from tools.torchgate import TorchGate
 from tools.cuda_graph import (
     cuda_graph_enabled, graph_hot_path, run_cuda_graph, clear_cuda_graph_cache,
 )
+from tools.model_assets import resolve_index_path, resolve_model_path
 
 
 def cuda_sync_or_die(timeout=5.0, device=None):
@@ -152,47 +153,21 @@ class RVCPipeline:
         if self.rvc:
             self.rvc.change_formant(val)
 
-    def _resolve_path(self, path, is_index=False):
-        if not path:
-            return ""
-        if os.path.isfile(path):
-            return os.path.abspath(path)
-        name = os.path.basename(path)
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        candidates = [os.path.join(root, path), os.path.join(root, "assets", "weights", name)]
-        if is_index or name.lower().endswith(".index"):
-            logs = os.path.join(root, "logs")
-            extra = []
-            if os.path.isdir(logs):
-                try:
-                    extra = [
-                        os.path.join(logs, d, name)
-                        for d in os.listdir(logs)
-                        if os.path.isdir(os.path.join(logs, d))
-                    ]
-                except Exception:
-                    extra = []
-            candidates = [
-                os.path.join(root, path),
-                os.path.join(logs, name),
-                os.path.join(root, "logs", "thchs_v2", name),
-                *extra,
-                os.path.join(root, "deploy", "logs", "thchs_v2", name),
-                os.path.join(root, "assets", "indices", name),
-                os.path.join(root, "assets", name),
-                os.path.join(root, "assets", "weights", name),
-            ]
-        for cand in candidates:
-            if os.path.isfile(cand):
-                return os.path.abspath(cand)
-        return path
+    def _project_root(self):
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _resolve_path(self, path, is_index=False, model_path=""):
+        root = self._project_root()
+        if is_index or str(path).lower().endswith(".index"):
+            return resolve_index_path(path, root, model_path=model_path)
+        return resolve_model_path(path, root)
 
     def load_speaker(self, model_path, index_path="", pitch=0, index_rate=0.0,
                      formant=0.0, last_rvc=None, **params):
         if params:
             self.configure(**params)
         model_path = self._resolve_path(model_path, is_index=False)
-        index_path = self._resolve_path(index_path, is_index=True)
+        index_path = self._resolve_path(index_path, is_index=True, model_path=model_path)
         if not model_path or not os.path.isfile(model_path):
             name = os.path.basename(model_path or "") or "（空路径）"
             self.last_error = (

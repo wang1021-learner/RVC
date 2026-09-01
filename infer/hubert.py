@@ -57,6 +57,30 @@ class HubertOnnx:
         return out
 
 
+def _apply_rvc_final_proj(model):
+    """Load the RVC v1 768→256 projector. v2 uses last_hidden_state and ignores it."""
+    path = HUBERT_MODEL_PATH / "final_proj.pt"
+    if not path.is_file():
+        logger.warning(
+            "Missing %s; RVC v1 (256-d) features would use an untrained projector",
+            path,
+        )
+        return
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        blob = torch.load(path, map_location="cpu")
+    if not isinstance(blob, dict) or "weight" not in blob:
+        logger.warning("Unexpected final_proj.pt format: %s", type(blob))
+        return
+    dtype = model.final_proj.weight.dtype
+    state = {"weight": blob["weight"].to(dtype=dtype)}
+    if "bias" in blob and model.final_proj.bias is not None:
+        state["bias"] = blob["bias"].to(dtype=dtype)
+    model.final_proj.load_state_dict(state)
+    logger.info("Loaded RVC v1 projector from %s", path)
+
+
 def _try_hubert_onnx(device, is_half):
     if not onnx_enabled_for_realtime():
         return None
@@ -100,6 +124,7 @@ def load_hubert_model(device, is_half=False):
     model = HubertModelWithFinalProj.from_pretrained(
         str(HUBERT_MODEL_PATH), **load_options
     )
+    _apply_rvc_final_proj(model)
     model = model.to(device).eval()
     if onnx_enabled_for_realtime():
         try:

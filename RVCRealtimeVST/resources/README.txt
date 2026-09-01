@@ -44,7 +44,7 @@ C:\Program Files\Common Files\VST3\RVCRealtime.vst3\Contents\x86_64-win\RVCRealt
 1. 在 Studio One 的音轨上加载“RVC Realtime”。
 2. 点击 RVC ROOT，选择已有 RVC 源码与环境整合包的根目录。
 3. 插件会自动检测该目录下的 runtime\python.exe。
-4. PYTHON 保持空白时，手动选择整合包中可用的 64 位 python.exe。
+4. PYTHON 保持空白时，手动选择整合包中的 Python 3.11 x64（runtime\python.exe）。
 5. 选择 .pth 模型；需要索引检索时再选择 .index 文件。
 6. 点击右下角 ENGINE。状态变成 READY 后开始输出变声结果。
 

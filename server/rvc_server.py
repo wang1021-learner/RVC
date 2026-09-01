@@ -17,6 +17,8 @@ import concurrent.futures
 from collections import deque
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools.pyver import require_python_311
+require_python_311()
 # --cpu 必须在 import pipeline / Config 之前生效
 if "--cpu" in sys.argv:
     os.environ["RVC_FORCE_CPU"] = "1"
@@ -25,6 +27,7 @@ import numpy as np
 import websockets
 
 from worker.rvc_pipeline import RVCPipeline, cuda_sync_or_die
+from tools.model_assets import list_index_names
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -96,16 +99,7 @@ def _list_pth():
 
 
 def _list_indices():
-    found = []
-    logs = ROOT / "logs"
-    if logs.is_dir():
-        for p in logs.rglob("*.index"):
-            found.append(p.name)
-    extra = ROOT / "assets" / "indices"
-    if extra.is_dir():
-        for p in extra.glob("*.index"):
-            found.append(p.name)
-    return sorted(set(found))
+    return list_index_names(ROOT)
 
 
 _LIST_CACHE = {"t": 0.0, "models": None, "indices": None}
