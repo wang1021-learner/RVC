@@ -29,7 +29,7 @@
       "threhold": -50
     },
     {
-      "name": "OP2694892",
+      "name": "OP2694892 杜情",
       "model_path": "OP2694892_e50_s4900.pth",
       "index_path": "OP2694892_added_IVF1676_Flat_nprobe_1_OP2694892_v2.index",
       "speaker_id": 0,
@@ -43,7 +43,7 @@
       "threhold": -50
     },
     {
-      "name": "OP2701992",
+      "name": "OP2701992 张乐",
       "model_path": "OP2701992_e50_s4950.pth",
       "index_path": "OP2701992_added_IVF1590_Flat_nprobe_1_OP2701992_v2.index",
       "speaker_id": 0,
@@ -57,7 +57,7 @@
       "threhold": -50
     },
     {
-      "name": "OP2655302",
+      "name": "OP2655302 王娟",
       "model_path": "OP2655302_e200_s22200.pth",
       "index_path": "OP2655302_added_IVF1887_Flat_nprobe_1_OP2655302_v2.index",
       "speaker_id": 0,
@@ -71,7 +71,7 @@
       "threhold": -50
     },
     {
-      "name": "OP2671842",
+      "name": "OP2671842 爼海峰",
       "model_path": "OP2671842_e200_s20400.pth",
       "index_path": "OP2671842_added_IVF1602_Flat_nprobe_1_OP2671842_v2.index",
       "speaker_id": 0,
@@ -85,7 +85,7 @@
       "threhold": -50
     },
     {
-      "name": "OP2687374",
+      "name": "OP2687374 牛志鹏",
       "model_path": "OP2687374_e200_s22600.pth",
       "index_path": "OP2687374_added_IVF2131_Flat_nprobe_1_OP2687374_v2.index",
       "speaker_id": 0,
@@ -99,7 +99,7 @@
       "threhold": -50
     },
     {
-      "name": "OP2701067",
+      "name": "OP2701067 刘智贤",
       "model_path": "OP2701067_e200_s28800.pth",
       "index_path": "OP2701067_added_IVF2531_Flat_nprobe_1_OP2701067_v2.index",
       "speaker_id": 0,

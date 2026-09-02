@@ -3,10 +3,11 @@
 RVC 实时变声客户端 (服务器推理模式) 打包配置
 构建: pyinstaller rvc_realtime.spec --noconfirm
 
-体积优化说明（199MB -> ~135MB，配合 UPX 可到 ~85MB）：
+体积优化说明：
 - 移除 opengl32sw.dll（软件 OpenGL 渲染器，桌面 D3D/硬件 GL 已足够）
-- 移除未使用的 Qt 模块（Quick/Qml/Pdf/Network/Svg/OpenGL 等）
-- 未安装 UPX 时 upx=True 自动跳过；安装 UPX 后 DLL 可再压 30~40%
+- 移除未使用的 Qt 模块（Quick/Qml/Pdf/Network/OpenGL 等）
+- QFluentWidgets 需要 QtXml / QtSvg / QtSvgWidgets，不可剔除
+- 未安装 UPX 时 upx=True 自动跳过
 """
 import os
 
@@ -21,7 +22,7 @@ _DROP_DLLS = {
     # 未使用的 Qt 模块
     "qt6quick.dll", "qt6qml.dll", "qt6pdf.dll", "qt6pdfwidgets.dll",
     "qt6quickwidgets.dll", "qt6quickcontrols2.dll", "qt6quicktemplates2.dll",
-    "qt6network.dll", "qt6svg.dll", "qt6xml.dll", "qt6printsupport.dll",
+    "qt6network.dll", "qt6printsupport.dll",
     "qt6opengl.dll", "qt6openglwidgets.dll", "qt6dbus.dll", "qt6sql.dll",
     "qt6test.dll", "qt6multimedia.dll", "qt6sensors.dll", "qt6websockets.dll",
     "qt6serialport.dll", "qt6concurrent.dll", "qt6charts.dll",
@@ -45,10 +46,19 @@ def _filter_binaries(binaries):
             continue
         if any(p in base for p in _DROP_PATTERNS):
             continue
-        # Qt 插件只保留 windows 平台插件（Fusion 样式内建，无图片/图标依赖）
+        # Qt 插件：平台 + 图片/图标。其它（qml/sqldriver 等）丢掉。
         low = pth.lower().replace("/", "\\")
-        if "\\plugins\\" in low and not low.endswith("platforms\\qwindows.dll"):
-            continue
+        if "\\plugins\\" in low:
+            keep = (
+                low.endswith("platforms\\qwindows.dll")
+                or "\\imageformats\\qico.dll" in low
+                or "\\imageformats\\qjpeg.dll" in low
+                or "\\imageformats\\qpng.dll" in low
+                or "\\imageformats\\qgif.dll" in low
+                or "\\iconengines\\qsvgicon.dll" in low
+            )
+            if not keep:
+                continue
         out.append((name, pth, typecode))
     return out
 
@@ -90,6 +100,10 @@ a = Analysis(
         'ui.widgets',
         'ui.speakers',
         'ui.main_window',
+        'tools.virtual_cable',
+        'qfluentwidgets',
+        'qframelesswindow',
+        'darkdetect',
         'websocket',
         'websocket._abnf',
         'sounddevice',
@@ -97,6 +111,9 @@ a = Analysis(
         'PySide6.QtCore',
         'PySide6.QtWidgets',
         'PySide6.QtGui',
+        'PySide6.QtXml',
+        'PySide6.QtSvg',
+        'PySide6.QtSvgWidgets',
     ],
     hookspath=[],
     hooksconfig={},
@@ -111,7 +128,7 @@ a = Analysis(
         # 未使用的 Qt 模块
         'PySide6.QtQuick', 'PySide6.QtQml', 'PySide6.QtPdf',
         'PySide6.QtPdfWidgets', 'PySide6.QtQuickWidgets',
-        'PySide6.QtNetwork', 'PySide6.QtSvg', 'PySide6.QtXml',
+        'PySide6.QtNetwork',
         'PySide6.QtPrintSupport', 'PySide6.QtOpenGL', 'PySide6.QtOpenGLWidgets',
         'PySide6.QtDBus', 'PySide6.QtSql', 'PySide6.QtTest',
         'PySide6.QtMultimedia', 'PySide6.QtSensors', 'PySide6.QtWebSockets',
