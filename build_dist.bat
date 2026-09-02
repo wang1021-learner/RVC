@@ -31,15 +31,9 @@ mkdir "%SRC%\assets"
 xcopy /e /i /q "assets\hubert_base" "%SRC%\assets\hubert_base" >nul
 xcopy /e /i /q "assets\rmvpe" "%SRC%\assets\rmvpe" >nul
 mkdir "%SRC%\assets\weights"
-copy /y "assets\weights\thchs_female_200e.pth" "%SRC%\assets\weights\" >nul
-copy /y "assets\weights\thchs_female_300e.pth" "%SRC%\assets\weights\" >nul
-copy /y "assets\weights\thchs_v2_e200_s13200.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\myvoice.pth" "%SRC%\assets\weights\" >nul
-copy /y "assets\weights\shanxi.pth" "%SRC%\assets\weights\" >nul
-copy /y "assets\weights\shanxi_e200_s14800.pth" "%SRC%\assets\weights\" >nul
 copy /y "assets\weights\shanxi_e200_s11800.pth" "%SRC%\assets\weights\" >nul
 mkdir "%SRC%\assets\indices"
-copy /y "assets\indices\thchs_v2.index" "%SRC%\assets\indices\" >nul
 copy /y "assets\indices\myvoice.index" "%SRC%\assets\indices\" >nul
 copy /y "assets\indices\shanxi.index" "%SRC%\assets\indices\" >nul
 copy /y "requirements_local_cu118.txt" "%SRC%\requirements_local_cu118.txt" >nul

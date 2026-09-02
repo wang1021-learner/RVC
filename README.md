@@ -126,7 +126,7 @@ assets/
 │   └── hubert_v2.onnx       # 可选
 ├── rmvpe/rmvpe.pt
 ├── weights/                 # 用户 .pth
-└── indices/                 # 与模型同族的 .index，如 thchs_v2.index
+└── indices/                 # 与模型同族的 .index，如 myvoice.index
 ```
 
 ### 下载公共模型
@@ -184,7 +184,7 @@ python convert_audio.py input.wav output.wav \
   -i assets/indices/your_index.index
 ```
 
-`.pth` 放 `assets/weights/`，对应 `.index` 放 `assets/indices/`（按说话人族命名，例如 `thchs_v2.index`）。检索 k=4，与实时路径相同；`index_rate` 为 0 或不提供索引则不做检索。
+`.pth` 放 `assets/weights/`，对应 `.index` 放 `assets/indices/`（按说话人族命名，例如 `myvoice.index`）。检索 k=4，与实时路径相同；`index_rate` 为 0 或不提供索引则不做检索。
 
 ## 参考项目
 

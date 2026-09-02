@@ -81,6 +81,8 @@ a = Analysis(
         'tools.client_ns',
         'tools.file_io',
         'tools.app_paths',
+        'tools.model_assets',
+        'ui.fw',
         'ui',
         'ui.theme',
         'ui.common',

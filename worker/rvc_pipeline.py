@@ -1,5 +1,6 @@
 """RVC inference pipeline - no UI dependency"""
 import os, sys, time, traceback, logging, threading
+from pathlib import Path
 import numpy as np, torch, torch.nn.functional as F, torchaudio.transforms as tat
 from configs.config import Config
 from infer import rtrvc as rvc_for_realtime
@@ -11,6 +12,75 @@ from tools.cuda_graph import (
     cuda_graph_enabled, graph_hot_path, run_cuda_graph, clear_cuda_graph_cache,
 )
 from tools.model_assets import resolve_index_path, resolve_model_path
+
+# 这些错误表示当前进程的 CUDA 上下文已坏，继续跑只会一直失败。
+# 主动退出后由 start_rvc.sh 看门狗拉起新进程。不要把 OOM 算进来。
+_CUDA_CONTEXT_DEAD = (
+    "illegal memory access",
+    "device-side assert",
+    "unspecified launch failure",
+)
+
+
+def cuda_context_dead(exc):
+    s = str(exc or "").lower()
+    return any(p in s for p in _CUDA_CONTEXT_DEAD)
+
+
+_WATCHDOG_WINDOW = 600.0  # 统计窗口：10 分钟
+_WATCHDOG_SOFT = 3        # 10 分钟内第 3 次起先等 30 秒
+_WATCHDOG_HARD = 6        # 第 6 次起等 120 秒，避免空转打满日志
+
+
+def _watchdog_stamp_path():
+    return Path(__file__).resolve().parent.parent / "logs" / "cuda_watchdog.json"
+
+
+def _watchdog_backoff_sec():
+    """最近窗口内死了几次，决定退出前多睡一会儿。"""
+    import json
+    path = _watchdog_stamp_path()
+    now = time.time()
+    history = []
+    try:
+        if path.is_file():
+            history = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(history, list):
+                history = []
+    except Exception:
+        history = []
+    history = [float(t) for t in history if now - float(t) < _WATCHDOG_WINDOW]
+    history.append(now)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(history), encoding="utf-8")
+    except Exception:
+        pass
+    n = len(history)
+    if n >= _WATCHDOG_HARD:
+        return n, 120
+    if n >= _WATCHDOG_SOFT:
+        return n, 30
+    return n, 0
+
+
+def die_for_watchdog(reason):
+    n, delay = _watchdog_backoff_sec()
+    logging.critical(
+        "CUDA context dead (%d in %.0fs), sleep %ds then exit for watchdog: %s",
+        n, _WATCHDOG_WINDOW, delay, reason)
+    try:
+        print("[!] CUDA 上下文已损坏，10分钟内第 %d 次，%d 秒后退出交给看门狗:" % (n, delay),
+              reason, flush=True)
+        if n >= _WATCHDOG_HARD:
+            print("[!] 短时间反复崩溃，可能是某个模型必崩，请查 rvc_server.log", flush=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    if delay > 0:
+        time.sleep(delay)
+    os._exit(1)
 
 
 def cuda_sync_or_die(timeout=5.0, device=None):
@@ -41,14 +111,10 @@ def cuda_sync_or_die(timeout=5.0, device=None):
     t = threading.Thread(target=_run, name="cuda-sync", daemon=True)
     t.start()
     if not done.wait(float(timeout)):
-        logging.error("CUDA synchronize hung for %.1fs, exiting for watchdog", timeout)
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except Exception:
-            pass
-        os._exit(1)
+        die_for_watchdog("CUDA synchronize hung for %.1fs" % timeout)
     if err:
+        if cuda_context_dead(err[0]):
+            die_for_watchdog(err[0])
         raise err[0]
     return True
 
@@ -203,6 +269,8 @@ class RVCPipeline:
             self.last_error = str(e)
             self._on_status("加载失败: " + str(e))
             self.rvc = old
+            if cuda_context_dead(e):
+                die_for_watchdog(e)
             return False
         finally:
             self._gpu_lock.release()
@@ -381,8 +449,10 @@ class RVCPipeline:
             return out_block, elapsed_ms
         except Exception as e:
             traceback.print_exc()
+            if cuda_context_dead(e):
+                die_for_watchdog(e)
             msg = str(e).lower()
-            if "cuda" in msg or "illegal memory" in msg:
+            if "cuda" in msg:
                 os.environ["RVC_CUDA_GRAPH"] = "0"
                 try:
                     for owner in (

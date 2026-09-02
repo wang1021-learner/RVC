@@ -396,16 +396,15 @@ class MainWindow(QMainWindow):
         cv.addWidget(self.cur_warn)
         l.addWidget(self.cur_card)
 
-        # 实时调节面板
+        # 实时调节面板：标签在上、框拉满，避免窄栏里只剩上下箭头
         live = QGroupBox("实时调节")
         gl = QGridLayout(live)
         gl.setContentsMargins(10, 16, 10, 10)
         gl.setHorizontalSpacing(10)
-        gl.setVerticalSpacing(8)
+        gl.setVerticalSpacing(6)
 
         self.live_pitch = SpinBox()
         self.live_pitch.setRange(-36, 36)
-        self.live_pitch.setSuffix(" 半音")
         self.live_pitch.setToolTip("男变女大约 +12，女变男大约 -12")
         self.live_pitch.setAccessibleName("音高")
         self.live_pitch.valueChanged.connect(self._on_live_pitch)
@@ -413,6 +412,7 @@ class MainWindow(QMainWindow):
         self.live_index = DoubleSpinBox()
         self.live_index.setRange(0.0, 1.0)
         self.live_index.setSingleStep(0.1)
+        self.live_index.setDecimals(2)
         self.live_index.setToolTip("越高越像角色，越低越像你自己。0 表示不用检索")
         self.live_index.setAccessibleName("像角色的程度")
         self.live_index.valueChanged.connect(self._on_live_index)
@@ -420,6 +420,7 @@ class MainWindow(QMainWindow):
         self.live_formant = DoubleSpinBox()
         self.live_formant.setRange(-12.0, 12.0)
         self.live_formant.setSingleStep(0.5)
+        self.live_formant.setDecimals(1)
         self.live_formant.setToolTip("声道长短：正值更亮更女声，负值更厚")
         self.live_formant.setAccessibleName("共鸣")
         self.live_formant.valueChanged.connect(self._on_live_formant)
@@ -427,29 +428,31 @@ class MainWindow(QMainWindow):
         self.live_dry = DoubleSpinBox()
         self.live_dry.setRange(0.0, 1.0)
         self.live_dry.setSingleStep(0.1)
+        self.live_dry.setDecimals(2)
         self.live_dry.setToolTip("0=只听变声，1=只听原声")
         self.live_dry.setAccessibleName("原声混合")
         self.live_dry.valueChanged.connect(self._on_live_dry)
 
-        gl.addWidget(self._lbl("音高"), 0, 0)
-        gl.addWidget(self.live_pitch, 0, 1)
-        gl.addWidget(self._lbl("像角色"), 1, 0)
-        gl.addWidget(self.live_index, 1, 1)
-        gl.addWidget(self._lbl("共鸣"), 2, 0)
-        gl.addWidget(self.live_formant, 2, 1)
-        gl.addWidget(self._lbl("原声混合"), 3, 0)
-        gl.addWidget(self.live_dry, 3, 1)
+        rows = (
+            ("音高（半音）", self.live_pitch),
+            ("像角色", self.live_index),
+            ("共鸣", self.live_formant),
+            ("原声混合", self.live_dry),
+        )
+        for i, (title, box) in enumerate(rows):
+            box.setMinimumWidth(0)
+            box.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self._expand_h(box)
+            r = i * 2
+            gl.addWidget(self._lbl(title), r, 0)
+            gl.addWidget(box, r + 1, 0)
 
         self.bypass = CheckBox("旁通（听原声）")
         self.bypass.setToolTip("临时输出原声，不关变声")
         self.bypass.setAccessibleName("旁通听原声")
         self.bypass.toggled.connect(self._on_bypass)
-        gl.addWidget(self.bypass, 4, 0, 1, 2)
-        gl.setColumnStretch(1, 1)
-        self._expand_h(self.live_pitch)
-        self._expand_h(self.live_index)
-        self._expand_h(self.live_formant)
-        self._expand_h(self.live_dry)
+        gl.addWidget(self.bypass, 8, 0)
+        gl.setColumnStretch(0, 1)
 
         l.addWidget(live)
         l.addStretch(1)
@@ -1228,7 +1231,7 @@ class MainWindow(QMainWindow):
                 self.sb.setEnabled(False)
         else:
             self.cur_name.setText("还没有角色")
-            self.cur_model.setText("把 .pth 拖进窗口，或点「添加」。")
+            self.cur_model.setText("把 .pth / .index 拖进窗口，或点「添加」导入。")
             self.cur_info.setText("")
             if hasattr(self, "cur_warn"):
                 self.cur_warn.setVisible(False)
@@ -1251,7 +1254,7 @@ class MainWindow(QMainWindow):
         self._sync_live_sliders(s)
         if self.engine.mode == "local" and not _local_model_path(s.model_path).is_file():
             msg = (
-                "本机找不到「%s」。把 .pth 放到 assets/weights/，或改用远程服务器。"
+                "本机找不到「%s」。点「添加/编辑」导入 .pth，或改用远程服务器。"
                 % (Path(s.model_path).name or "模型")
             )
             if hasattr(self, "cur_warn"):
@@ -1352,7 +1355,10 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "_loader") or self._loader is None or not self._loader.isRunning():
             return
         elapsed = time.time() - (self._load_started or time.time())
-        stage = self._loading_stage() or "正在加载"
+        if getattr(self.engine, "mode", "") == "server":
+            stage = "正在加载远端模型"
+        else:
+            stage = self._loading_stage() or "正在加载"
         self._set_light(LIGHT_YELLOW, f"加载中… {stage}（{elapsed:.0f} 秒）")
 
     def _on_loaded(self, speaker, gen=0):
@@ -1454,7 +1460,13 @@ class MainWindow(QMainWindow):
                 connected = bool(self.engine.pipeline.is_connected())
             except Exception:
                 connected = False
-            low = (text + " " + str(err or "")).lower()
+            raw_err = str(err or "")
+            low = (text + " " + raw_err).lower()
+            timed = (
+                "超时" in text or "超时" in raw_err
+                or "timeout" in low or "timed out" in low
+                or "等待服务器回复" in raw_err
+            )
             closed = (
                 (not connected)
                 or "连接已关闭" in text
@@ -1462,14 +1474,17 @@ class MainWindow(QMainWindow):
                 or "未连接" in text
                 or "closed" in low
             )
-            if closed:
+            if connected and timed:
+                text = "加载超时。远端换模型要十几秒，请再点一次角色。"
+                hint = "连接还在，不是防火墙或安全组问题。请再点一次角色；反复失败再重新「连接」。"
+            elif closed:
                 hint = "连接已经断了。点一次「连接」，成功后再选角色。"
             elif "找不到" in text or "no such file" in low or "not found" in low:
                 hint = "远端没有这个模型。把同名 .pth 放到服务器的 assets/weights/ 后再加载。"
-            elif "没回上" in text or "没有返回有效" in str(err or "") or "expecting" in low:
+            elif "没回上" in text or "没有返回有效" in raw_err or "expecting" in low:
                 hint = "连接还在，只是这一次没拿到加载回复。再点一次角色；反复出现就重新「连接」。"
             else:
-                hint = "服务器已连上。若文件名对不上，请把 .pth 放到远端 assets/weights/。"
+                hint = "连接还在。请再点一次角色；反复失败再重新「连接」。"
             try:
                 if not connected:
                     self._set_server_status("未连接", "fail")

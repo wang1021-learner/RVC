@@ -5,10 +5,10 @@ Canonical layout:
   assets/indices/<speaker>.index
 
 A speaker family maps every checkpoint of that voice onto one index:
-  thchs_v2_e200_s13200.pth  ->  thchs_v2.index
   shanxi_e200_s11800.pth    ->  shanxi.index
   myvoice.pth               ->  myvoice.index
 """
+import shutil
 from pathlib import Path
 
 WEIGHTS_REL = Path("assets") / "weights"
@@ -17,16 +17,12 @@ INDICES_REL = Path("assets") / "indices"
 # FAISS / GPU cosine retrieval. Realtime and offline conversion share this k.
 INDEX_TOPK = 4
 
-# Longest family first so thchs_female is not swallowed by a shorter prefix.
 SPEAKER_FAMILIES = (
-    "thchs_female",
-    "thchs_v2",
     "myvoice",
     "shanxi",
 )
 
 INDEX_ALIASES = {
-    "added_ivf2716_flat_nprobe_1_thchs_v2_v2.index": "thchs_v2.index",
     "added_ivf314_flat_nprobe_1_myvoice_v2.index": "myvoice.index",
 }
 
@@ -71,6 +67,39 @@ def _existing(path):
     except Exception:
         return ""
     return ""
+
+
+def writable_asset_dir(kind="weights"):
+    """Directory for user-imported models/indexes (survives exe upgrades)."""
+    from tools.app_paths import is_frozen, package_root
+
+    rel = WEIGHTS_REL if kind != "indices" else INDICES_REL
+    pkg = package_root()
+    if is_frozen():
+        source = pkg / "source"
+        base = source if source.is_dir() else pkg
+    else:
+        base = pkg
+    dest = base / rel
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def import_user_asset(src, kind="weights", overwrite=False):
+    """Copy a .pth/.index into the local assets folder. Returns the basename."""
+    src_p = Path(str(src or "")).expanduser()
+    if not src_p.is_file():
+        raise FileNotFoundError(str(src_p))
+    dest = writable_asset_dir(kind) / src_p.name
+    try:
+        if dest.resolve() == src_p.resolve():
+            return dest.name
+    except Exception:
+        pass
+    if dest.is_file() and not overwrite:
+        raise FileExistsError(dest.name)
+    shutil.copy2(src_p, dest)
+    return dest.name
 
 
 def _search_roots(project_root):
@@ -135,7 +164,55 @@ def resolve_index_path(path, project_root, model_path=""):
                 found = _existing(cand)
                 if found:
                     return found
+        # Server copies often prefix the speaker id: OP2694892_added_IVF....index
+        folder = root / INDICES_REL
+        if folder.is_dir():
+            for name in names:
+                if not name:
+                    continue
+                for p in sorted(folder.glob("*" + name)):
+                    found = _existing(p)
+                    if found:
+                        return found
+        logs = root / "logs"
+        if logs.is_dir():
+            for name in names:
+                if not name:
+                    continue
+                for p in logs.rglob(name):
+                    found = _existing(p)
+                    if found:
+                        return found
     return str(path) if path else ""
+
+
+def list_asset_names(kind="weights", project_root=None):
+    """Basenames already on disk (.pth or .index)."""
+    from tools.app_paths import package_root
+
+    ext = "*.pth" if kind != "indices" else "*.index"
+    rel = WEIGHTS_REL if kind != "indices" else INDICES_REL
+    root = Path(project_root) if project_root else package_root()
+    seen = set()
+    names = []
+    folders = []
+    for base in _search_roots(root):
+        folders.append(base / rel)
+    try:
+        wd = writable_asset_dir(kind)
+        if wd not in folders:
+            folders.insert(0, wd)
+    except Exception:
+        pass
+    for folder in folders:
+        if not folder.is_dir():
+            continue
+        for p in sorted(folder.glob(ext)):
+            key = p.name.lower()
+            if key not in seen:
+                seen.add(key)
+                names.append(p.name)
+    return names
 
 
 def list_index_names(project_root):

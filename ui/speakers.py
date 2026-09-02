@@ -5,14 +5,15 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QHBoxLayout, QDialogButtonBox, QMessageBox,
-    QInputDialog, QFileDialog,
+    QInputDialog, QFileDialog, QSizePolicy,
 )
 from PySide6.QtGui import QCursor
 
 from tools.app_paths import speakers_path, package_root
 from tools.file_io import write_json_atomic
+from tools.model_assets import import_user_asset, list_asset_names
 from ui.common import (
-    NL, WEIGHTS_DIR, INDICES_DIR, fill_f0_combo, f0_from_combo,
+    NL, fill_f0_combo, f0_from_combo,
 )
 from ui.widgets import create_styled_combo
 from ui.fw import LineEdit, SpinBox, DoubleSpinBox, CheckBox, PushButton, ComboBox
@@ -82,25 +83,39 @@ class SpeakerDialog(QDialog):
     def __init__(self, parent=None, speaker=None):
         super().__init__(parent)
         self.setWindowTitle("编辑角色" if speaker else "添加角色")
-        self.setMinimumWidth(520); self.result = None
+        self.setMinimumSize(720, 580)
+        self.resize(780, 620)
+        self.result = None
         s = speaker or SpeakerConfig()
-        l = QFormLayout(self); l.setSpacing(10)
+        l = QFormLayout(self)
+        l.setContentsMargins(24, 20, 24, 16)
+        l.setHorizontalSpacing(16)
+        l.setVerticalSpacing(12)
+        l.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        l.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
         self.ne = LineEdit()
         self.ne.setText(s.name)
         self.ne.setPlaceholderText("例如: 女声A")
+        self.ne.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         l.addRow("角色名称:", self.ne)
 
         mr = QHBoxLayout()
         self.me = LineEdit()
         self.me.setText(s.model_path)
-        self.me.setPlaceholderText("选择 .pth 模型文件")
+        self.me.setPlaceholderText("选择已有模型，或导入本机 .pth")
+        self.me.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         mr.addWidget(self.me, 1)
-        mb = PushButton("浏览...")
-        mb.clicked.connect(lambda: self._br("模型文件 (*.pth)", WEIGHTS_DIR, self.me))
+        sel_m = PushButton("选择")
+        sel_m.setToolTip("从本机已有的 .pth 里点选，不复制文件")
+        sel_m.clicked.connect(lambda: self._pick_local("weights", self.me, "模型"))
+        mr.addWidget(sel_m)
+        mb = PushButton("导入")
+        mb.setToolTip("从电脑其它位置选 .pth，复制到本机模型目录")
+        mb.clicked.connect(lambda: self._br("模型文件 (*.pth)", "weights", self.me))
         mr.addWidget(mb)
         ms = PushButton("从服务器获取")
-        ms.setToolTip("列出当前模式可用的 .pth（本地目录或服务器）")
+        ms.setToolTip("列出远程服务器上的 .pth 文件名")
         ms.clicked.connect(self._from_server)
         mr.addWidget(ms)
         l.addRow("模型文件:", mr)
@@ -108,10 +123,16 @@ class SpeakerDialog(QDialog):
         ir = QHBoxLayout()
         self.ie = LineEdit()
         self.ie.setText(s.index_path)
-        self.ie.setPlaceholderText("可选 .index 文件")
+        self.ie.setPlaceholderText("可选。选择已有索引，或导入 .index")
+        self.ie.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         ir.addWidget(self.ie, 1)
-        ib = PushButton("浏览...")
-        ib.clicked.connect(lambda: self._br("索引文件 (*.index)", INDICES_DIR, self.ie))
+        sel_i = PushButton("选择")
+        sel_i.setToolTip("从本机已有的 .index 里点选，不复制文件")
+        sel_i.clicked.connect(lambda: self._pick_local("indices", self.ie, "索引"))
+        ir.addWidget(sel_i)
+        ib = PushButton("导入")
+        ib.setToolTip("从电脑其它位置选 .index，复制到本机索引目录")
+        ib.clicked.connect(lambda: self._br("索引文件 (*.index)", "indices", self.ie))
         ir.addWidget(ib)
         l.addRow("索引文件:", ir)
 
@@ -215,22 +236,74 @@ class SpeakerDialog(QDialog):
         self._list_models_thread = t
         t.start()
 
-    @staticmethod
-    def _br(filt, start, target):
-        p, _ = QFileDialog.getOpenFileName(None, "选择文件", str(start), filt)
-        if p: target.setText(p)
+    def _pick_local(self, kind, target, label):
+        names = list_asset_names(kind)
+        if not names:
+            QMessageBox.information(
+                self, "提示",
+                "本机还没有%s文件。请先点「导入」。" % label)
+            return
+        current = Path(target.text().strip()).name
+        idx = names.index(current) if current in names else 0
+        name, ok = QInputDialog.getItem(
+            self, "选择" + label, "本机已有的%s：" % label, names, idx, False)
+        if ok and name:
+            target.setText(name)
+
+    def _br(self, filt, kind, target):
+        home = Path.home() / "Downloads"
+        start = home if home.is_dir() else Path.home()
+        p, _ = QFileDialog.getOpenFileName(self, "导入文件", str(start), filt)
+        if p:
+            target.setText(p)
+
+    def _import_field(self, raw, kind, overwrite=False):
+        text = (raw or "").strip()
+        if not text:
+            return ""
+        p = Path(text).expanduser()
+        if p.is_file():
+            return import_user_asset(str(p), kind, overwrite=overwrite)
+        return p.name
+
+    def _import_one(self, raw, kind, label):
+        text = (raw or "").strip()
+        if not text:
+            return ""
+        try:
+            return self._import_field(text, kind, overwrite=False)
+        except FileNotFoundError:
+            raise
+        except FileExistsError as e:
+            ans = QMessageBox.question(
+                self, "文件已存在",
+                "本机已有同名%s「%s」。覆盖？" % (label, e)
+                + NL + "选「否」则沿用已有文件。")
+            if ans == QMessageBox.Yes:
+                return self._import_field(text, kind, overwrite=True)
+            return Path(text).name
 
     def _ok(self):
-        n = self.ne.text().strip(); mp = self.me.text().strip()
+        n = self.ne.text().strip()
+        mp = self.me.text().strip()
         if not n:
             return QMessageBox.warning(self, "提示", "请输入角色名称")
         if not mp:
-            # 网络模式：模型在服务器上，本地只需填服务器上的模型文件名
             return QMessageBox.warning(self, "提示",
-                "请输入模型文件名（可点「从服务器获取」选择，或填服务器上的文件名，如 thchs_v2.pth）")
-        # 不检查本地文件存在：推理在服务器，本地路径只取文件名发送
+                "请导入本机 .pth，或填写服务器上的模型文件名（如 myvoice.pth）")
+        try:
+            mp = self._import_one(self.me.text(), "weights", "模型")
+            ip = self._import_one(self.ie.text(), "indices", "索引")
+        except FileNotFoundError:
+            return QMessageBox.warning(self, "提示", "找不到所选文件，请重新导入")
+        except OSError as e:
+            return QMessageBox.warning(self, "导入失败", str(e))
+        if ip and self.irs.value() <= 0.05:
+            self.irs.setValue(0.4)
+        self.me.setText(mp)
+        self.ie.setText(ip)
         self.result = SpeakerConfig(
-            n, mp, self.ie.text().strip(),
+            n, mp, ip,
             self.si.value(), self.ps.value(), self.irs.value(),
             formant=self.fs.value(), f0method=f0_from_combo(self.fmc),
             I_noise_reduce=self.inc2.isChecked(),

@@ -271,13 +271,13 @@ class RVCClient:
                 if not self.connect(timeout=8):
                     return False
             try:
-                if not self._acquire_io(8.0):
-                    self.last_error = "服务器正忙"
-                    self._on_status("加载失败: 服务器正忙")
+                if not self._acquire_io(15.0):
+                    self.last_error = "GPU 正忙，加载超时"
+                    self._on_status("加载失败: GPU 正忙，请稍后重试")
                     return False
                 try:
                     self._ws.send(json.dumps(cmd))
-                    resp = self._recv_json(60.0)
+                    resp = self._recv_json(90.0)
                 finally:
                     self._release_io()
                 if "error" in resp:
@@ -635,15 +635,22 @@ class RVCClient:
         return []
 
     def _recv_json(self, timeout):
-        """等一条 JSON 控制回复；跳过残留的二进制音频帧。"""
+        """等一条 JSON 控制回复；跳过残留的二进制音频帧。
+
+        settimeout 切成 ≤1s 是为了能检查总时限；底层 recv 超时不能当失败，
+        否则换模型这种十几秒的操作会在 1 秒后被误报成「连接超时」。
+        """
         deadline = time.time() + float(timeout)
         last_err = "服务器没有返回有效结果"
         while True:
             remain = deadline - time.time()
             if remain <= 0:
-                raise socket.timeout(last_err)
+                raise TimeoutError("等待服务器回复超时")
             self._ws.settimeout(min(remain, 1.0))
-            raw = self._ws.recv()
+            try:
+                raw = self._ws.recv()
+            except _WS_TIMEOUT_EXC:
+                continue
             if isinstance(raw, (bytes, bytearray)):
                 last_err = "收到残留音频，继续等待加载结果"
                 continue

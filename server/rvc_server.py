@@ -26,7 +26,9 @@ if "--cpu" in sys.argv:
 import numpy as np
 import websockets
 
-from worker.rvc_pipeline import RVCPipeline, cuda_sync_or_die
+from worker.rvc_pipeline import (
+    RVCPipeline, cuda_sync_or_die, cuda_context_dead, die_for_watchdog,
+)
 from tools.model_assets import list_index_names
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -549,6 +551,8 @@ class RVCServer:
             except asyncio.TimeoutError:
                 pass
             resp = await self._on_io_thread(_load)
+            if isinstance(resp, dict) and cuda_context_dead(resp.get("error")):
+                die_for_watchdog(resp.get("error"))
             await websocket.send(json.dumps(resp))
             if isinstance(resp, dict) and "error" not in resp:
                 self._pool.submit(self._prepare_loaded, pipeline)
@@ -676,8 +680,10 @@ class RVCServer:
                     req_seq, audio = session.pending.popleft()
         except asyncio.CancelledError:
             return
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
+            if cuda_context_dead(e):
+                die_for_watchdog(e)
 
     async def start(self):
         print(f"RVC Server 启动: ws://{self.host}:{self.port}")

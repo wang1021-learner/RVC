@@ -45,8 +45,8 @@ def load_model(pth_path: str, device: torch.device, is_half: bool = False):
 def convert_audio(
     input_path: str,
     output_path: str = None,
-    pth_path: str = "assets/weights/thchs_v2_e200_s13200.pth",
-    index_path: str = "assets/indices/thchs_v2.index",
+    pth_path: str = "assets/weights/myvoice.pth",
+    index_path: str = "assets/indices/myvoice.index",
     index_rate: float = 0.5,
     pitch: int = 0,
 ):
@@ -193,13 +193,13 @@ def main():
     parser.add_argument(
         "--model",
         "-m",
-        default="assets/weights/thchs_v2_e200_s13200.pth",
+        default="assets/weights/myvoice.pth",
         help="模型权重路径",
     )
     parser.add_argument(
         "--index",
         "-i",
-        default="assets/indices/thchs_v2.index",
+        default="assets/indices/myvoice.index",
         help="FAISS 索引路径",
     )
     parser.add_argument(

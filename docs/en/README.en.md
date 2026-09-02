@@ -124,7 +124,7 @@ assets/
 │   └── hubert_v2.onnx       # optional
 ├── rmvpe/rmvpe.pt
 ├── weights/                 # user .pth
-└── indices/                 # matching .index, e.g. thchs_v2.index
+└── indices/                 # matching .index, e.g. myvoice.index
 ```
 
 ### Download shared models
@@ -182,7 +182,7 @@ python convert_audio.py input.wav output.wav \
   -i assets/indices/your_index.index
 ```
 
-Put `.pth` files in `assets/weights/` and the matching `.index` in `assets/indices/` (family name, e.g. `thchs_v2.index`). Retrieval uses k=4, same as realtime. `index_rate=0` or a missing index skips retrieval.
+Put `.pth` files in `assets/weights/` and the matching `.index` in `assets/indices/` (family name, e.g. `myvoice.index`). Retrieval uses k=4, same as realtime. `index_rate=0` or a missing index skips retrieval.
 
 ## Credits
 

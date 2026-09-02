@@ -8,6 +8,7 @@ from tools.app_paths import (
     bundled_dir, ensure_user_data, is_frozen, log_dir, package_root,
     presets_path, settings_path, speakers_path, user_data_dir,
 )
+from tools.model_assets import writable_asset_dir
 from tools.file_io import write_json_atomic
 from tools.virtual_cable import is_bluetooth_name
 from ui.theme import (
@@ -20,8 +21,8 @@ PROJECT_ROOT = package_root()
 SETTINGS_FILE = settings_path()
 PRESETS_FILE = presets_path()
 SPEAKERS_FILE = speakers_path()
-WEIGHTS_DIR = bundled_dir() / "assets" / "weights"
-INDICES_DIR = bundled_dir() / "assets" / "indices"
+WEIGHTS_DIR = writable_asset_dir("weights")
+INDICES_DIR = writable_asset_dir("indices")
 STYLE_QSS = LIGHT_QSS
 
 NL = chr(10)
@@ -154,6 +155,8 @@ def _friendly_net_error(e):
         return "服务器正忙（已有人在变声）。等对方停，或让管理员加大同时路数。"
     if "refused" in s or "10061" in s:
         return "服务器拒绝连接。那台机器上的推理服务没开，或端口不是 8765。"
+    if "等待服务器回复" in raw or "加载超时" in raw:
+        return None
     if "timed out" in s or "timeout" in s or "10060" in s:
         return "连接超时。检查地址是否写对、网络是否通，以及云服务器安全组是否放行 TCP 8765。"
     if "getaddrinfo" in s or "nodename" in s or "name or service" in s or "11001" in s:
@@ -180,6 +183,10 @@ def _friendly_net_error(e):
 def _friendly_error(e):
     """统一错误文案：能翻译就翻译，并告诉用户下一步。"""
     raw = str(e or "").strip()
+    if "gpu 正忙" in raw.lower():
+        return "服务器 GPU 正忙。请稍等几秒再加载角色。"
+    if "加载超时" in raw or "等待服务器回复" in raw:
+        return "加载超时。远端换模型要十几秒，请再点一次角色；反复出现请重新「连接」。"
     net = _friendly_net_error(e)
     if net:
         return net
@@ -188,8 +195,6 @@ def _friendly_error(e):
         return "显存不足。请关掉其它占显卡的程序后重试。"
     if "cuda" in low and ("illegal" in low or "launch" in low or "device-side" in low):
         return "显卡推理出错。请重启推理服务后再连。"
-    if "gpu 正忙" in raw or "加载超时" in raw:
-        return "服务器 GPU 正忙。请稍等几秒再加载角色。"
     if "no such file" in low or "not found" in low or "找不到" in raw:
         return "找不到模型或索引文件。本地请核对路径；服务器模式只认文件名，远端要有同名文件。"
     if "本地推理" in raw:
@@ -375,7 +380,8 @@ def _local_model_path(path):
     if p.is_file():
         return p
     name = p.name
-    roots = [bundled_dir(), package_root(), package_root() / "source"]
+    roots = [bundled_dir(), package_root(), package_root() / "source",
+             writable_asset_dir("weights").parent.parent]
     cands = []
     for root in roots:
         cands.extend((
