@@ -62,7 +62,7 @@ if errorlevel 1 (
 
 REM 4. remaining deps
 echo Installing remaining deps...
-set "REQ_FILE=%ROOT%source\requirements_local_cu118.txt"
+set "REQ_FILE=%ROOT%source\server\requirements_local_cu118.txt"
 if not exist "!REQ_FILE!" set "REQ_FILE=%ROOT%requirements_local_cu118.txt"
 if not exist "!REQ_FILE!" (
     echo [WARN] requirements_local_cu118.txt not found, skip deps
@@ -77,7 +77,7 @@ if not exist "!REQ_FILE!" (
 
 REM 5. trim torch
 echo [4/4] Trimming torch...
-set "TRIM_PY=%ROOT%source\tools\trim_torch.py"
+set "TRIM_PY=%ROOT%source\server\tools\trim_torch.py"
 if not exist "!TRIM_PY!" set "TRIM_PY=%ROOT%tools\trim_torch.py"
 if exist "!TRIM_PY!" (
     "%RT%\python.exe" "!TRIM_PY!" --torch-dir "%RT%\Lib\site-packages\torch"

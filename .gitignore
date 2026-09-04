@@ -18,8 +18,8 @@ record_out/
 user_settings.json
 
 # 模型权重与索引（体积超过 GitHub 100MB 限制，请另行准备）
-assets/weights/
-assets/rmvpe/
-assets/hubert_base/*.safetensors
+server/assets/weights/
+server/assets/rmvpe/
+server/assets/hubert_base/*.safetensors
 *.index
 *.onnx

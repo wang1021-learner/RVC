@@ -32,7 +32,7 @@ fi
 echo "using: $PY"
 
 mkdir -p "$ROOT/logs"
-setsid nohup "$PY" -u server/rvc_server.py --host 0.0.0.0 --port 8765 >> "$ROOT/logs/rvc_server.log" 2>&1 < /dev/null &
+setsid nohup "$PY" -u rvc_server.py --host 0.0.0.0 --port 8765 >> "$ROOT/logs/rvc_server.log" 2>&1 < /dev/null &
 echo "started pid: $!"
 for i in $(seq 1 45); do
   if command -v ss >/dev/null 2>&1 && ss -tln | grep -q 8765; then

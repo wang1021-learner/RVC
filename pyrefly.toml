@@ -1,0 +1,19 @@
+# Pyrefly 类型检查配置
+# 项目实际运行在 Python 3.11（见 .vscode/settings.json 的 python.defaultInterpreterPath）。
+# 若不指定，Pyrefly 会从 PATH 探测到 3.14 解释器，而 3.14 没有 torch，
+# 从而对 worker/rvc_pipeline.py 等文件误报 missing-import。
+
+python-version = "3.11"
+python-platform = "win32"
+
+# 项目自身的顶层包（client_gui 与 server 各自作为导入根：
+#   client_gui/{worker,tools,ui}、server/{worker,tools,infer,configs,i18n}）
+search-path = ["client_gui", "server"]
+
+# 依赖查找路径（按顺序优先匹配）
+#  - runtime：推理侧依赖 torch / torchaudio / onnxruntime / faiss / librosa / numpy 1.26 等
+#  - .packvenv：GUI 侧依赖 PySide6 / sounddevice 等
+site-package-path = [
+    "runtime/Lib/site-packages",
+    ".packvenv/Lib/site-packages",
+]

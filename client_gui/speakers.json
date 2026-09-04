@@ -103,7 +103,7 @@
       "model_path": "OP2701067_e200_s28800.pth",
       "index_path": "OP2701067_added_IVF2531_Flat_nprobe_1_OP2701067_v2.index",
       "speaker_id": 0,
-      "pitch": 12,
+      "pitch": 0,
       "index_rate": 0.5,
       "formant": 0.0,
       "f0method": "rmvpe",

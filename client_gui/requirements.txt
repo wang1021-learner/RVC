@@ -1,0 +1,7 @@
+# RVC 实时变声瘦客户端（仅 Python 3.11 x64）— 不依赖 torch / 推理
+# 本地推理也统一走子进程拉起本机 server，客户端只保留 GUI + 音频 + 协议依赖。
+PySide6>=6.5
+PySide6-Fluent-Widgets>=1.7.0
+sounddevice>=0.4.6
+numpy>=1.26.4,<2
+websocket-client>=1.6

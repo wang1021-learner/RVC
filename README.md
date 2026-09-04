@@ -16,11 +16,11 @@
 
 | 用途 | 命令 |
 | --- | --- |
-| 实时变声桌面客户端 | `python realtime_qt.py` |
+| 实时变声桌面客户端 | `python client_gui/realtime_qt.py` |
 | 独立 / 远程推理服务 | `python server/rvc_server.py` |
-| 离线音频转换 | `python convert_audio.py input.wav output.wav -m <模型.pth> -i <索引.index>` |
+| 离线音频转换 | `python server/convert_audio.py input.wav output.wav -m <模型.pth> -i <索引.index>` |
 
-底模来自开源 VCTK；说话人权重与 FAISS 索引由用户放到 `assets/weights/`、`assets/indices/`。
+底模来自开源 VCTK；说话人权重与 FAISS 索引由用户放到 `server/assets/weights/`、`server/assets/indices/`。
 
 ## 简介
 
@@ -32,7 +32,7 @@
 
 ## 环境配置
 
-只支持 **Python 3.11 x64**。Windows 便携 `runtime/` 和 `install_local.bat` 是 **3.11.9**。不要用 3.10 / 3.12。源码开发用 `.venv`。请在仓库根目录执行。
+只支持 **Python 3.11 x64**。Windows 便携 `runtime/` 和 `server/install_local.bat` 是 **3.11.9**。不要用 3.10 / 3.12。推理侧源码开发在 `server/` 下建 `.venv`，客户端在 `client_gui/` 下建。请在仓库根目录执行。
 
 ### Ubuntu 24.04
 
@@ -58,7 +58,7 @@ py -3.11 -m venv .venv
 python -m pip install --upgrade pip setuptools wheel
 ```
 
-打包/单机版用 `runtime\python.exe`（3.11.9）。`start_server.bat` 会跳过不是 3.11 的 venv。
+打包/单机版用 `runtime\python.exe`（3.11.9）。`server/start_server.bat` 会跳过不是 3.11 的 venv。
 
 ### 按硬件选择依赖
 
@@ -66,15 +66,15 @@ python -m pip install --upgrade pip setuptools wheel
 
 | 硬件 | 安装方式 |
 | --- | --- |
-| CPU、AMD、Intel | 先装 CPU 版 Torch，再 `requirments_cpu_py311.txt`；Windows 可另装 `torch-directml` |
-| NVIDIA RTX 50 系 | 先装 CUDA 12.8 版 Torch，再 `requirments_cu128_py311.txt` |
-| NVIDIA RTX 50 系以前 | 先装 CUDA 11.8 版 Torch，再 `requirments_cu118_py311.txt` |
+| CPU、AMD、Intel | 先装 CPU 版 Torch，再 `server/requirments_cpu_py311.txt`；Windows 可另装 `torch-directml` |
+| NVIDIA RTX 50 系 | 先装 CUDA 12.8 版 Torch，再 `server/requirments_cu128_py311.txt` |
+| NVIDIA RTX 50 系以前 | 先装 CUDA 11.8 版 Torch，再 `server/requirments_cu118_py311.txt` |
 
 #### CPU、AMD、Intel
 
 ```bash
 python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
-python -m pip install -r requirments_cpu_py311.txt
+python -m pip install -r server/requirments_cpu_py311.txt
 ```
 
 Windows DirectML（可选）：
@@ -89,7 +89,7 @@ python -m pip install torch-directml
 python -m pip install torch==2.7.1+cu128 torchaudio==2.7.1+cu128 \
   --index-url https://download.pytorch.org/whl/cu128 \
   --extra-index-url https://pypi.org/simple
-python -m pip install -r requirments_cu128_py311.txt
+python -m pip install -r server/requirments_cu128_py311.txt
 ```
 
 #### NVIDIA RTX 50 系以前
@@ -98,10 +98,10 @@ python -m pip install -r requirments_cu128_py311.txt
 python -m pip install torch==2.7.1+cu118 torchaudio==2.7.1+cu118 \
   --index-url https://download.pytorch.org/whl/cu118 \
   --extra-index-url https://pypi.org/simple
-python -m pip install -r requirments_cu118_py311.txt
+python -m pip install -r server/requirments_cu118_py311.txt
 ```
 
-只跑客户端、Torch 已在别处装好时，也可用精简清单 `requirements.txt`。
+只跑客户端、推理放在服务器上时，用精简清单 `client_gui/requirements.txt`；推理侧用 `server/requirements.txt`。
 
 检查 Torch：
 
@@ -116,7 +116,7 @@ python -c "import torch; print('torch:', torch.__version__); print('cuda:', torc
 从 [Hugging Face](https://huggingface.co/lj1995/VoiceConversionWebUI/tree/main) 下载公共权重，说话人模型和索引按族放在一起：
 
 ```text
-assets/
+server/assets/
 ├── hubert_base/
 │   ├── config.json
 │   ├── preprocessor_config.json
@@ -135,18 +135,18 @@ assets/
 python -m pip install --upgrade huggingface_hub
 
 hf download lj1995/VoiceConversionWebUI --revision main \
-  --include "hubert_base/*" --local-dir assets
+  --include "hubert_base/*" --local-dir server/assets
 hf download lj1995/VoiceConversionWebUI rmvpe.pt --revision main \
-  --local-dir assets/rmvpe
+  --local-dir server/assets/rmvpe
 ```
 
-若 Hugging Face 给的是 `pytorch_model.bin`，放到 `assets/hubert_base/` 即可，和 `model.safetensors` 二选一。v1 模型还必须有 `final_proj.pt`。
+若 Hugging Face 给的是 `pytorch_model.bin`，放到 `server/assets/hubert_base/` 即可，和 `model.safetensors` 二选一。v1 模型还必须有 `final_proj.pt`。
 
 Windows AMD/Intel DirectML 还需要：
 
 ```bash
 hf download lj1995/VoiceConversionWebUI rmvpe.onnx --revision main \
-  --local-dir assets/rmvpe
+  --local-dir server/assets/rmvpe
 ```
 
 ### FFmpeg
@@ -161,7 +161,7 @@ Ubuntu 已在系统依赖里安装。Windows 可把下面两个文件放到项�
 ### 1. 实时变声桌面客户端
 
 ```bash
-python realtime_qt.py
+python client_gui/realtime_qt.py
 ```
 
 ### 2. 独立 / 远程推理服务器
@@ -174,17 +174,17 @@ python server/rvc_server.py --host 0.0.0.0 --port 8765
 python server/rvc_server.py --cpu          # 无独显
 ```
 
-Windows 也可用 `start_server.bat`。
+Windows 也可用 `server/start_server.bat`（CPU 用 `server/start_server_cpu.bat`）。
 
 ### 3. 批量音频离线转换
 
 ```bash
-python convert_audio.py input.wav output.wav \
-  -m assets/weights/your_model.pth \
-  -i assets/indices/your_index.index
+python server/convert_audio.py input.wav output.wav \
+  -m server/assets/weights/your_model.pth \
+  -i server/assets/indices/your_index.index
 ```
 
-`.pth` 放 `assets/weights/`，对应 `.index` 放 `assets/indices/`（按说话人族命名，例如 `myvoice.index`）。检索 k=4，与实时路径相同；`index_rate` 为 0 或不提供索引则不做检索。
+`.pth` 放 `server/assets/weights/`，对应 `.index` 放 `server/assets/indices/`（按说话人族命名，例如 `myvoice.index`）。检索 k=4，与实时路径相同；`index_rate` 为 0 或不提供索引则不做检索。
 
 ## 参考项目
 

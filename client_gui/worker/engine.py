@@ -7,7 +7,7 @@ import sounddevice as sd
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QTimer
 
 from worker.rvc_client import RVCClient
-from worker.local_server import is_frozen, pack_mode
+from worker.local_server import LocalServerPipeline
 from tools.audio_process import AutoGain, PeakLimiter
 from tools.audio_meter import calc_rms_db, spec_bins
 from tools.virtual_cable import is_virtual_name, is_bluetooth_name
@@ -17,84 +17,10 @@ from ui.common import (
     _friendly_error, to_server_path,
 )
 
-class LazyLocalPipeline:
-    """启动时不立刻 import torch，第一次加载角色再进本机推理。"""
-    is_remote = False
-    is_network = False
-
-    def __init__(self, on_status):
-        self._on_status = on_status
-        self._real = None
-
-    def _ensure(self):
-        if self._real is None:
-            from worker.rvc_pipeline import RVCPipeline
-            self._real = RVCPipeline(on_status=self._on_status)
-        return self._real
-
-    @property
-    def is_loaded(self):
-        return bool(self._real and self._real.is_loaded)
-
-    @property
-    def samplerate(self):
-        return self._real.samplerate if self._real is not None else 48000
-
-    @property
-    def channels(self):
-        return self._real.channels if self._real is not None else 1
-
-    @property
-    def _block_frame(self):
-        if self._real is not None and hasattr(self._real, "_block_frame"):
-            return self._real._block_frame
-        return None
-
-    @property
-    def last_stage_ms(self):
-        if self._real is None:
-            return {}
-        return getattr(self._real, "last_stage_ms", {}) or {}
-
-    def is_connected(self):
-        return True
-
-    def abort(self):
-        return
-
-    def set_server_url(self, url):
-        return
-
-    def stop(self):
-        if self._real is not None:
-            self._real.stop()
-
-    def unload(self):
-        if self._real is not None:
-            self._real.unload()
-
-    def disconnect(self):
-        return
-
-    def __getattr__(self, name):
-        return getattr(self._ensure(), name)
-
-
-def _use_local_subprocess():
-    """打包 exe 默认子进程隔离；源码默认进程内。环境变量可强制切换。"""
-    if os.environ.get("RVC_DIRECT_LOCAL") == "1":
-        return False
-    if os.environ.get("RVC_LOCAL_SUBPROCESS") == "1":
-        return True
-    return bool(is_frozen())
-
-
 def make_pipeline(mode, server_url, on_status):
     if mode == "local":
-        if _use_local_subprocess():
-            from worker.local_server import LocalServerPipeline
-            return LocalServerPipeline(on_status=on_status)
-        return LazyLocalPipeline(on_status)
+        # 本地推理也统一走子进程拉起本机 server，客户端不直接 import torch/infer。
+        return LocalServerPipeline(on_status=on_status)
     # 不在构造时 connect：远程未启动会卡住 UI 数秒
     return RVCClient(server_url=server_url, on_status=on_status)
 

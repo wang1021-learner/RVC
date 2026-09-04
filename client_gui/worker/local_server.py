@@ -26,10 +26,14 @@ def runtime_python():
 
 
 def source_dir():
-    """服务端源码根目录：冻结版为包内 source/，源码版为项目根目录。"""
+    """服务端源码根目录：冻结版为包内 source/，源码版为仓库根目录（server/ 的上一级）。
+
+    拆分后本文件位于 client_gui/worker/，而 server/ 是 client_gui 的兄弟目录，
+    故源码模式下取 parents[2] 即仓库根目录，而不是 package_root()（= client_gui/）。
+    """
     if is_frozen():
         return package_root() / "source"
-    return package_root()
+    return Path(__file__).resolve().parents[2]
 
 
 def runtime_installed():

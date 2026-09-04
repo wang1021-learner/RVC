@@ -16,7 +16,7 @@ import asyncio, json, struct, argparse, traceback, sys, socket, os, threading, t
 import concurrent.futures
 from collections import deque
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from tools.pyver import require_python_311
 require_python_311()
 # --cpu 必须在 import pipeline / Config 之前生效
@@ -31,7 +31,7 @@ from worker.rvc_pipeline import (
 )
 from tools.model_assets import list_index_names
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 
 INFER_KEYS = (
     "block_time", "crossfade_time", "extra_time", "f0method",

@@ -1,0 +1,13 @@
+# RVC 推理服务器依赖（仅 Python 3.11 x64）— 不含客户端 GUI 依赖
+# torch / torchaudio 按显卡单独安装（见 requirments_cu118_py311.txt / cu128 / cpu 顶部说明）。
+numpy>=1.26.4,<2
+scipy>=1.10
+librosa>=0.10.2,<0.11
+soundfile>=0.13
+faiss-cpu>=1.13.0,<2
+praat-parselmouth>=0.4.5
+transformers>=4.49.0,<4.50
+websockets>=10.4,<11
+onnxruntime-gpu>=1.18.0,<1.19
+onnx>=1.16.0,<2
+torchfcpe>=0.0.4,<0.1
